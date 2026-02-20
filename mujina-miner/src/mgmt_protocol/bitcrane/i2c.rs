@@ -31,7 +31,7 @@ impl BitcraneI2c {
         payload.extend_from_slice(data);
 
         let packet = Packet::new(
-            0xBC, // ID
+            0x00, // Placeholder, channel assigns actual ID
             Page::I2C,
             I2CCommand::Write as u8,
             payload,

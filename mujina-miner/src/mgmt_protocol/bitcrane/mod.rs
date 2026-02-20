@@ -4,5 +4,6 @@
 //! different GPIO command mappings for board-specific control pins.
 
 pub mod apw12;
+pub mod fan;
 pub mod gpio;
 pub mod i2c;

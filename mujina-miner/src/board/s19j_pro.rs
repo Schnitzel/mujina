@@ -17,7 +17,7 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::{BoardState, TemperatureSensor},
+    api_client::types::{BoardState, Fan, TemperatureSensor},
     asic::{
         bm13xx::{
             self,
@@ -32,6 +32,7 @@ use crate::{
     mgmt_protocol::{
         ControlChannel, Apw12Psu,
         bitcrane::{
+            fan::{self, BitcraneFan},
             gpio::{BitcraneGpioController, BitcraneGpioPin, BitcraneGpioPinHandle},
             i2c::BitcraneI2c,
         },
@@ -160,10 +161,20 @@ impl S19jPro {
         let (temp0, temp1) = tmp75::sensors_for_hashboard(i2c, 0);
         self.temp_sensors = Some((temp0.clone(), temp1.clone()));
 
-        // Spawn telemetry task to periodically read temperatures
+        // Initialize fans and set to 50% speed
+        let fans = fan::all_fans(self.control_channel.clone());
+        const DEFAULT_FAN_SPEED: u8 = 50;
+        for fan in &fans {
+            if let Err(e) = fan.set_speed(DEFAULT_FAN_SPEED).await {
+                warn!(fan = %fan.name(), error = %e, "Failed to set fan speed");
+            }
+        }
+        info!("Fans initialized at {}% speed", DEFAULT_FAN_SPEED);
+
+        // Spawn telemetry task to periodically read temperatures and fan RPMs
         let state_tx = self.state_tx.clone();
         tokio::spawn(async move {
-            telemetry_task(temp0, temp1, state_tx).await;
+            telemetry_task(temp0, temp1, fans, state_tx).await;
         });
 
         info!("S19j Pro initialized successfully");
@@ -256,12 +267,13 @@ impl Board for S19jPro {
     }
 }
 
-/// Telemetry task that periodically reads temperature sensors.
+/// Telemetry task that periodically reads temperature sensors and fan RPMs.
 ///
-/// Runs indefinitely, updating state_tx with temperature readings every 2 seconds.
+/// Runs indefinitely, updating state_tx with readings every 2 seconds.
 async fn telemetry_task(
     temp0: Tmp75,
     temp1: Tmp75,
+    fans: [BitcraneFan; 4],
     state_tx: watch::Sender<BoardState>,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -287,9 +299,24 @@ async fn telemetry_task(
             },
         ];
 
-        // Update board state (modify_if_different could be used to avoid spurious wakes)
+        // Read all fan RPMs
+        let mut fan_states = Vec::with_capacity(4);
+        for fan in &fans {
+            let rpm_result = fan.read_rpm().await;
+            fan_states.push(Fan {
+                name: fan.name().to_string(),
+                rpm: rpm_result
+                    .inspect_err(|e| debug!(fan = %fan.name(), error = %e, "Fan RPM read failed"))
+                    .ok(),
+                percent: None, // We don't track current duty cycle yet
+                target_percent: Some(50), // We set 50% at init
+            });
+        }
+
+        // Update board state
         state_tx.send_modify(|state| {
             state.temperatures = temperatures;
+            state.fans = fan_states;
         });
 
         tokio::time::sleep(TELEMETRY_INTERVAL).await;

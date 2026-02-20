@@ -87,6 +87,8 @@ pub enum Page {
     GPIO = 0x06,
     /// ADC operations (voltage monitoring)
     ADC = 0x07,
+    /// Fan control operations (bitcrane PWM fans)
+    Fan = 0x09,
 }
 
 /// I2C commands
