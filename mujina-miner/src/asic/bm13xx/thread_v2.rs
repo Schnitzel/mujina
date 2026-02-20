@@ -101,6 +101,12 @@ impl BM13xxThread {
         // verification where all chips respond at once).
         let (response_tx, response_rx) = mpsc::channel(128);
 
+        // Initial hashrate estimate: 83 GH/s per chip (~1 TH/s for 12-chip EmberOne).
+        // Must match TicketMask scaling in sequencer.rs so scheduler computes
+        // share_target >= TicketMask difficulty. The HashrateEstimator will
+        // refine this once shares start flowing.
+        let initial_hashrate = HashRate::from_gigahashes(83.0 * chain.chip_count() as f64);
+
         // Spawn reader task - continuously reads from serial to prevent USB
         // CDC-ACM flow control from blocking TX. Runs until chip_rx closes.
         tokio::spawn(serial_reader_task(chip_rx, response_tx));
@@ -127,7 +133,7 @@ impl BM13xxThread {
             name,
             command_tx: cmd_tx,
             capabilities: HashThreadCapabilities {
-                hashrate_estimate: HashRate::from_terahashes(1.0), // Stub; estimator takes over
+                hashrate_estimate: initial_hashrate,
             },
             status,
             event_rx: Some(evt_rx),
@@ -649,7 +655,7 @@ where
     /// Sets up Core broadcast writes, TicketMask, AnalogMux, IoDriverStrength,
     /// and initial PLL. Call this before frequency ramp.
     async fn execute_reg_config_broadcast(&mut self) -> Result<(), HashThreadError> {
-        let steps = self.sequencer.build_reg_config_broadcast();
+        let steps = self.sequencer.build_reg_config_broadcast(&self.chain);
         self.execute_sequence(steps, "broadcast register config")
             .await
     }

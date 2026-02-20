@@ -162,8 +162,9 @@ impl Sequencer {
     ///
     /// This should be called before frequency ramp. Contains Core broadcast
     /// writes, TicketMask, AnalogMux, IoDriverStrength, and initial PLL.
-    pub fn build_reg_config_broadcast(&self) -> Vec<Step> {
-        self.default_reg_config_broadcast()
+    /// TicketMask difficulty is scaled by chip count to maintain ~1 nonce/sec.
+    pub fn build_reg_config_broadcast(&self, chain: &Chain) -> Vec<Step> {
+        self.default_reg_config_broadcast(chain)
     }
 
     /// Build per-chip register configuration (Phase 2).
@@ -349,12 +350,12 @@ impl Sequencer {
             },
         }));
 
-        // TicketMask controls which nonces chips report. Use values matching
-        // the old thread.rs implementation (1 TH/s hashrate, 1 nonce/sec rate)
-        // which produces zero_bits=8. This is a moderate difficulty that should
-        // produce nonces at typical mining frequencies.
+        // TicketMask controls which nonces chips report.
+        // Scale hashrate by chip count to maintain ~1 nonce/sec across the chain.
+        // Base: ~83 GH/s per chip (1 TH/s for 12 chips)
+        let hashrate_gh = 83.0 * chain.chip_count() as f64;
         let reporting_interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(1000.0), // ~1 TH/s
+            Hashrate::gibihashes_per_sec(hashrate_gh),
             ReportingRate::nonces_per_sec(1.0),
         );
         steps.push(Step::new(Command::WriteRegister {
@@ -391,8 +392,8 @@ impl Sequencer {
         }));
 
         // Phase 2: Per-chip configuration with delays
-        // emberone-miner does InitControl, MiscControl, and Core x3 per-chip
-        // with 500ms delay after each chip. This is critical for proper operation.
+        // InitControl, MiscControl, and Core x3 per-chip with brief delay
+        // to allow cores to stabilize before moving to next chip.
         for (_, chip) in chain.chips() {
             // InitControl (0xA8) = 0x02 per-chip
             // Wire bytes: 00 00 00 02
@@ -438,7 +439,7 @@ impl Sequencer {
                         raw_value: 0x8000_82AA,
                     },
                 },
-                Duration::from_millis(500), // 500ms delay per chip per emberone-miner
+                Duration::from_millis(50), // Brief delay for core stabilization
             ));
         }
 
@@ -466,7 +467,7 @@ impl Sequencer {
     ///
     /// Called before frequency ramp. Sets up Core broadcast writes, TicketMask,
     /// AnalogMux, IoDriverStrength, and initial PLL at ~56 MHz.
-    fn default_reg_config_broadcast(&self) -> Vec<Step> {
+    fn default_reg_config_broadcast(&self, chain: &Chain) -> Vec<Step> {
         let mut steps = vec![];
 
         // Core configuration - first two writes are broadcast
@@ -486,10 +487,11 @@ impl Sequencer {
         }));
 
         // TicketMask controls which nonces chips report.
-        // Use difficulty ~256 (8 zero bits) for ~1 nonce/sec at 1 TH/s.
-        // Share target should match for accurate hashrate calculation.
+        // Scale hashrate by chip count to maintain ~1 nonce/sec across the chain.
+        // Base: ~83 GH/s per chip (1 TH/s for 12 chips)
+        let hashrate_gh = 83.0 * chain.chip_count() as f64;
         let reporting_interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(1000.0), // ~1 TH/s
+            Hashrate::gibihashes_per_sec(hashrate_gh),
             ReportingRate::nonces_per_sec(1.0),
         );
         steps.push(Step::new(Command::WriteRegister {
@@ -523,7 +525,7 @@ impl Sequencer {
     /// Per-chip register configuration (Phase 2).
     ///
     /// Called AFTER frequency ramp. Per-chip InitControl, MiscControl, and
-    /// Core writes with 500ms delays enable the hashing cores at the target
+    /// Core writes with brief delays enable the hashing cores at the target
     /// frequency.
     fn default_reg_config_perchip(&self, chain: &Chain) -> Vec<Step> {
         let mut steps = vec![];
@@ -571,7 +573,7 @@ impl Sequencer {
                         raw_value: 0x8000_82AA,
                     },
                 },
-                Duration::from_millis(500),
+                Duration::from_millis(50),
             ));
         }
 
