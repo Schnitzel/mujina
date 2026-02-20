@@ -5,3 +5,4 @@
 
 pub mod apw12;
 pub mod gpio;
+pub mod i2c;

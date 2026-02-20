@@ -5,6 +5,7 @@
 //! via bit-banged I2C.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Mutex, watch};
@@ -16,7 +17,7 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::BoardState,
+    api_client::types::{BoardState, TemperatureSensor},
     asic::{
         bm13xx::{
             self,
@@ -30,8 +31,12 @@ use crate::{
     hw_trait::gpio::{GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel, Apw12Psu,
-        bitcrane::gpio::{BitcraneGpioController, BitcraneGpioPin, BitcraneGpioPinHandle},
+        bitcrane::{
+            gpio::{BitcraneGpioController, BitcraneGpioPin, BitcraneGpioPinHandle},
+            i2c::BitcraneI2c,
+        },
     },
+    peripheral::tmp75::{self, Tmp75},
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
@@ -67,9 +72,10 @@ pub struct S19jPro {
     reset_pin: Option<BitcraneGpioPinHandle>,
     /// APW12 PSU controller.
     psu: Option<Arc<Mutex<Apw12Psu>>>,
+    /// TMP75 temperature sensors (2 per hashboard).
+    temp_sensors: Option<(Tmp75, Tmp75)>,
 
     /// Channel for publishing board state to the API server.
-    #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
     state_tx: watch::Sender<BoardState>,
 }
 
@@ -88,6 +94,7 @@ impl S19jPro {
             data_control: None,
             reset_pin: None,
             psu: None,
+            temp_sensors: None,
             state_tx,
         }
     }
@@ -147,6 +154,17 @@ impl S19jPro {
         }
 
         self.psu = Some(Arc::new(Mutex::new(psu)));
+
+        // Initialize TMP75 temperature sensors for hashboard 0
+        let i2c = BitcraneI2c::new(self.control_channel.clone());
+        let (temp0, temp1) = tmp75::sensors_for_hashboard(i2c, 0);
+        self.temp_sensors = Some((temp0.clone(), temp1.clone()));
+
+        // Spawn telemetry task to periodically read temperatures
+        let state_tx = self.state_tx.clone();
+        tokio::spawn(async move {
+            telemetry_task(temp0, temp1, state_tx).await;
+        });
 
         info!("S19j Pro initialized successfully");
         Ok(())
@@ -235,6 +253,46 @@ impl Board for S19jPro {
         })?;
 
         Ok(vec![Box::new(thread)])
+    }
+}
+
+/// Telemetry task that periodically reads temperature sensors.
+///
+/// Runs indefinitely, updating state_tx with temperature readings every 2 seconds.
+async fn telemetry_task(
+    temp0: Tmp75,
+    temp1: Tmp75,
+    state_tx: watch::Sender<BoardState>,
+) {
+    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+    loop {
+        // Read both temperature sensors
+        let temp0_result = temp0.read_temperature().await;
+        let temp1_result = temp1.read_temperature().await;
+
+        // Build temperature sensor readings
+        let temperatures = vec![
+            TemperatureSensor {
+                name: temp0.name().to_string(),
+                temperature_c: temp0_result
+                    .inspect_err(|e| debug!(sensor = %temp0.name(), error = %e, "Temp read failed"))
+                    .ok(),
+            },
+            TemperatureSensor {
+                name: temp1.name().to_string(),
+                temperature_c: temp1_result
+                    .inspect_err(|e| debug!(sensor = %temp1.name(), error = %e, "Temp read failed"))
+                    .ok(),
+            },
+        ];
+
+        // Update board state (modify_if_different could be used to avoid spurious wakes)
+        state_tx.send_modify(|state| {
+            state.temperatures = temperatures;
+        });
+
+        tokio::time::sleep(TELEMETRY_INTERVAL).await;
     }
 }
 

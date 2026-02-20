@@ -7,4 +7,5 @@
 
 pub mod emc2101;
 pub mod pmbus;
+pub mod tmp75;
 pub mod tps546;
