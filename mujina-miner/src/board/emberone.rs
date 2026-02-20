@@ -249,7 +249,7 @@ impl EmberOne {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Initial voltage matches the V-f curve at the initial PLL
-                // frequency (~56.25 MHz). See thread_v2::voltage_for_frequency().
+                // frequency (~56.25 MHz). See thread_v2::voltage_for_frequency_stacked().
                 const DEFAULT_VOUT: f32 = 3.04;
 
                 tps546.set_vout_target(DEFAULT_VOUT).await.map_err(|e| {

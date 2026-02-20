@@ -323,10 +323,11 @@ impl ChipJobs {
 /// frequency. Allows the regulator output to reach the new setpoint.
 const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
-/// Maximum total output voltage for the TPS546 on EmberOne.
-const VOUT_MAX: f32 = 4.0;
+/// Maximum total output voltage for per-chip stacked regulators (TPS546).
+const DEFAULT_VOUT_MAX: f32 = 4.0;
 
-/// Compute the total supply voltage needed for a given frequency and chip count.
+/// Compute voltage for per-chip stacked regulators (e.g., TPS546 on EmberOne)
+/// or single-supply PSUs driving series domains (e.g., APW12 on S19j Pro).
 ///
 /// Near-threshold CMOS (like the BM1362 at 7nm) needs more voltage as clock
 /// frequency increases -- faster switching requires more drive current and
@@ -334,8 +335,15 @@ const VOUT_MAX: f32 = 4.0;
 /// range.
 ///
 /// Interpolates between two known-good operating points and returns
-/// V_per_chip * chip_count, capped at VOUT_MAX.
-fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
+/// V_per_chip * domain_count, capped at the max voltage.
+///
+/// For series chains: domain_count is the number of voltage domains in series.
+/// For stacked regulators: domain_count equals chip_count (one domain per chip).
+fn voltage_for_frequency_stacked(
+    freq: protocol::Frequency,
+    domain_count: usize,
+    max_voltage: f32,
+) -> f32 {
     // Known-good operating points (per-chip voltage):
     //   - Low: confirmed stable in our testing
     //   - High: from reference implementations
@@ -349,7 +357,7 @@ fn voltage_for_frequency(freq: protocol::Frequency, chip_count: usize) -> f32 {
 
     let v_per_chip = LOW_VOLTAGE + SLOPE * (freq.mhz() - LOW_FREQ_MHZ);
 
-    (v_per_chip * chip_count as f32).min(VOUT_MAX)
+    (v_per_chip * domain_count as f32).min(max_voltage)
 }
 
 /// Per-chip timeout during chain verification.
@@ -672,28 +680,43 @@ where
         }
 
         let chip_count = self.chain.chip_count();
+        let domain_count = self.chain.domain_count();
         let has_regulator = self.peripherals.voltage_regulator.is_some();
+
+        // Get voltage calculation parameters from regulator
+        let max_v = if let Some(ref regulator) = self.peripherals.voltage_regulator {
+            let reg = regulator.lock().await;
+            reg.voltage_range().1
+        } else {
+            DEFAULT_VOUT_MAX
+        };
 
         info!(
             steps = steps.len(),
             target_mhz = target.mhz(),
             coordinated = has_regulator,
+            domain_count = domain_count,
             "Ramping frequency"
         );
 
         for (freq, step) in &steps {
             // 1. Set voltage (lead the frequency change)
+            // Use domain_count for series voltage calculation:
+            //   - For stacked (TPS546): 12 domains, V = V_per_chip * 12
+            //   - For series (APW12): 42 domains, V = V_per_chip * 42
+            // The regulator's set_voltage() will clamp to its valid range.
             if let Some(ref regulator) = self.peripherals.voltage_regulator {
-                let target_v = voltage_for_frequency(*freq, chip_count);
+                let step_voltage = voltage_for_frequency_stacked(*freq, domain_count, max_v);
+
                 regulator
                     .lock()
                     .await
-                    .set_voltage(target_v)
+                    .set_voltage(step_voltage)
                     .await
                     .map_err(|e| {
                         HashThreadError::InitializationFailed(format!(
                             "Failed to set voltage to {:.2}V: {}",
-                            target_v, e
+                            step_voltage, e
                         ))
                     })?;
 
@@ -717,11 +740,10 @@ where
             // 4. Health check: verify all chips still respond
             let responding = self.verify_chain().await;
             if responding < chip_count {
-                let target_v = voltage_for_frequency(*freq, chip_count);
+                let step_voltage = voltage_for_frequency_stacked(*freq, domain_count, max_v);
                 warn!(
                     freq_mhz = freq.mhz(),
-                    voltage = format!("{:.2}V", target_v),
-                    v_per_chip = format!("{:.3}V", target_v / chip_count as f32),
+                    voltage = format!("{:.2}V", step_voltage),
                     expected = chip_count,
                     responding,
                     "Chips lost during ramp"
@@ -730,7 +752,7 @@ where
         }
 
         if has_regulator {
-            let final_v = voltage_for_frequency(steps.last().unwrap().0, chip_count);
+            let final_v = voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
             info!(
                 target_mhz = target.mhz(),
                 voltage = format!("{:.2}V", final_v),

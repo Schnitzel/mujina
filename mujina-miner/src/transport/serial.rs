@@ -517,6 +517,31 @@ impl SerialControl {
         self.inner.bytes_read.store(0, Ordering::Relaxed);
         self.inner.bytes_written.store(0, Ordering::Relaxed);
     }
+
+    /// Flush (discard) all data in the input buffer.
+    ///
+    /// This is useful for clearing stale data before starting communication,
+    /// e.g., after releasing ASICs from reset.
+    pub fn flush_input(&self) -> Result<(), SerialError> {
+        let fd = self.inner.fd.as_raw_fd();
+        let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
+
+        rustix::termios::tcflush(fd_ref, rustix::termios::QueueSelector::IFlush)
+            .map_err(|e| SerialError::ConfigError(format!("Failed to flush input: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Flush (discard) all data in both input and output buffers.
+    pub fn flush_all(&self) -> Result<(), SerialError> {
+        let fd = self.inner.fd.as_raw_fd();
+        let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
+
+        rustix::termios::tcflush(fd_ref, rustix::termios::QueueSelector::IOFlush)
+            .map_err(|e| SerialError::ConfigError(format!("Failed to flush buffers: {}", e)))?;
+
+        Ok(())
+    }
 }
 
 impl Drop for SerialInner {

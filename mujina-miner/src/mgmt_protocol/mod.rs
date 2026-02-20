@@ -5,7 +5,10 @@
 //! passthrough, ADC readings, and other board management functions.
 
 pub mod bitaxe_raw;
+pub mod bitcrane;
 
 // Re-export commonly used types
 pub use bitaxe_raw::channel::ControlChannel;
 pub use bitaxe_raw::gpio::{BitaxeRawGpioController, BitaxeRawGpioPin};
+pub use bitcrane::apw12::Apw12Psu;
+pub use bitcrane::gpio::{BitcraneGpioController, BitcraneGpioPin, BitcraneGpioPinHandle};

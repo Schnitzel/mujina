@@ -79,6 +79,8 @@ const ERROR_MARKER: u8 = 0xff;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Page {
+    /// PSU operations (bit-banged I2C on GPIO14/GPIO15 for APW12)
+    PSU = 0x04,
     /// I2C operations (EMC2101, TMP75, INA260)
     I2C = 0x05,
     /// GPIO operations (ASIC reset control)

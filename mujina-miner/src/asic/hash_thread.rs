@@ -143,11 +143,34 @@ pub trait AsicEnable: Send + Sync {
 
 /// Voltage regulator control for ASIC core voltage.
 ///
-/// Hash threads may use this to adjust voltage for tuning.
+/// Hash threads may use this to adjust voltage for tuning. Different regulators
+/// have different voltage ranges and step sizes.
 #[async_trait]
 pub trait VoltageRegulator: Send + Sync {
     /// Set output voltage in volts.
     async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()>;
+
+    /// Get the valid voltage range (min, max) in volts.
+    ///
+    /// Default is (0.0, 4.0) for per-chip stacked regulators like TPS546.
+    fn voltage_range(&self) -> (f32, f32) {
+        (0.0, 4.0)
+    }
+
+    /// Get the target operating voltage at full frequency.
+    ///
+    /// This is the voltage the ramp will reach at target frequency.
+    /// Default is the max voltage from voltage_range().
+    fn target_voltage(&self) -> f32 {
+        self.voltage_range().1
+    }
+
+    /// Get the voltage step size for ramping in volts.
+    ///
+    /// Default is 0.05V for fine-grained per-chip voltage control.
+    fn voltage_step(&self) -> f32 {
+        0.05
+    }
 }
 
 /// Hardware interfaces provided by the board to the hash thread.
