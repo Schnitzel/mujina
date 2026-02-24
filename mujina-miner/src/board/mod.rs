@@ -9,7 +9,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use tokio::sync::watch;
 
 use crate::{
-    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::{BoardState, MinerState},
+    asic::hash_thread::HashThread,
+    transport::UsbDeviceInfo,
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -37,6 +39,14 @@ pub trait Board: Send {
     /// Board-to-thread shutdown is implementation-specific (not exposed through
     /// HashThread trait). Call board.shutdown() to trigger thread shutdown.
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError>;
+
+    /// Set the miner state receiver for telemetry features.
+    ///
+    /// Boards that display hashrate or other aggregate metrics can subscribe
+    /// to miner state updates. Default implementation does nothing.
+    fn set_miner_state_rx(&mut self, _rx: watch::Receiver<MinerState>) {
+        // Default: boards that don't need miner state ignore this
+    }
 }
 
 /// Information about a board

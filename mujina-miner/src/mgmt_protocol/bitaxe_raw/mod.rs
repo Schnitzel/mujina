@@ -89,6 +89,8 @@ pub enum Page {
     ADC = 0x07,
     /// Fan control operations (bitcrane PWM fans)
     Fan = 0x09,
+    /// OLED display operations
+    Display = 0x0A,
 }
 
 /// I2C commands

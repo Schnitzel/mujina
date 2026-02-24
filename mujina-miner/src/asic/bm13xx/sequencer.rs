@@ -177,9 +177,9 @@ impl Sequencer {
 
     /// Build frequency ramp sequence from initial PLL frequency to target.
     ///
-    /// Ramps in 6.25 MHz steps with 150ms delay between each step, matching
-    /// esp-miner's frequency transition algorithm. The initial frequency is
-    /// ~56.25 MHz (set during register configuration).
+    /// Ramps in 6.25 MHz steps with 10ms delay between each step for PLL
+    /// lock. The initial frequency is ~56.25 MHz (set during register
+    /// configuration).
     ///
     /// Returns `(Frequency, Step)` pairs so the caller can compute the
     /// matching voltage for each step when coordinating a voltage-frequency
@@ -189,7 +189,7 @@ impl Sequencer {
     pub fn build_frequency_ramp(&self, target: Frequency) -> Vec<(Frequency, Step)> {
         const INITIAL_FREQ_MHZ: f32 = 56.25;
         const STEP_MHZ: f32 = 6.25;
-        const STEP_DELAY: Duration = Duration::from_millis(200);
+        const STEP_DELAY: Duration = Duration::from_millis(100);
 
         let mut steps = vec![];
 

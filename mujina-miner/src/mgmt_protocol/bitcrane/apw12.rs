@@ -43,6 +43,7 @@ pub struct Apw12Psu {
     channel: ControlChannel,
     gpio: BitcraneGpioController,
     enabled: bool,
+    last_voltage_setting: Option<u8>,
 }
 
 impl Apw12Psu {
@@ -53,6 +54,7 @@ impl Apw12Psu {
             channel,
             gpio,
             enabled: false,
+            last_voltage_setting: None,
         }
     }
 
@@ -100,6 +102,12 @@ impl Apw12Psu {
         // Voltage formula: hex_voltage = (voltage - 15.092) / -0.013
         let hex_voltage = ((voltage - 15.092) / -0.013) as u8;
 
+        // Skip if voltage setting hasn't changed
+        if Some(hex_voltage) == self.last_voltage_setting {
+            return Ok(());
+        }
+        self.last_voltage_setting = Some(hex_voltage);
+
         debug!(
             voltage = voltage,
             hex_voltage = hex_voltage,
@@ -110,8 +118,8 @@ impl Apw12Psu {
         let packet = Self::make_psu_packet(&cmd_bytes);
         self.psu_send_bytes(&packet).await?;
 
-        // Read response
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Wait for PSU to process and read response to ensure command completed
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         let _response = self.psu_read_bytes(8).await?;
         Ok(())
     }

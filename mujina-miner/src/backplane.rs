@@ -6,6 +6,7 @@
 //! lifecycle (hotplug, emergency shutdown, etc.).
 
 use crate::{
+    api_client::types::MinerState,
     asic::hash_thread::HashThread,
     board::{Board, BoardDescriptor, BoardRegistration, VirtualBoardRegistry},
     error::Result,
@@ -16,7 +17,7 @@ use crate::{
     },
 };
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Board registry that uses inventory to find registered boards.
 pub struct BoardRegistry;
@@ -51,6 +52,8 @@ pub struct Backplane {
     scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
     /// Channel to forward board registrations to the API server
     board_reg_tx: mpsc::Sender<BoardRegistration>,
+    /// Receiver for miner state (passed to boards for display)
+    miner_state_rx: watch::Receiver<MinerState>,
 }
 
 impl Backplane {
@@ -59,6 +62,7 @@ impl Backplane {
         event_rx: mpsc::Receiver<TransportEvent>,
         scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
         board_reg_tx: mpsc::Sender<BoardRegistration>,
+        miner_state_rx: watch::Receiver<MinerState>,
     ) -> Self {
         Self {
             registry: BoardRegistry,
@@ -67,6 +71,7 @@ impl Backplane {
             event_rx,
             scheduler_tx,
             board_reg_tx,
+            miner_state_rx,
         }
     }
 
@@ -160,6 +165,9 @@ impl Backplane {
                         "Failed to register board with API server"
                     );
                 }
+
+                // Provide miner state receiver for boards that display aggregate metrics
+                board.set_miner_state_rx(self.miner_state_rx.clone());
 
                 // Create hash threads from the board
                 match board.create_hash_threads().await {

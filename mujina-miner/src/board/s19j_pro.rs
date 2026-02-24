@@ -17,7 +17,7 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::{BoardState, Fan, TemperatureSensor},
+    api_client::types::{BoardState, Fan, MinerState, TemperatureSensor},
     asic::{
         bm13xx::{
             self,
@@ -32,6 +32,7 @@ use crate::{
     mgmt_protocol::{
         ControlChannel, Apw12Psu,
         bitcrane::{
+            display::BitcraneDisplay,
             fan::{self, BitcraneFan},
             gpio::{BitcraneGpioController, BitcraneGpioPin, BitcraneGpioPinHandle},
             i2c::BitcraneI2c,
@@ -78,6 +79,8 @@ pub struct S19jPro {
 
     /// Channel for publishing board state to the API server.
     state_tx: watch::Sender<BoardState>,
+    /// Receiver for miner state (hashrate for OLED display).
+    miner_state_rx: Option<watch::Receiver<MinerState>>,
 }
 
 impl S19jPro {
@@ -97,6 +100,7 @@ impl S19jPro {
             psu: None,
             temp_sensors: None,
             state_tx,
+            miner_state_rx: None,
         }
     }
 
@@ -171,12 +175,6 @@ impl S19jPro {
         }
         info!("Fans initialized at {}% speed", DEFAULT_FAN_SPEED);
 
-        // Spawn telemetry task to periodically read temperatures and fan RPMs
-        let state_tx = self.state_tx.clone();
-        tokio::spawn(async move {
-            telemetry_task(temp0, temp1, fans, state_tx).await;
-        });
-
         info!("S19j Pro initialized successfully");
         Ok(())
     }
@@ -193,6 +191,14 @@ impl Board for S19jPro {
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
+        // Set all fans to 0%
+        for (i, fan) in fan::all_fans(self.control_channel.clone()).into_iter().enumerate() {
+            if let Err(e) = fan.set_speed(0).await {
+                warn!(fan = i, "Failed to set fan to 0% on shutdown: {}", e);
+            }
+        }
+        info!("Fans set to 0%");
+
         // Assert reset to stop ASICs
         if let Some(ref mut reset_pin) = self.reset_pin {
             if let Err(e) = reset_pin.write(PinValue::Low).await {
@@ -263,20 +269,43 @@ impl Board for S19jPro {
             BoardError::InitializationFailed(format!("Failed to create hash thread: {}", e))
         })?;
 
+        // Spawn telemetry task now that miner_state_rx is available
+        // (set_miner_state_rx is called by backplane before create_hash_threads)
+        let (temp0, temp1) = self.temp_sensors.take().ok_or_else(|| {
+            BoardError::InitializationFailed("Temperature sensors not initialized".to_string())
+        })?;
+        let fans = fan::all_fans(self.control_channel.clone());
+        let display = BitcraneDisplay::new(self.control_channel.clone());
+        let state_tx = self.state_tx.clone();
+        let miner_state_rx = self.miner_state_rx.clone();
+        tokio::spawn(async move {
+            telemetry_task(temp0, temp1, fans, display, state_tx, miner_state_rx).await;
+        });
+
         Ok(vec![Box::new(thread)])
+    }
+
+    fn set_miner_state_rx(&mut self, rx: watch::Receiver<MinerState>) {
+        self.miner_state_rx = Some(rx);
     }
 }
 
 /// Telemetry task that periodically reads temperature sensors and fan RPMs.
 ///
 /// Runs indefinitely, updating state_tx with readings every 2 seconds.
+/// Also updates the OLED display with hashrate every 10 seconds.
 async fn telemetry_task(
     temp0: Tmp75,
     temp1: Tmp75,
     fans: [BitcraneFan; 4],
+    display: BitcraneDisplay,
     state_tx: watch::Sender<BoardState>,
+    miner_state_rx: Option<watch::Receiver<MinerState>>,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+    const DISPLAY_UPDATE_INTERVAL: u32 = 5; // Update display every N telemetry cycles
+
+    let mut cycle_count: u32 = 0;
 
     loop {
         // Read both temperature sensors
@@ -318,6 +347,19 @@ async fn telemetry_task(
             state.temperatures = temperatures;
             state.fans = fan_states;
         });
+
+        // Update OLED display periodically with actual hashrate from scheduler
+        if cycle_count % DISPLAY_UPDATE_INTERVAL == 0 {
+            let hashrate_gh = miner_state_rx
+                .as_ref()
+                .map(|rx| rx.borrow().hashrate as f64 / 1_000_000_000.0) // H/s to GH/s
+                .unwrap_or(0.0);
+
+            if let Err(e) = display.display_hashrate(hashrate_gh).await {
+                debug!(error = %e, "Failed to update OLED display");
+            }
+        }
+        cycle_count = cycle_count.wrapping_add(1);
 
         tokio::time::sleep(TELEMETRY_INTERVAL).await;
     }

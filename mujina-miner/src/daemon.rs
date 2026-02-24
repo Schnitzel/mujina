@@ -82,8 +82,12 @@ impl Daemon {
         // registrations here, the API server collects and serves them.
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
+        // Miner state channel: scheduler publishes snapshots, API serves them.
+        // Created early so backplane can pass receiver to boards for display.
+        let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
+
         // Create and start backplane
-        let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx);
+        let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx, miner_state_rx.clone());
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
@@ -223,9 +227,6 @@ impl Daemon {
                 }
             });
         }
-
-        // Miner state channel: scheduler publishes snapshots, API serves them.
-        let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
 
         // Command channel: API sends commands, scheduler processes them.
         let (scheduler_cmd_tx, scheduler_cmd_rx) = mpsc::channel::<SchedulerCommand>(16);

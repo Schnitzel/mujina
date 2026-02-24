@@ -327,7 +327,7 @@ impl ChipJobs {
 
 /// Settle time after changing the voltage regulator target, before adjusting
 /// frequency. Allows the regulator output to reach the new setpoint.
-const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(100);
+const VOLTAGE_SETTLE_DELAY: Duration = Duration::from_millis(50);
 
 /// Maximum total output voltage for per-chip stacked regulators (TPS546).
 const DEFAULT_VOUT_MAX: f32 = 4.0;
@@ -577,11 +577,37 @@ where
         // Wait for chips to stabilize after power-on
         time::sleep(Duration::from_millis(500)).await;
 
+        // Drain any stale responses that accumulated during power-on
+        let mut drained = 0;
+        while self.response_rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        if drained > 0 {
+            debug!(count = drained, "Drained stale responses before enumeration");
+        }
+
         // 2. Execute enumeration sequence (assigns addresses)
         self.execute_enumeration().await?;
 
-        // 3. Verify chip count
-        let responding = self.verify_chain().await;
+        // 3. Verify chip count with retries
+        const MAX_VERIFY_RETRIES: usize = 3;
+        const VERIFY_RETRY_DELAY_MS: u64 = 500;
+        let mut responding = 0;
+        for attempt in 1..=MAX_VERIFY_RETRIES {
+            responding = self.verify_chain().await;
+            if responding == expected_count {
+                break;
+            }
+            if attempt < MAX_VERIFY_RETRIES {
+                debug!(
+                    attempt,
+                    expected = expected_count,
+                    responding,
+                    "Chain verification incomplete, retrying"
+                );
+                time::sleep(Duration::from_millis(VERIFY_RETRY_DELAY_MS)).await;
+            }
+        }
         let min_required = min_viable_chip_count(expected_count);
         if responding < min_required {
             return Err(HashThreadError::InitializationFailed(format!(
@@ -738,23 +764,20 @@ where
                 ))
             })?;
 
-            // 3. Wait for PLL to lock
+            // 3. Wait for PLL to lock (brief delay, no per-step verification)
             if let Some(delay) = step.wait_after {
                 time::sleep(delay).await;
             }
+        }
 
-            // 4. Health check: verify all chips still respond
-            let responding = self.verify_chain().await;
-            if responding < chip_count {
-                let step_voltage = voltage_for_frequency_stacked(*freq, domain_count, max_v);
-                warn!(
-                    freq_mhz = freq.mhz(),
-                    voltage = format!("{:.2}V", step_voltage),
-                    expected = chip_count,
-                    responding,
-                    "Chips lost during ramp"
-                );
-            }
+        // 4. Health check: verify all chips respond after ramp completes
+        let responding = self.verify_chain().await;
+        if responding < chip_count {
+            warn!(
+                expected = chip_count,
+                responding,
+                "Chips lost during frequency ramp"
+            );
         }
 
         if has_regulator {
