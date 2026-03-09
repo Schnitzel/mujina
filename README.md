@@ -182,6 +182,28 @@ MUJINA_POOL_USER="your-address.worker" \
 cargo run
 ```
 
+### Amlogic Board Workflow
+
+For the live Amlogic Antminer control-board bring-up, the deployed board uses
+`/home/root/start.sh` and `/home/root/stop.sh` as convenience wrappers around
+`mujina-minerd`.
+
+Start the miner on the board:
+
+```bash
+ssh root@<board-ip> /home/root/start.sh
+```
+
+Stop the miner cleanly on the board:
+
+```bash
+ssh root@<board-ip> /home/root/stop.sh
+```
+
+The current bring-up script expects `/home/root/mujina-hb2.toml` and binds the
+API to `0.0.0.0:7785`, so stats can be queried remotely once the miner is
+running.
+
 ## Protocol Analysis Tool
 
 The `mujina-dissect` tool analyzes captured communication between the host and

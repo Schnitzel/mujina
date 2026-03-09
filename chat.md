@@ -52,3 +52,10 @@ It is not an automatic export of the full Copilot chat transcript.
 - Fixed MUSL cross-build gating so Linux USB discovery is treated as unavailable on `aarch64-unknown-linux-musl`, allowing the native Amlogic daemon binary to build cleanly with `cargo zigbuild`.
 - Built and deployed `mujina-cli` to `/home/root/mujina-cli` so miner stats can be queried directly on the control board without needing Cargo on-device.
 - Added and deployed `/home/root/start.sh` as a convenience launcher for the HB2 config, pool URL, pool user, and externally reachable API bind on port `7785`.
+
+### Native Telemetry Update
+
+- Implemented a periodic native Amlogic telemetry task in `s19j_pro_amlogic.rs` that refreshes board temperatures, PSU voltage, and fan RPM state into `BoardState` every `2s` while mining.
+- Wired telemetry task shutdown to the board cancellation path so polling exits cleanly during miner shutdown.
+- Cross-built the updated `mujina-minerd` for `aarch64-unknown-linux-musl` and redeployed it to `/home/root/mujina-minerd` on the live board.
+- Added `stop.sh` as a companion to `start.sh` so the live board can stop `mujina-minerd` with the available `killall`/`pidof` tools and verify shutdown without needing `pkill`.

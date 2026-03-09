@@ -20,10 +20,12 @@ use amlogic_cb_tools::{
         parse_frame,
     },
     pwm::SysfsPwm,
+    tach::SysfsTachometer,
 };
 use async_trait::async_trait;
 use tokio::sync::{Mutex, watch};
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::sync::CancellationToken;
 
 use super::{Board, BoardError, BoardInfo, VirtualBoardDescriptor};
 use crate::{
@@ -76,6 +78,7 @@ pub struct S19jProAmlogic {
     board_serial: Option<String>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
+    telemetry_shutdown: CancellationToken,
 }
 
 impl S19jProAmlogic {
@@ -92,6 +95,7 @@ impl S19jProAmlogic {
             board_serial,
             psu,
             state_tx,
+            telemetry_shutdown: CancellationToken::new(),
         }
     }
 
@@ -167,6 +171,8 @@ impl Board for S19jProAmlogic {
     async fn shutdown(&mut self) -> Result<(), BoardError> {
         info!(board = %device_id(&self.config), "Shutting down native Amlogic board");
 
+        self.telemetry_shutdown.cancel();
+
         assert_all_resets(&self.config)?;
         configure_fans(&self.config, 0)?;
         self.psu
@@ -214,6 +220,15 @@ impl Board for S19jProAmlogic {
 
         self.state_tx.send_modify(|state| {
             state.serial = self.board_serial.clone().or_else(|| Some(device_id(&self.config)));
+        });
+
+        let config = self.config.clone();
+        let hashboard = self.selected_hashboard.clone();
+        let psu = Arc::clone(&self.psu);
+        let state_tx = self.state_tx.clone();
+        let shutdown = self.telemetry_shutdown.child_token();
+        tokio::spawn(async move {
+            native_telemetry_task(config, hashboard, psu, state_tx, shutdown).await;
         });
 
         Ok(vec![Box::new(thread)])
@@ -498,6 +513,97 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
             target_percent: Some(percent),
         })
         .collect()
+}
+
+async fn native_telemetry_task(
+    config: AmlogicControlBoardConfig,
+    hashboard: AmlogicHashboardConfig,
+    psu: Arc<Mutex<NativeAmlogicPsu>>,
+    state_tx: watch::Sender<BoardState>,
+    shutdown: CancellationToken,
+) {
+    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        let temperatures = match read_temperatures(&hashboard) {
+            Ok(temperatures) => temperatures,
+            Err(error) => {
+                debug!(board = %hashboard.index, error = %error, "Native telemetry temperature read failed");
+                Vec::new()
+            }
+        };
+
+        let fans = read_fan_states(&config, config.startup.default_fan_percent).await;
+        let voltage_v = match psu.lock().await.measure_voltage() {
+            Ok(voltage_v) => Some(voltage_v),
+            Err(error) => {
+                debug!(error = %error, "Native telemetry PSU voltage read failed");
+                None
+            }
+        };
+        let powers = vec![PowerMeasurement {
+            name: "apw12".into(),
+            voltage_v,
+            current_a: None,
+            power_w: None,
+        }];
+
+        state_tx.send_modify(|state| {
+            state.temperatures = temperatures.clone();
+            state.fans = fans.clone();
+            state.powers = powers.clone();
+        });
+
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(TELEMETRY_INTERVAL) => {}
+        }
+    }
+}
+
+async fn read_fan_states(
+    config: &AmlogicControlBoardConfig,
+    target_percent: u8,
+) -> Vec<Fan> {
+    const FAN_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
+
+    let mut fan_states = Vec::with_capacity(config.fans.len());
+    for fan in &config.fans {
+        let fan_name = format!("fan{}", fan.index);
+        let tach_gpio = fan.tach_gpio;
+        let pulses_per_rev = fan.pulses_per_rev;
+        let rpm = match tokio::task::spawn_blocking(move || {
+            SysfsTachometer::new(tach_gpio)
+                .measure_rpm(FAN_SAMPLE_WINDOW, pulses_per_rev)
+                .map(|reading| reading.rpm)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(Ok(rpm)) => Some(rpm),
+            Ok(Err(error)) => {
+                debug!(fan = %fan_name, gpio = tach_gpio, error = %error, "Native telemetry fan RPM read failed");
+                None
+            }
+            Err(error) => {
+                debug!(fan = %fan_name, gpio = tach_gpio, error = %error, "Native telemetry fan RPM task join failed");
+                None
+            }
+        };
+
+        fan_states.push(Fan {
+            name: fan_name,
+            rpm,
+            percent: None,
+            target_percent: Some(target_percent),
+        });
+    }
+
+    fan_states
 }
 
 fn read_temperatures(hashboard: &AmlogicHashboardConfig) -> Result<Vec<TemperatureSensor>, BoardError> {
