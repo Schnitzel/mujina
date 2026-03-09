@@ -12,8 +12,8 @@ use crate::{
     error::Result,
     tracing::prelude::*,
     transport::{
-        TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
-        usb::TransportEvent as UsbTransportEvent,
+        TransportEvent, UsbDeviceInfo, amlogic::TransportEvent as AmlogicTransportEvent,
+        cpu::TransportEvent as CpuTransportEvent, usb::TransportEvent as UsbTransportEvent,
     },
 };
 use std::collections::HashMap;
@@ -79,6 +79,9 @@ impl Backplane {
     pub async fn run(&mut self) -> Result<()> {
         while let Some(event) = self.event_rx.recv().await {
             match event {
+                TransportEvent::Amlogic(amlogic_event) => {
+                    self.handle_amlogic_event(amlogic_event).await?;
+                }
                 TransportEvent::Usb(usb_event) => {
                     self.handle_usb_event(usb_event).await?;
                 }
@@ -115,6 +118,105 @@ impl Backplane {
                 }
             }
         }
+    }
+
+    /// Handle native Amlogic control-board virtual transport events.
+    async fn handle_amlogic_event(&mut self, event: AmlogicTransportEvent) -> Result<()> {
+        match event {
+            AmlogicTransportEvent::DeviceConnected(device_info) => {
+                let Some(descriptor) = self.virtual_registry.find("s19j_pro_amlogic") else {
+                    error!("No virtual board descriptor found for s19j_pro_amlogic");
+                    return Ok(());
+                };
+
+                info!(
+                    board = descriptor.name,
+                    id = %device_info.device_id,
+                    "Native Amlogic control board enabled."
+                );
+
+                let (mut board, registration) = match (descriptor.create_fn)().await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        error!(
+                            board = descriptor.name,
+                            id = %device_info.device_id,
+                            error = %e,
+                            "Failed to create native Amlogic board"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let board_info = board.board_info();
+                let board_id = device_info.device_id.clone();
+
+                if let Err(e) = self.board_reg_tx.send(registration).await {
+                    error!(
+                        board = %board_info.model,
+                        error = %e,
+                        "Failed to register board with API server"
+                    );
+                }
+
+                board.set_miner_state_rx(self.miner_state_rx.clone());
+
+                match board.create_hash_threads().await {
+                    Ok(threads) => {
+                        let thread_count = threads.len();
+                        self.boards.insert(board_id.clone(), board);
+
+                        for thread in threads {
+                            if let Err(e) = self.scheduler_tx.send(thread).await {
+                                error!(
+                                    board = %board_info.model,
+                                    error = %e,
+                                    "Failed to send thread to scheduler"
+                                );
+                                break;
+                            }
+                        }
+
+                        info!(
+                            board = %board_info.model,
+                            id = %board_id,
+                            threads = thread_count,
+                            "Native Amlogic board started."
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            board = %board_info.model,
+                            id = %board_id,
+                            error = %e,
+                            "Native Amlogic board failed to start."
+                        );
+                    }
+                }
+            }
+            AmlogicTransportEvent::DeviceDisconnected { device_id } => {
+                if let Some(mut board) = self.boards.remove(&device_id) {
+                    let model = board.board_info().model;
+                    debug!(board = %model, id = %device_id, "Shutting down native Amlogic board");
+
+                    match board.shutdown().await {
+                        Ok(()) => {
+                            info!(board = %model, id = %device_id, "Native Amlogic board disconnected");
+                        }
+                        Err(e) => {
+                            error!(
+                                board = %model,
+                                id = %device_id,
+                                error = %e,
+                                "Failed to shutdown native Amlogic board"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Handle USB transport events.

@@ -45,11 +45,13 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 rustix = { workspace = true }
 slotmap = { workspace = true }
+toml = { workspace = true }
 ruint = "1.17.0"
+amlogic-cb-tools = { path = "../../amlogic-cb-tools" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-udev = { workspace = true }
-udev = { workspace = true }
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+tokio-udev = { workspace = true, optional = true }
+udev = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
@@ -69,7 +71,8 @@ name = "mujina-tui"
 path = "src/bin/tui.rs"
 
 [features]
-default = []
+default = ["usb-discovery"]
+usb-discovery = ["dep:tokio-udev", "dep:udev"]
 skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
 
 [dev-dependencies]

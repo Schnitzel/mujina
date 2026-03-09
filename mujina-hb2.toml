@@ -1,0 +1,65 @@
+[hardware.amlogic_control_board]
+enabled = true
+board_name = "s19jpro-amlogic-hb2"
+
+[hardware.amlogic_control_board.psu]
+i2c_device = "/dev/i2c-1"
+address = 16
+write_register = 17
+enable_gpio = 437
+
+[hardware.amlogic_control_board.startup]
+default_fan_percent = 50
+initial_voltage = 12.6
+psu_settle_ms = 2000
+reset_assert_ms = 100
+reset_release_ms = 2000
+
+[hardware.amlogic_control_board.startup.health_gate]
+read_eeprom_before_mining = true
+read_temperatures_before_mining = true
+fail_on_missing_expected_hashboard = false
+
+[[hardware.amlogic_control_board.fans]]
+index = 0
+pwm_chip = 0
+pwm_channel = 0
+tach_gpio = 447
+pulses_per_rev = 2
+
+[[hardware.amlogic_control_board.fans]]
+index = 1
+pwm_chip = 0
+pwm_channel = 0
+tach_gpio = 448
+pulses_per_rev = 2
+
+[[hardware.amlogic_control_board.fans]]
+index = 2
+pwm_chip = 0
+pwm_channel = 1
+tach_gpio = 449
+pulses_per_rev = 2
+
+[[hardware.amlogic_control_board.fans]]
+index = 3
+pwm_chip = 0
+pwm_channel = 1
+tach_gpio = 450
+pulses_per_rev = 2
+
+[hardware.amlogic_control_board.leds]
+green_gpio = 453
+red_gpio = 438
+
+[[hardware.amlogic_control_board.hashboards]]
+index = 2
+model = "s19j_pro"
+serial_path = "/dev/ttyS3"
+reset_gpio = 456
+detect_gpio = 441
+temp_i2c_device = "/dev/i2c-0"
+temp_sensor_addresses = [76, 72]
+eeprom_i2c_device = "/dev/i2c-0"
+eeprom_address = 80
+required = true

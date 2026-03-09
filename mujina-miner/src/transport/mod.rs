@@ -5,11 +5,13 @@
 //! implementation provides device discovery and emits transport-specific
 //! events when devices are connected or disconnected.
 
+pub mod amlogic;
 pub mod cpu;
 pub mod serial;
 pub mod usb;
 
 // Re-export transport implementations
+pub use amlogic::AmlogicDeviceInfo;
 pub use cpu::CpuDeviceInfo;
 pub use serial::{
     Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
@@ -20,6 +22,9 @@ pub use usb::{UsbDeviceInfo, UsbTransport};
 /// Generic transport event that can represent different transport types.
 #[derive(Debug)]
 pub enum TransportEvent {
+    /// Native Amlogic control-board event
+    Amlogic(amlogic::TransportEvent),
+
     /// USB device event
     Usb(usb::TransportEvent),
 

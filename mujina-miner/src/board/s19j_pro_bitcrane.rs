@@ -46,6 +46,10 @@ use crate::{
     },
 };
 
+const BOARD_MODEL: &str = "S19j Pro (Bitcrane v3)";
+const BOARD_NAME_PREFIX: &str = "s19jpro-bitcrane";
+const THREAD_NAME_PREFIX: &str = "S19jProBitcrane";
+
 // Register this board type with the inventory system
 inventory::submit! {
     BoardDescriptor {
@@ -57,13 +61,13 @@ inventory::submit! {
             product: Match::Specific(StringMatch::Exact("bitcrane_S19jpro")),
             serial_pattern: Match::Any,
         },
-        name: "S19j Pro",
+        name: BOARD_MODEL,
         create_fn: |device| Box::pin(create_from_usb(device)),
     }
 }
 
-/// S19j Pro hashboard.
-pub struct S19jPro {
+/// S19j Pro hashboard via Bitcrane v3.
+pub struct S19jProBitcrane {
     device_info: UsbDeviceInfo,
     data_port_path: String,
     /// Control channel for board management (bitcrane protocol).
@@ -83,8 +87,8 @@ pub struct S19jPro {
     miner_state_rx: Option<watch::Receiver<MinerState>>,
 }
 
-impl S19jPro {
-    /// Create a new S19j Pro board instance.
+impl S19jProBitcrane {
+    /// Create a new Bitcrane-backed S19j Pro board instance.
     pub fn new(
         device_info: UsbDeviceInfo,
         control_channel: ControlChannel,
@@ -115,7 +119,7 @@ impl S19jPro {
         let mut reset_pin = gpio.pin(BitcraneGpioPin::Rst0);
 
         // Initialize to safe state: chips in reset (RST0 low = reset asserted)
-        debug!("Initializing S19j Pro: chips in reset");
+        debug!("Initializing {BOARD_MODEL}: chips in reset");
         reset_pin.write(PinValue::Low).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to assert reset: {}", e))
         })?;
@@ -175,16 +179,16 @@ impl S19jPro {
         }
         info!("Fans initialized at {}% speed", DEFAULT_FAN_SPEED);
 
-        info!("S19j Pro initialized successfully");
+        info!("{BOARD_MODEL} initialized successfully");
         Ok(())
     }
 }
 
 #[async_trait]
-impl Board for S19jPro {
+impl Board for S19jProBitcrane {
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
-            model: "S19j Pro".to_string(),
+            model: BOARD_MODEL.to_string(),
             firmware_version: None,
             serial_number: self.device_info.serial_number.clone(),
         }
@@ -213,7 +217,7 @@ impl Board for S19jPro {
             }
         }
 
-        info!("S19j Pro shutdown complete");
+        info!("{BOARD_MODEL} shutdown complete");
         Ok(())
     }
 
@@ -242,8 +246,8 @@ impl Board for S19jPro {
 
         // Build thread name from board model and serial
         let thread_name = match &self.device_info.serial_number {
-            Some(serial) => format!("S19jPro-{}", &serial[..8.min(serial.len())]),
-            None => "S19jPro".to_string(),
+            Some(serial) => format!("{THREAD_NAME_PREFIX}-{}", &serial[..8.min(serial.len())]),
+            None => THREAD_NAME_PREFIX.to_string(),
         };
 
         // Build chain configuration for S19j Pro: 42 series domains × 3 chips = 126 BM1362 chips
@@ -259,7 +263,7 @@ impl Board for S19jPro {
             topology: TopologySpec::uniform_domains(42, 3, false),
             chip_config: chip_config::bm1362(),
             peripherals: ChainPeripherals {
-                asic_enable: Arc::new(Mutex::new(S19jProAsicEnable { reset_pin })),
+                asic_enable: Arc::new(Mutex::new(S19jProBitcraneAsicEnable { reset_pin })),
                 voltage_regulator,
             },
         };
@@ -369,12 +373,12 @@ async fn telemetry_task(
 ///
 /// Controls RST0 pin via bitcrane protocol (active-low reset for ASIC chips).
 /// Power is handled externally.
-struct S19jProAsicEnable {
+struct S19jProBitcraneAsicEnable {
     reset_pin: BitcraneGpioPinHandle,
 }
 
 #[async_trait]
-impl AsicEnable for S19jProAsicEnable {
+impl AsicEnable for S19jProBitcraneAsicEnable {
     async fn enable(&mut self) -> anyhow::Result<()> {
         // Release reset (RST0 is active-low, so High = running)
         self.reset_pin
@@ -421,7 +425,7 @@ async fn create_from_usb(
         serial = ?device.serial_number,
         control = %control_port_path,
         data = %data_port_path,
-        "S19j Pro serial ports"
+        "S19j Pro Bitcrane serial ports"
     );
 
     // Open control port
@@ -433,15 +437,15 @@ async fn create_from_usb(
     // Create watch channel for board state, seeded with identity
     let serial = device.serial_number.clone();
     let initial_state = BoardState {
-        name: format!("s19jpro-{}", serial.as_deref().unwrap_or("unknown")),
-        model: "S19j Pro".into(),
+        name: format!("{BOARD_NAME_PREFIX}-{}", serial.as_deref().unwrap_or("unknown")),
+        model: BOARD_MODEL.into(),
         serial,
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
     // Create and initialize board
-    let mut board = S19jPro::new(device, control_channel, data_port_path, state_tx);
+    let mut board = S19jProBitcrane::new(device, control_channel, data_port_path, state_tx);
 
     board
         .initialize()
