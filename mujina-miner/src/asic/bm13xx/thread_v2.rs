@@ -716,39 +716,57 @@ where
         let has_regulator = self.peripherals.voltage_regulator.is_some();
 
         // Get voltage calculation parameters from regulator
-        let max_v = if let Some(ref regulator) = self.peripherals.voltage_regulator {
+        let (min_v, max_v) = if let Some(ref regulator) = self.peripherals.voltage_regulator {
             let reg = regulator.lock().await;
-            reg.voltage_range().1
+            reg.voltage_range()
         } else {
-            DEFAULT_VOUT_MAX
+            (0.0, DEFAULT_VOUT_MAX)
         };
 
+        let step_count = steps.len();
+
         info!(
-            steps = steps.len(),
+            steps = step_count,
             target_mhz = target.mhz(),
             coordinated = has_regulator,
             domain_count = domain_count,
             "Ramping frequency"
         );
 
-        for (freq, step) in &steps {
+        for (step_index, (freq, step)) in steps.iter().enumerate() {
             // 1. Set voltage (lead the frequency change)
             // Use domain_count for series voltage calculation:
             //   - For stacked (TPS546): 12 domains, V = V_per_chip * 12
             //   - For series (APW12): 42 domains, V = V_per_chip * 42
             // The regulator's set_voltage() will clamp to its valid range.
-            if let Some(ref regulator) = self.peripherals.voltage_regulator {
-                let step_voltage = voltage_for_frequency_stacked(*freq, domain_count, max_v);
+            let requested_voltage = has_regulator
+                .then(|| voltage_for_frequency_stacked(*freq, domain_count, max_v));
+            let applied_voltage = requested_voltage.map(|voltage| voltage.clamp(min_v, max_v));
 
+            if step_index == 0
+                || step_index + 1 == step_count
+                || (step_index + 1) % 8 == 0
+            {
+                debug!(
+                    step = step_index + 1,
+                    total_steps = step_count,
+                    frequency_mhz = freq.mhz(),
+                    requested_voltage_v = requested_voltage,
+                    applied_voltage_v = applied_voltage,
+                    "Executing frequency ramp step"
+                );
+            }
+
+            if let Some(ref regulator) = self.peripherals.voltage_regulator {
                 regulator
                     .lock()
                     .await
-                    .set_voltage(step_voltage)
+                    .set_voltage(applied_voltage.expect("applied voltage is present when regulator exists"))
                     .await
                     .map_err(|e| {
                         HashThreadError::InitializationFailed(format!(
                             "Failed to set voltage to {:.2}V: {}",
-                            step_voltage, e
+                            applied_voltage.expect("applied voltage is present when regulator exists"), e
                         ))
                     })?;
 

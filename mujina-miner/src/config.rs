@@ -150,6 +150,10 @@ pub struct AmlogicStartupConfig {
     pub default_fan_percent: u8,
 
     /// Initial PSU output voltage used for first BM1362 enumeration.
+    ///
+    /// This should be a low bring-up voltage. The BM13xx thread ramps the PSU
+    /// from this starting point up to the operating voltage as frequency is
+    /// increased.
     pub initial_voltage: f32,
 
     /// Delay after enabling the PSU before dependent operations begin.
