@@ -12,7 +12,7 @@ use tracing::{Level, info, warn};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{commands::SchedulerCommand, registry::BoardRegistry, v0};
+use super::{commands::SchedulerCommand, dashboard, registry::BoardRegistry, v0};
 use crate::api_client::types::MinerState;
 use crate::board::BoardRegistration;
 
@@ -118,7 +118,8 @@ pub(crate) fn build_router(
         .split_for_parts();
 
     router
-        .route("/", routing::get(Redirect::permanent("/swagger-ui")))
+        .route("/", routing::get(dashboard::index))
+        .route("/dashboard", routing::get(dashboard::index))
         .route("/api", routing::get(Redirect::permanent("/swagger-ui")))
         .merge(SwaggerUi::new("/swagger-ui").url("/api/v0/openapi.json", api))
         .layer(
@@ -187,6 +188,15 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/health").await;
         assert_eq!(status, 200);
         assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn root_serves_dashboard() {
+        let fixtures = build_test_router(MinerState::default(), vec![]);
+        let (status, body) = get(fixtures.router.clone(), "/").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("Mujina Dashboard"));
+        assert!(body.contains("/api/v0/miner"));
     }
 
     #[tokio::test]

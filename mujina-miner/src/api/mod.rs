@@ -5,6 +5,7 @@
 //! require authentication for local access.
 
 pub mod commands;
+mod dashboard;
 mod registry;
 mod server;
 mod v0;
