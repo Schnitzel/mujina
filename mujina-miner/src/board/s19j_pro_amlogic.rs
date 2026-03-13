@@ -37,7 +37,7 @@ use crate::{
             chip_config, thread_v2,
             topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, HashThread},
+        hash_thread::{AsicEnable, HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent, HashThreadStatus},
     },
     config::{AmlogicControlBoardConfig, AmlogicHashboardConfig},
     error::Error,
@@ -78,6 +78,7 @@ pub struct S19jProAmlogic {
     board_serial: Option<String>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
+    thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     telemetry_shutdown: CancellationToken,
 }
 
@@ -95,6 +96,7 @@ impl S19jProAmlogic {
             board_serial,
             psu,
             state_tx,
+            thread_states: Arc::new(std::sync::Mutex::new(Vec::new())),
             telemetry_shutdown: CancellationToken::new(),
         }
     }
@@ -218,20 +220,158 @@ impl Board for S19jProAmlogic {
             BoardError::InitializationFailed(format!("Failed to create hash thread: {e}"))
         })?;
 
+        let thread_name = thread.name().to_string();
+        let thread_hashrate = u64::from(thread.capabilities().hashrate_estimate);
+
         self.state_tx.send_modify(|state| {
             state.serial = self.board_serial.clone().or_else(|| Some(device_id(&self.config)));
+            state.threads = vec![crate::api_client::types::ThreadState {
+                name: thread_name.clone(),
+                hashrate: thread_hashrate,
+                is_active: false,
+            }];
         });
+
+        {
+            let mut thread_states = self
+                .thread_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *thread_states = vec![crate::api_client::types::ThreadState {
+                name: thread_name.clone(),
+                hashrate: thread_hashrate,
+                is_active: false,
+            }];
+        }
+
+        let thread = BoardStateHashThread::new(
+            Box::new(thread),
+            self.state_tx.clone(),
+            Arc::clone(&self.thread_states),
+        );
 
         let config = self.config.clone();
         let hashboard = self.selected_hashboard.clone();
         let psu = Arc::clone(&self.psu);
         let state_tx = self.state_tx.clone();
+        let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
         tokio::spawn(async move {
-            native_telemetry_task(config, hashboard, psu, state_tx, shutdown).await;
+            native_telemetry_task(config, hashboard, psu, state_tx, thread_states, shutdown).await;
         });
 
         Ok(vec![Box::new(thread)])
+    }
+}
+
+struct BoardStateHashThread {
+    inner: Box<dyn HashThread>,
+    state_tx: watch::Sender<BoardState>,
+    thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+}
+
+impl BoardStateHashThread {
+    fn new(
+        inner: Box<dyn HashThread>,
+        state_tx: watch::Sender<BoardState>,
+        thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+    ) -> Self {
+        Self {
+            inner,
+            state_tx,
+            thread_states,
+        }
+    }
+
+    fn sync_thread_state(&self, is_active_override: Option<bool>) {
+        let status = self.inner.status();
+        let capabilities = self.inner.capabilities();
+        let hashrate = thread_hashrate_value(&status, capabilities);
+        let name = self.inner.name().to_string();
+        let is_active = is_active_override.unwrap_or(status.is_active);
+        let thread_state = crate::api_client::types::ThreadState {
+            name: name.clone(),
+            hashrate,
+            is_active,
+        };
+
+        {
+            let mut thread_states = self
+                .thread_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = thread_states.iter_mut().find(|thread| thread.name == name) {
+                *existing = thread_state.clone();
+            } else {
+                thread_states.push(thread_state.clone());
+            }
+        }
+
+        self.state_tx.send_modify(|state| {
+            if let Some(existing) = state.threads.iter_mut().find(|thread| thread.name == name) {
+                *existing = thread_state.clone();
+            } else {
+                state.threads.push(thread_state);
+            }
+        });
+    }
+}
+
+fn thread_hashrate_value(status: &HashThreadStatus, capabilities: &HashThreadCapabilities) -> u64 {
+    let measured = u64::from(status.hashrate);
+    if measured > 0 {
+        measured
+    } else {
+        u64::from(capabilities.hashrate_estimate)
+    }
+}
+
+#[async_trait]
+impl HashThread for BoardStateHashThread {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> &HashThreadCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn update_task(
+        &mut self,
+        new_task: HashTask,
+    ) -> Result<Option<HashTask>, HashThreadError> {
+        let result = self.inner.update_task(new_task).await;
+        self.sync_thread_state(Some(result.is_ok()));
+        result
+    }
+
+    async fn replace_task(
+        &mut self,
+        new_task: HashTask,
+    ) -> Result<Option<HashTask>, HashThreadError> {
+        let result = self.inner.replace_task(new_task).await;
+        self.sync_thread_state(Some(result.is_ok()));
+        result
+    }
+
+    async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
+        let result = self.inner.go_idle().await;
+        self.sync_thread_state(Some(false));
+        result
+    }
+
+    async fn shutdown(&mut self) -> Result<(), HashThreadError> {
+        let result = self.inner.shutdown().await;
+        self.sync_thread_state(Some(false));
+        result
+    }
+
+    fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<HashThreadEvent>> {
+        self.inner.take_event_receiver()
+    }
+
+    fn status(&self) -> HashThreadStatus {
+        self.inner.status()
     }
 }
 
@@ -429,7 +569,7 @@ fn select_hashboard(config: &AmlogicControlBoardConfig) -> Result<AmlogicHashboa
 fn is_hashboard_present(hashboard: &AmlogicHashboardConfig) -> Result<bool, BoardError> {
     let detect = SysfsGpio::new(hashboard.detect_gpio);
     detect
-        .set_input()
+        .set_input_bias_disabled()
         .map_err(|e| BoardError::HardwareControl(format!("Failed to configure detect GPIO: {e}")))?;
     let present = detect
         .read_value()
@@ -520,6 +660,7 @@ async fn native_telemetry_task(
     hashboard: AmlogicHashboardConfig,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
+    thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     shutdown: CancellationToken,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -551,11 +692,18 @@ async fn native_telemetry_task(
             current_a: None,
             power_w: None,
         }];
+        let threads = {
+            thread_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
 
         state_tx.send_modify(|state| {
             state.temperatures = temperatures.clone();
             state.fans = fans.clone();
             state.powers = powers.clone();
+            state.threads = threads.clone();
         });
 
         tokio::select! {

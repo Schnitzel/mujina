@@ -55,7 +55,7 @@ red_gpio = 438
 [[hardware.amlogic_control_board.hashboards]]
 index = 2
 model = "s19j_pro"
-serial_path = "/dev/ttyS3"
+serial_path = "/dev/ttyS1"
 reset_gpio = 456
 detect_gpio = 441
 temp_i2c_device = "/dev/i2c-0"

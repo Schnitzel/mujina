@@ -117,6 +117,7 @@ impl BM13xxThread {
                 cmd_rx,
                 evt_tx,
                 status: status_clone,
+                estimated_hashrate: initial_hashrate,
                 response_rx,
                 chip_tx,
                 peripherals: config.peripherals,
@@ -246,9 +247,9 @@ impl std::fmt::Debug for BM13xxThread {
 /// serial port, which is required for USB CDC-ACM flow control.
 struct BM13xxActor<W> {
     cmd_rx: mpsc::Receiver<ThreadCommand>,
-    #[expect(dead_code)] // Will emit events when nonce processing is added
     evt_tx: mpsc::Sender<HashThreadEvent>,
     status: Arc<RwLock<HashThreadStatus>>,
+    estimated_hashrate: HashRate,
     /// Responses from chips, forwarded by the reader task.
     response_rx: mpsc::Receiver<Result<protocol::Response, std::io::Error>>,
     chip_tx: W,
@@ -423,6 +424,12 @@ where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    fn update_status(&self, mutate: impl FnOnce(&mut HashThreadStatus)) -> HashThreadStatus {
+        let mut status = self.status.write();
+        mutate(&mut status);
+        status.clone()
+    }
+
     /// Main actor loop. Runs until command channel closes.
     async fn run(&mut self) {
         // ntime rolling timer - sends new job every second with incremented timestamp
@@ -508,7 +515,13 @@ where
         self.send_job(&new_task).await?;
 
         let old = self.current_task.replace(new_task);
-        self.status.write().is_active = true;
+        let status = self.update_status(|status| {
+            status.is_active = true;
+            if status.hashrate.is_zero() {
+                status.hashrate = self.estimated_hashrate;
+            }
+        });
+        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
         Ok(old)
     }
 
@@ -546,7 +559,11 @@ where
         self.disable_chips().await;
 
         let old = self.current_task.take();
-        self.status.write().is_active = false;
+        let status = self.update_status(|status| {
+            status.is_active = false;
+            status.hashrate = HashRate::default();
+        });
+        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
         Ok(old)
     }
 
@@ -639,6 +656,10 @@ where
             .await?;
 
         self.chip_state = ChipState::Initialized;
+        let status = self.update_status(|status| {
+            status.hashrate = self.estimated_hashrate;
+        });
+        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
         debug!(chip_count = responding, "Chain initialized");
         Ok(())
     }
@@ -897,8 +918,17 @@ where
         debug!("Disabling chips");
         if let Err(e) = self.peripherals.asic_enable.lock().await.disable().await {
             warn!(error = %e, "Failed to disable chips");
+            let status = self.update_status(|status| {
+                status.hardware_errors += 1;
+            });
+            let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
         }
         self.chip_state = ChipState::Disabled;
+        let status = self.update_status(|status| {
+            status.is_active = false;
+            status.hashrate = HashRate::default();
+        });
+        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
     }
 
     async fn handle_chip_response(&mut self, result: Result<protocol::Response, std::io::Error>) {
@@ -988,6 +1018,13 @@ where
                         // Channel closed = task replaced, share is stale
                         debug!("Share channel closed (task replaced)");
                     } else {
+                        let status = self.update_status(|status| {
+                            status.chip_shares_found += 1;
+                            status.is_active = true;
+                            status.hashrate = self.estimated_hashrate;
+                        });
+                        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+
                         debug!(
                             job_id,
                             nonce = format!("{:#x}", nonce),
@@ -1030,6 +1067,10 @@ where
 
             Err(e) => {
                 warn!(error = %e, "Chip stream error");
+                let status = self.update_status(|status| {
+                    status.hardware_errors += 1;
+                });
+                let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
             }
         }
     }
@@ -1205,6 +1246,7 @@ mod tests {
             cmd_rx,
             evt_tx,
             status,
+            estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             response_rx,
             chip_tx,
             peripherals: ChainPeripherals {

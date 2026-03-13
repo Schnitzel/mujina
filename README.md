@@ -204,6 +204,10 @@ The current bring-up script expects `/home/root/mujina-hb2.toml` and binds the
 API to `0.0.0.0:7785`, so stats can be queried remotely once the miner is
 running.
 
+That HB2 config now targets the corrected native mapping for hashboard 2:
+`/dev/ttyS1` with reset GPIO `456`, detect GPIO `441`, TMP75 addresses
+`0x4C/0x48`, and EEPROM address `0x50`.
+
 ## Protocol Analysis Tool
 
 The `mujina-dissect` tool analyzes captured communication between the host and
