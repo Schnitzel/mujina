@@ -4,6 +4,7 @@
 //! task management, signal handling, and graceful shutdown.
 
 use std::env;
+use std::sync::{Arc, Mutex};
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -12,12 +13,13 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::api_client::types::MinerState;
 use crate::tracing::prelude::*;
 use crate::{
-    api::{self, ApiConfig, commands::SchedulerCommand},
+    api::{self, ApiConfig, BoardRegistry, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
     board::s19j_pro_amlogic,
-    config::Config,
+    config::{Config, HashboardModel},
     cpu_miner::CpuMinerConfig,
+    display::gt_touch,
     job_source::{
         SourceCommand, SourceEvent,
         dummy::DummySource,
@@ -27,10 +29,13 @@ use crate::{
     scheduler::{self, SourceRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
     transport::{
-        AmlogicDeviceInfo, CpuDeviceInfo, TransportEvent, UsbTransport,
-        amlogic as amlogic_transport, cpu as cpu_transport,
+        AmlogicDeviceInfo, CpuDeviceInfo, TransportEvent, amlogic as amlogic_transport,
+        cpu as cpu_transport,
     },
 };
+
+#[cfg(feature = "usb-discovery")]
+use crate::transport::UsbTransport;
 
 /// The main daemon.
 pub struct Daemon {
@@ -85,9 +90,10 @@ impl Daemon {
 
                 info!(board = %device_id, "Native Amlogic control board enabled from config");
 
-                let event = TransportEvent::Amlogic(amlogic_transport::TransportEvent::DeviceConnected(
-                    AmlogicDeviceInfo { device_id },
-                ));
+                let event =
+                    TransportEvent::Amlogic(amlogic_transport::TransportEvent::DeviceConnected(
+                        AmlogicDeviceInfo { device_id },
+                    ));
                 if let Err(e) = transport_tx.send(event).await {
                     error!("Failed to send native Amlogic board event: {}", e);
                 }
@@ -115,13 +121,32 @@ impl Daemon {
             // Board registration channel: backplane forwards board
             // registrations here, the API server collects and serves them.
             let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
+            let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
+
+            self.tracker.spawn({
+                let board_registry = board_registry.clone();
+                async move {
+                    let mut board_reg_rx = board_reg_rx;
+                    while let Some(reg) = board_reg_rx.recv().await {
+                        board_registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(reg);
+                    }
+                }
+            });
 
             // Miner state channel: scheduler publishes snapshots, API serves them.
             // Created early so backplane can pass receiver to boards for display.
             let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
 
             // Create and start backplane
-            let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx, miner_state_rx.clone());
+            let mut backplane = Backplane::new(
+                transport_rx,
+                thread_tx,
+                board_reg_tx,
+                miner_state_rx.clone(),
+            );
             self.tracker.spawn({
                 let shutdown = self.shutdown.clone();
                 async move {
@@ -277,6 +302,8 @@ impl Daemon {
             // Start the API server
             self.tracker.spawn({
                 let shutdown = self.shutdown.clone();
+                let board_registry = board_registry.clone();
+                let api_miner_state_rx = miner_state_rx.clone();
                 async move {
                     // ASCII 'M' (77) + 'U' (85) = 7785
                     const API_PORT: u16 = 7785;
@@ -290,8 +317,8 @@ impl Daemon {
                     if let Err(e) = api::serve(
                         config,
                         shutdown,
-                        miner_state_rx,
-                        board_reg_rx,
+                        api_miner_state_rx,
+                        board_registry,
                         scheduler_cmd_tx,
                     )
                     .await
@@ -300,6 +327,46 @@ impl Daemon {
                     }
                 }
             });
+
+            if let Some(gt_touch_config) = self
+                .config
+                .as_ref()
+                .and_then(Config::enabled_amlogic_control_board)
+                .and_then(|config| config.gt_touch_display.clone())
+                .filter(|config| config.enabled)
+            {
+                let default_asic_model = self
+                    .config
+                    .as_ref()
+                    .and_then(Config::enabled_amlogic_control_board)
+                    .and_then(|config| config.hashboards.first())
+                    .map(|hashboard| match hashboard.model {
+                        HashboardModel::S19jPro => "BM1362".to_string(),
+                    });
+                let default_device_model = Some("S19j Pro (Amlogic control board)".to_string());
+                let default_voltage = self
+                    .config
+                    .as_ref()
+                    .and_then(Config::enabled_amlogic_control_board)
+                    .map(|config| config.startup.initial_voltage);
+                let default_pool_url = env::var("MUJINA_POOL_URL").ok();
+                let default_pool_user = env::var("MUJINA_POOL_USER").ok();
+
+                self.tracker.spawn(gt_touch::task(
+                    gt_touch_config,
+                    gt_touch::ServiceContext {
+                        miner_state_rx: miner_state_rx.clone(),
+                        board_registry: board_registry.clone(),
+                        default_device_model,
+                        default_asic_model,
+                        default_pool_url,
+                        default_pool_user,
+                        default_mode: Some("normal".to_string()),
+                        default_voltage,
+                    },
+                    self.shutdown.clone(),
+                ));
+            }
 
             info!("Started.");
             info!("For debugging, set RUST_LOG=mujina_miner=debug or trace.");

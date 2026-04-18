@@ -51,11 +51,18 @@ impl UsbDeviceInfo {
     pub fn serial_ports(&self) -> Result<&[String]> {
         self.serial_ports
             .get_or_init(|| {
-                #[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "usb-discovery"))]
+                #[cfg(all(
+                    target_os = "linux",
+                    not(target_env = "musl"),
+                    feature = "usb-discovery"
+                ))]
                 {
                     linux::find_serial_ports_for_device(&self.device_path)
                 }
-                #[cfg(all(target_os = "linux", any(target_env = "musl", not(feature = "usb-discovery"))))]
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_env = "musl", not(feature = "usb-discovery"))
+                ))]
                 {
                     Err(crate::error::Error::Other(
                         "USB serial discovery is not available in this build".to_string(),
@@ -196,7 +203,11 @@ impl UsbTransport {
 }
 
 // Platform-specific implementations
-#[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "usb-discovery"))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_env = "musl"),
+    feature = "usb-discovery"
+))]
 mod linux;
 
 #[cfg(target_os = "macos")]
@@ -240,12 +251,19 @@ trait UsbDiscoveryImpl: Send + Sync {
 /// Returns a boxed trait object that implements USB discovery for the
 /// current platform.
 fn create_discovery() -> Result<Box<dyn UsbDiscoveryImpl>> {
-    #[cfg(all(target_os = "linux", not(target_env = "musl"), feature = "usb-discovery"))]
+    #[cfg(all(
+        target_os = "linux",
+        not(target_env = "musl"),
+        feature = "usb-discovery"
+    ))]
     {
         Ok(Box::new(linux::LinuxUdevDiscovery::new()?))
     }
 
-    #[cfg(all(target_os = "linux", any(target_env = "musl", not(feature = "usb-discovery"))))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_env = "musl", not(feature = "usb-discovery"))
+    ))]
     {
         Err(crate::error::Error::Other(
             "USB discovery was disabled at compile time".to_string(),

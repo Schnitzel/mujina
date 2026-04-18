@@ -79,7 +79,7 @@ fn stderr_is_journal_stream() -> bool {
         return false;
     }
 
-    stat.st_dev == expected_dev && stat.st_ino == expected_ino
+    (stat.st_dev as u64) == expected_dev && (stat.st_ino as u64) == expected_ino
 }
 
 /// Initialize logging.

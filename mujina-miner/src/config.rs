@@ -6,7 +6,10 @@
 
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 /// Main configuration structure for the miner.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -125,6 +128,48 @@ pub struct AmlogicControlBoardConfig {
 
     /// Expected hashboards connected to the control board.
     pub hashboards: Vec<AmlogicHashboardConfig>,
+
+    /// Optional GT Touch USB CDC display integration.
+    #[serde(default)]
+    pub gt_touch_display: Option<GtTouchDisplayConfig>,
+}
+
+/// GT Touch USB CDC display configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GtTouchDisplayConfig {
+    /// Enable GT Touch integration.
+    pub enabled: bool,
+
+    /// Explicit CDC serial device path (for example `/dev/ttyACM0`).
+    ///
+    /// When omitted on Linux, Mujina attempts to auto-detect a GT Touch CDC
+    /// device by walking `/sys/class/tty`.
+    pub serial_path: Option<PathBuf>,
+
+    /// Baud rate used when opening the CDC ACM port.
+    ///
+    /// USB CDC ACM ignores this electrically, but the host stack still
+    /// requires a line coding value when opening the port.
+    pub baud_rate: u32,
+
+    /// How often to publish subscribed metrics to the display.
+    pub update_interval_ms: u64,
+
+    /// Delay before reconnecting after a disconnect or open failure.
+    pub reconnect_delay_ms: u64,
+}
+
+impl Default for GtTouchDisplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            serial_path: None,
+            baud_rate: 115_200,
+            update_interval_ms: 2_000,
+            reconnect_delay_ms: 2_000,
+        }
+    }
 }
 
 /// APW12 PSU configuration for the Amlogic control board.

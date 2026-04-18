@@ -6,8 +6,9 @@
 
 pub mod commands;
 mod dashboard;
-mod registry;
+pub(crate) mod registry;
 mod server;
 mod v0;
 
+pub(crate) use registry::BoardRegistry;
 pub use server::{ApiConfig, serve};

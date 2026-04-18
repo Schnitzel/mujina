@@ -13,8 +13,8 @@
 use tracing::debug;
 
 use crate::hw_trait::Result;
-use crate::mgmt_protocol::bitaxe_raw::{Page, Packet};
 use crate::mgmt_protocol::ControlChannel;
+use crate::mgmt_protocol::bitaxe_raw::{Packet, Page};
 
 /// Command to set display text
 const CMD_SET_DISPLAY: u8 = 0x10;

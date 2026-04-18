@@ -237,6 +237,7 @@ impl Scheduler {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
             shares_submitted: self.stats.shares_submitted,
+            best_difficulty: self.stats.best_difficulty,
             paused: self.paused,
             boards: vec![],
             sources: self
@@ -480,6 +481,14 @@ impl Scheduler {
         let hash = share.hash;
         let share_difficulty = Difficulty::from_hash(&hash);
         let threshold = Difficulty::from_target(task_entry.template.share_target);
+
+        self.stats.best_difficulty = Some(
+            self.stats
+                .best_difficulty
+                .map_or(share_difficulty.as_u64(), |best| {
+                    best.max(share_difficulty.as_u64())
+                }),
+        );
 
         debug!(
             source = %self.sources.get(task_entry.source_id).map(|s| s.name.as_str()).unwrap_or("unknown"),
@@ -943,6 +952,7 @@ fn format_duration(secs: u64) -> String {
 struct MiningStats {
     start_time: std::time::Instant,
     shares_submitted: u64,
+    best_difficulty: Option<u64>,
 }
 
 impl Default for MiningStats {
@@ -950,6 +960,7 @@ impl Default for MiningStats {
         Self {
             start_time: std::time::Instant::now(),
             shares_submitted: 0,
+            best_difficulty: None,
         }
     }
 }

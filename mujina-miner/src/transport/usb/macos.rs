@@ -26,20 +26,20 @@ use crate::{
     transport::TransportEvent,
 };
 use core_foundation::{
-    base::{kCFAllocatorDefault, CFType, TCFType},
+    base::{CFType, TCFType, kCFAllocatorDefault},
     number::CFNumber,
-    runloop::{kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult},
+    runloop::{CFRunLoop, CFRunLoopRunResult, kCFRunLoopDefaultMode},
     string::CFString,
 };
 use io_kit_sys::{
-    kIOMasterPortDefault, kIORegistryIterateParents, kIORegistryIterateRecursively,
-    keys::{kIOFirstMatchNotification, kIOTerminatedNotification},
-    ret::kIOReturnSuccess,
-    types::io_iterator_t,
     IOIteratorNext, IONotificationPortCreate, IONotificationPortDestroy,
     IONotificationPortGetRunLoopSource, IOObjectRelease, IORegistryEntryCreateCFProperty,
     IORegistryEntrySearchCFProperty, IOServiceAddMatchingNotification,
-    IOServiceGetMatchingServices, IOServiceMatching,
+    IOServiceGetMatchingServices, IOServiceMatching, kIOMasterPortDefault,
+    kIORegistryIterateParents, kIORegistryIterateRecursively,
+    keys::{kIOFirstMatchNotification, kIOTerminatedNotification},
+    ret::kIOReturnSuccess,
+    types::io_iterator_t,
 };
 use std::{ffi::c_void, sync::OnceLock};
 use tokio::sync::mpsc;
@@ -104,10 +104,7 @@ impl MacOsIoKitDiscovery {
     }
 
     /// Build a UsbDeviceInfo from IORegistry device properties.
-    fn build_device_info(
-        &self,
-        device: io_kit_sys::types::io_object_t,
-    ) -> Option<UsbDeviceInfo> {
+    fn build_device_info(&self, device: io_kit_sys::types::io_object_t) -> Option<UsbDeviceInfo> {
         let props = self.extract_device_properties(device)?;
 
         // Use location ID as the device path identifier (hex string)
@@ -138,9 +135,8 @@ impl MacOsIoKitDiscovery {
         }
 
         let mut iterator: io_iterator_t = 0;
-        let result = unsafe {
-            IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iterator)
-        };
+        let result =
+            unsafe { IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iterator) };
 
         if result != kIOReturnSuccess {
             return Err(Error::Other(format!(
@@ -181,10 +177,7 @@ struct DeviceProperties {
 }
 
 /// Get a numeric property from an IORegistry entry.
-fn get_device_property_number(
-    device: io_kit_sys::types::io_object_t,
-    key: &str,
-) -> Option<i64> {
+fn get_device_property_number(device: io_kit_sys::types::io_object_t, key: &str) -> Option<i64> {
     let cf_key = CFString::new(key);
     let cf_value = unsafe {
         IORegistryEntryCreateCFProperty(
@@ -211,10 +204,7 @@ fn get_device_property_number(
 }
 
 /// Get a string property from an IORegistry entry.
-fn get_device_property_string(
-    device: io_kit_sys::types::io_object_t,
-    key: &str,
-) -> Option<String> {
+fn get_device_property_string(device: io_kit_sys::types::io_object_t, key: &str) -> Option<String> {
     let cf_key = CFString::new(key);
     let cf_value = unsafe {
         IORegistryEntryCreateCFProperty(
@@ -254,9 +244,7 @@ pub(super) fn find_serial_ports_for_device(device_path: &str) -> Result<Vec<Stri
     let mut ports = Vec::new();
 
     // Create matching dictionary for serial devices
-    let matching = unsafe {
-        IOServiceMatching(c"IOSerialBSDClient".as_ptr())
-    };
+    let matching = unsafe { IOServiceMatching(c"IOSerialBSDClient".as_ptr()) };
     if matching.is_null() {
         return Err(Error::Other(
             "Failed to create serial matching dictionary".to_string(),
@@ -264,9 +252,8 @@ pub(super) fn find_serial_ports_for_device(device_path: &str) -> Result<Vec<Stri
     }
 
     let mut iterator: io_iterator_t = 0;
-    let result = unsafe {
-        IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iterator)
-    };
+    let result =
+        unsafe { IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &mut iterator) };
 
     if result != kIOReturnSuccess {
         return Err(Error::Other(format!(
@@ -408,7 +395,10 @@ impl super::UsbDiscoveryImpl for MacOsIoKitDiscovery {
                 // Drain the iterator (required to arm the notification)
                 drain_iterator(add_iterator);
             } else {
-                warn!("Failed to register for USB add notifications: 0x{:08x}", result);
+                warn!(
+                    "Failed to register for USB add notifications: 0x{:08x}",
+                    result
+                );
             }
         }
 
@@ -431,7 +421,10 @@ impl super::UsbDiscoveryImpl for MacOsIoKitDiscovery {
                 // Drain the iterator (required to arm the notification)
                 drain_iterator(remove_iterator);
             } else {
-                warn!("Failed to register for USB remove notifications: 0x{:08x}", result);
+                warn!(
+                    "Failed to register for USB remove notifications: 0x{:08x}",
+                    result
+                );
             }
         }
 

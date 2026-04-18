@@ -15,6 +15,9 @@ pub struct MinerState {
     /// Aggregate hashrate in hashes per second.
     pub hashrate: u64,
     pub shares_submitted: u64,
+    /// Best share difficulty observed since startup, if any shares were found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_difficulty: Option<u64>,
     pub paused: bool,
     pub boards: Vec<BoardState>,
     pub sources: Vec<SourceState>,

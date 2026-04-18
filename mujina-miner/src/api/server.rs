@@ -14,8 +14,6 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use super::{commands::SchedulerCommand, dashboard, registry::BoardRegistry, v0};
 use crate::api_client::types::MinerState;
-use crate::board::BoardRegistration;
-
 /// API server configuration.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
@@ -58,22 +56,9 @@ pub async fn serve(
     config: ApiConfig,
     shutdown: CancellationToken,
     miner_state_rx: watch::Receiver<MinerState>,
-    mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
+    board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
 ) -> Result<()> {
-    let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
-
-    // Drain board registrations into the registry as they arrive.
-    // Exits when the sender is dropped (backplane shutdown).
-    tokio::spawn({
-        let registry = board_registry.clone();
-        async move {
-            while let Some(reg) = board_reg_rx.recv().await {
-                registry.lock().unwrap_or_else(|e| e.into_inner()).push(reg);
-            }
-        }
-    });
-
     let app = build_router(miner_state_rx, board_registry, scheduler_cmd_tx);
 
     let listener = TcpListener::bind(&config.bind_addr).await?;

@@ -3,8 +3,11 @@
 //! The bitcrane supports up to 4 PWM-controlled fans with tachometer feedback.
 //! Fan control uses PAGE_FAN (0x09) with speed and tach commands.
 
-use crate::mgmt_protocol::{ControlChannel, bitaxe_raw::{Page, Packet}};
 use crate::hw_trait::HwError;
+use crate::mgmt_protocol::{
+    ControlChannel,
+    bitaxe_raw::{Packet, Page},
+};
 use crate::tracing::prelude::*;
 
 type Result<T> = std::result::Result<T, HwError>;
@@ -92,16 +95,15 @@ impl BitcraneFan {
         if response.data.len() < 2 {
             return Err(HwError::Other(format!(
                 "{}: Tach response too short ({} bytes)",
-                self.name, response.data.len()
+                self.name,
+                response.data.len()
             )));
         }
 
         // RPM is in the last 2 bytes as little-endian
         let data_len = response.data.len();
-        let rpm = u16::from_le_bytes([
-            response.data[data_len - 2],
-            response.data[data_len - 1],
-        ]) as u32;
+        let rpm =
+            u16::from_le_bytes([response.data[data_len - 2], response.data[data_len - 1]]) as u32;
 
         trace!(
             fan = %self.name,

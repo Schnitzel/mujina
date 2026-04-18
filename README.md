@@ -208,6 +208,40 @@ That HB2 config now targets the corrected native mapping for hashboard 2:
 `/dev/ttyS1` with reset GPIO `456`, detect GPIO `441`, TMP75 addresses
 `0x4C/0x48`, and EEPROM address `0x50`.
 
+### GT Touch USB Display
+
+Mujina can now stream live mining stats to a
+[BAP-GT-TOUCH](https://github.com/skot/Bitcoin/Ampminer/BAP-GT-TOUCH) display
+connected to the Amlogic board over USB CDC ACM.
+
+Enable it in the Amlogic config:
+
+```toml
+[hardware.amlogic_control_board.gt_touch_display]
+enabled = true
+# serial_path = "/dev/ttyACM0"  # optional; Linux auto-detect matches "GT Touch CDC"
+baud_rate = 115200
+update_interval_ms = 2000
+reconnect_delay_ms = 2000
+```
+
+When `serial_path` is omitted on Linux, Mujina scans `/sys/class/tty` and
+matches the GT Touch's default USB identity (`303a:4001`, product
+`"GT Touch CDC"`).
+
+The current bridge answers the GT Touch's BAP subscriptions for:
+
+- hashrate
+- temperature
+- power
+- fan speed
+- shares
+- best difficulty
+- system info
+
+GT Touch-originated setting changes are logged but not applied yet, and block
+height is not populated by the current Stratum pipeline.
+
 ## Protocol Analysis Tool
 
 The `mujina-dissect` tool analyzes captured communication between the host and

@@ -14,9 +14,9 @@ use tracing::{debug, warn};
 
 use crate::hw_trait::gpio::{GpioPin, PinValue};
 use crate::hw_trait::{HwError, Result};
-use crate::mgmt_protocol::bitaxe_raw::{Page, Packet};
-use crate::mgmt_protocol::bitcrane::gpio::{BitcraneGpioController, BitcraneGpioPin};
 use crate::mgmt_protocol::ControlChannel;
+use crate::mgmt_protocol::bitaxe_raw::{Packet, Page};
+use crate::mgmt_protocol::bitcrane::gpio::{BitcraneGpioController, BitcraneGpioPin};
 
 /// APW12 PSU I2C address
 const PSU_I2C_ADDR: u8 = 0x10;

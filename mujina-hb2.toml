@@ -52,6 +52,13 @@ pulses_per_rev = 2
 green_gpio = 453
 red_gpio = 438
 
+[hardware.amlogic_control_board.gt_touch_display]
+enabled = true
+# serial_path = "/dev/ttyACM0"
+baud_rate = 115200
+update_interval_ms = 2000
+reconnect_delay_ms = 2000
+
 [[hardware.amlogic_control_board.hashboards]]
 index = 2
 model = "s19j_pro"

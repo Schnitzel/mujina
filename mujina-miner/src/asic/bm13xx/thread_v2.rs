@@ -521,7 +521,11 @@ where
                 status.hashrate = self.estimated_hashrate;
             }
         });
-        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+        let _ = self
+            .evt_tx
+            .clone()
+            .send(HashThreadEvent::StatusUpdate(status))
+            .await;
         Ok(old)
     }
 
@@ -563,7 +567,11 @@ where
             status.is_active = false;
             status.hashrate = HashRate::default();
         });
-        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+        let _ = self
+            .evt_tx
+            .clone()
+            .send(HashThreadEvent::StatusUpdate(status))
+            .await;
         Ok(old)
     }
 
@@ -600,7 +608,10 @@ where
             drained += 1;
         }
         if drained > 0 {
-            debug!(count = drained, "Drained stale responses before enumeration");
+            debug!(
+                count = drained,
+                "Drained stale responses before enumeration"
+            );
         }
 
         // 2. Execute enumeration sequence (assigns addresses)
@@ -659,7 +670,11 @@ where
         let status = self.update_status(|status| {
             status.hashrate = self.estimated_hashrate;
         });
-        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+        let _ = self
+            .evt_tx
+            .clone()
+            .send(HashThreadEvent::StatusUpdate(status))
+            .await;
         debug!(chip_count = responding, "Chain initialized");
         Ok(())
     }
@@ -760,14 +775,11 @@ where
             //   - For stacked (TPS546): 12 domains, V = V_per_chip * 12
             //   - For series (APW12): 42 domains, V = V_per_chip * 42
             // The regulator's set_voltage() will clamp to its valid range.
-            let requested_voltage = has_regulator
-                .then(|| voltage_for_frequency_stacked(*freq, domain_count, max_v));
+            let requested_voltage =
+                has_regulator.then(|| voltage_for_frequency_stacked(*freq, domain_count, max_v));
             let applied_voltage = requested_voltage.map(|voltage| voltage.clamp(min_v, max_v));
 
-            if step_index == 0
-                || step_index + 1 == step_count
-                || (step_index + 1) % 8 == 0
-            {
+            if step_index == 0 || step_index + 1 == step_count || (step_index + 1) % 8 == 0 {
                 debug!(
                     step = step_index + 1,
                     total_steps = step_count,
@@ -782,12 +794,16 @@ where
                 regulator
                     .lock()
                     .await
-                    .set_voltage(applied_voltage.expect("applied voltage is present when regulator exists"))
+                    .set_voltage(
+                        applied_voltage.expect("applied voltage is present when regulator exists"),
+                    )
                     .await
                     .map_err(|e| {
                         HashThreadError::InitializationFailed(format!(
                             "Failed to set voltage to {:.2}V: {}",
-                            applied_voltage.expect("applied voltage is present when regulator exists"), e
+                            applied_voltage
+                                .expect("applied voltage is present when regulator exists"),
+                            e
                         ))
                     })?;
 
@@ -814,13 +830,13 @@ where
         if responding < chip_count {
             warn!(
                 expected = chip_count,
-                responding,
-                "Chips lost during frequency ramp"
+                responding, "Chips lost during frequency ramp"
             );
         }
 
         if has_regulator {
-            let final_v = voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
+            let final_v =
+                voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
             info!(
                 target_mhz = target.mhz(),
                 voltage = format!("{:.2}V", final_v),
@@ -921,14 +937,22 @@ where
             let status = self.update_status(|status| {
                 status.hardware_errors += 1;
             });
-            let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+            let _ = self
+                .evt_tx
+                .clone()
+                .send(HashThreadEvent::StatusUpdate(status))
+                .await;
         }
         self.chip_state = ChipState::Disabled;
         let status = self.update_status(|status| {
             status.is_active = false;
             status.hashrate = HashRate::default();
         });
-        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+        let _ = self
+            .evt_tx
+            .clone()
+            .send(HashThreadEvent::StatusUpdate(status))
+            .await;
     }
 
     async fn handle_chip_response(&mut self, result: Result<protocol::Response, std::io::Error>) {
@@ -1023,7 +1047,11 @@ where
                             status.is_active = true;
                             status.hashrate = self.estimated_hashrate;
                         });
-                        let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+                        let _ = self
+                            .evt_tx
+                            .clone()
+                            .send(HashThreadEvent::StatusUpdate(status))
+                            .await;
 
                         debug!(
                             job_id,
@@ -1070,7 +1098,11 @@ where
                 let status = self.update_status(|status| {
                     status.hardware_errors += 1;
                 });
-                let _ = self.evt_tx.clone().send(HashThreadEvent::StatusUpdate(status)).await;
+                let _ = self
+                    .evt_tx
+                    .clone()
+                    .send(HashThreadEvent::StatusUpdate(status))
+                    .await;
             }
         }
     }

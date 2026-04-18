@@ -3,8 +3,11 @@
 //! Provides I2C read/write operations over the bitcrane control channel using
 //! PAGE_I2C (0x05). Used by TMP75 temperature sensors on S19j Pro hashboards.
 
-use crate::mgmt_protocol::{ControlChannel, bitaxe_raw::{I2CCommand, Page, Packet}};
 use crate::hw_trait::HwError;
+use crate::mgmt_protocol::{
+    ControlChannel,
+    bitaxe_raw::{I2CCommand, Packet, Page},
+};
 
 type Result<T> = std::result::Result<T, HwError>;
 

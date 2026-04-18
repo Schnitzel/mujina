@@ -9,8 +9,8 @@
 //! | HB1       | 0x4D     | 0x49     |
 //! | HB2       | 0x4E     | 0x4A     |
 
-use crate::mgmt_protocol::bitcrane::i2c::BitcraneI2c;
 use crate::hw_trait::HwError;
+use crate::mgmt_protocol::bitcrane::i2c::BitcraneI2c;
 use crate::tracing::prelude::*;
 
 type Result<T> = std::result::Result<T, HwError>;
@@ -60,12 +60,16 @@ impl Tmp75 {
     /// The TMP75 returns a 12-bit signed value in big-endian format,
     /// with 0.0625°C resolution.
     pub async fn read_temperature(&self) -> Result<f32> {
-        let data = self.i2c.read_register(self.address, TMP75_TEMP_REG, 2).await?;
+        let data = self
+            .i2c
+            .read_register(self.address, TMP75_TEMP_REG, 2)
+            .await?;
 
         if data.len() < 2 {
             return Err(HwError::Other(format!(
                 "{}: TMP75 returned {} bytes, expected 2",
-                self.name, data.len()
+                self.name,
+                data.len()
             )));
         }
 

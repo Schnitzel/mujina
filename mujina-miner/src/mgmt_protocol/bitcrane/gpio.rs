@@ -16,8 +16,8 @@ use tracing::debug;
 
 use crate::hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue};
 use crate::hw_trait::{HwError, Result};
-use crate::mgmt_protocol::bitaxe_raw::{Page, Packet};
 use crate::mgmt_protocol::ControlChannel;
+use crate::mgmt_protocol::bitaxe_raw::{Packet, Page};
 
 /// Bitcrane GPIO pin identifiers.
 ///

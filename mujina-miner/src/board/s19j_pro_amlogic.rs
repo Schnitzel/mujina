@@ -15,9 +15,8 @@ use amlogic_cb_tools::{
     gpio::SysfsGpio,
     linux_i2c::LinuxI2cDevice,
     protocol::{
-        CMD_GET_VOLTAGE, CMD_MEASURE_VOLTAGE, CMD_SET_VOLTAGE, CMD_WATCHDOG, NAK_BYTE,
-        build_frame, decode_dac_to_voltage, decode_measured_voltage, encode_voltage_to_dac,
-        parse_frame,
+        CMD_GET_VOLTAGE, CMD_MEASURE_VOLTAGE, CMD_SET_VOLTAGE, CMD_WATCHDOG, NAK_BYTE, build_frame,
+        decode_dac_to_voltage, decode_measured_voltage, encode_voltage_to_dac, parse_frame,
     },
     pwm::SysfsPwm,
     tach::SysfsTachometer,
@@ -37,7 +36,10 @@ use crate::{
             chip_config, thread_v2,
             topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent, HashThreadStatus},
+        hash_thread::{
+            AsicEnable, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
+            HashThreadEvent, HashThreadStatus,
+        },
     },
     config::{AmlogicControlBoardConfig, AmlogicHashboardConfig},
     error::Error,
@@ -104,8 +106,14 @@ impl S19jProAmlogic {
     async fn initialize(
         config: &AmlogicControlBoardConfig,
         state_tx: &watch::Sender<BoardState>,
-    ) -> Result<(AmlogicHashboardConfig, Option<String>, Arc<Mutex<NativeAmlogicPsu>>), BoardError>
-    {
+    ) -> Result<
+        (
+            AmlogicHashboardConfig,
+            Option<String>,
+            Arc<Mutex<NativeAmlogicPsu>>,
+        ),
+        BoardError,
+    > {
         let selected_hashboard = select_hashboard(config)?;
         let board_name = device_id(config);
 
@@ -116,7 +124,8 @@ impl S19jProAmlogic {
             "Initializing native Amlogic S19j Pro board"
         );
 
-        let (board_serial, initial_temperatures) = perform_health_gate(config, &selected_hashboard)?;
+        let (board_serial, initial_temperatures) =
+            perform_health_gate(config, &selected_hashboard)?;
 
         configure_fans(config, config.startup.default_fan_percent)?;
         assert_all_resets(config)?;
@@ -127,13 +136,15 @@ impl S19jProAmlogic {
             psu_guard
                 .set_enabled(true)
                 .map_err(|e| BoardError::HardwareControl(format!("Failed to enable PSU: {e}")))?;
-            psu_guard
-                .config_watchdog(0x00)
-                .map_err(|e| BoardError::HardwareControl(format!("Failed to disable PSU watchdog: {e}")))?;
+            psu_guard.config_watchdog(0x00).map_err(|e| {
+                BoardError::HardwareControl(format!("Failed to disable PSU watchdog: {e}"))
+            })?;
             psu_guard
                 .set_voltage(config.startup.initial_voltage)
                 .await
-                .map_err(|e| BoardError::HardwareControl(format!("Failed to set PSU voltage: {e}")))?;
+                .map_err(|e| {
+                    BoardError::HardwareControl(format!("Failed to set PSU voltage: {e}"))
+                })?;
 
             tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
             psu_guard.measure_voltage().ok()
@@ -166,7 +177,10 @@ impl Board for S19jProAmlogic {
         BoardInfo {
             model: BOARD_MODEL.into(),
             firmware_version: None,
-            serial_number: self.board_serial.clone().or_else(|| Some(device_id(&self.config))),
+            serial_number: self
+                .board_serial
+                .clone()
+                .or_else(|| Some(device_id(&self.config))),
         }
     }
 
@@ -224,7 +238,10 @@ impl Board for S19jProAmlogic {
         let thread_hashrate = u64::from(thread.capabilities().hashrate_estimate);
 
         self.state_tx.send_modify(|state| {
-            state.serial = self.board_serial.clone().or_else(|| Some(device_id(&self.config)));
+            state.serial = self
+                .board_serial
+                .clone()
+                .or_else(|| Some(device_id(&self.config)));
             state.threads = vec![crate::api_client::types::ThreadState {
                 name: thread_name.clone(),
                 hashrate: thread_hashrate,
@@ -448,7 +465,11 @@ impl NativeAmlogicPsu {
         Ok(decode_dac_to_voltage(dac))
     }
 
-    fn exchange(&mut self, command: u8, payload: &[u8]) -> anyhow::Result<amlogic_cb_tools::protocol::Frame> {
+    fn exchange(
+        &mut self,
+        command: u8,
+        payload: &[u8],
+    ) -> anyhow::Result<amlogic_cb_tools::protocol::Frame> {
         let mut dev = LinuxI2cDevice::open(&self.i2c_device, self.address)?;
         let frame = build_frame(command, payload);
         for byte in frame {
@@ -534,7 +555,9 @@ impl VoltageRegulator for NativeAmlogicPsu {
     }
 }
 
-fn select_hashboard(config: &AmlogicControlBoardConfig) -> Result<AmlogicHashboardConfig, BoardError> {
+fn select_hashboard(
+    config: &AmlogicControlBoardConfig,
+) -> Result<AmlogicHashboardConfig, BoardError> {
     if config.hashboards.is_empty() {
         return Err(BoardError::InitializationFailed(
             "Amlogic config has no configured hashboards".into(),
@@ -545,7 +568,10 @@ fn select_hashboard(config: &AmlogicControlBoardConfig) -> Result<AmlogicHashboa
     for hashboard in &config.hashboards {
         let present = is_hashboard_present(hashboard)?;
         if !present {
-            let missing_is_fatal = config.startup.health_gate.fail_on_missing_expected_hashboard
+            let missing_is_fatal = config
+                .startup
+                .health_gate
+                .fail_on_missing_expected_hashboard
                 || hashboard.required;
             if missing_is_fatal {
                 return Err(BoardError::InitializationFailed(format!(
@@ -568,9 +594,9 @@ fn select_hashboard(config: &AmlogicControlBoardConfig) -> Result<AmlogicHashboa
 
 fn is_hashboard_present(hashboard: &AmlogicHashboardConfig) -> Result<bool, BoardError> {
     let detect = SysfsGpio::new(hashboard.detect_gpio);
-    detect
-        .set_input_bias_disabled()
-        .map_err(|e| BoardError::HardwareControl(format!("Failed to configure detect GPIO: {e}")))?;
+    detect.set_input_bias_disabled().map_err(|e| {
+        BoardError::HardwareControl(format!("Failed to configure detect GPIO: {e}"))
+    })?;
     let present = detect
         .read_value()
         .map_err(|e| BoardError::HardwareControl(format!("Failed to read detect GPIO: {e}")))?;
@@ -618,10 +644,12 @@ fn assert_all_resets(config: &AmlogicControlBoardConfig) -> Result<(), BoardErro
     for hashboard in &config.hashboards {
         SysfsGpio::new(hashboard.reset_gpio)
             .set_output_low()
-            .map_err(|e| BoardError::HardwareControl(format!(
-                "Failed to assert reset for hashboard {}: {e}",
-                hashboard.index
-            )))?;
+            .map_err(|e| {
+                BoardError::HardwareControl(format!(
+                    "Failed to assert reset for hashboard {}: {e}",
+                    hashboard.index
+                ))
+            })?;
     }
     std::thread::sleep(Duration::from_millis(config.startup.reset_assert_ms));
     Ok(())
@@ -633,10 +661,12 @@ fn configure_fans(config: &AmlogicControlBoardConfig, percent: u8) -> Result<(),
         if configured_channels.insert((fan.pwm_chip, fan.pwm_channel)) {
             SysfsPwm::new(fan.pwm_chip, fan.pwm_channel)
                 .configure_percent(FAN_PWM_PERIOD_NS, percent, true)
-                .map_err(|e| BoardError::HardwareControl(format!(
-                    "Failed to configure pwmchip{}/pwm{}: {e}",
-                    fan.pwm_chip, fan.pwm_channel
-                )))?;
+                .map_err(|e| {
+                    BoardError::HardwareControl(format!(
+                        "Failed to configure pwmchip{}/pwm{}: {e}",
+                        fan.pwm_chip, fan.pwm_channel
+                    ))
+                })?;
         }
     }
     Ok(())
@@ -713,10 +743,7 @@ async fn native_telemetry_task(
     }
 }
 
-async fn read_fan_states(
-    config: &AmlogicControlBoardConfig,
-    target_percent: u8,
-) -> Vec<Fan> {
+async fn read_fan_states(config: &AmlogicControlBoardConfig, target_percent: u8) -> Vec<Fan> {
     const FAN_SAMPLE_WINDOW: Duration = Duration::from_millis(500);
 
     let mut fan_states = Vec::with_capacity(config.fans.len());
@@ -754,7 +781,9 @@ async fn read_fan_states(
     fan_states
 }
 
-fn read_temperatures(hashboard: &AmlogicHashboardConfig) -> Result<Vec<TemperatureSensor>, BoardError> {
+fn read_temperatures(
+    hashboard: &AmlogicHashboardConfig,
+) -> Result<Vec<TemperatureSensor>, BoardError> {
     let addresses = configured_tmp75_addresses(hashboard)?;
     let mut sensors = Vec::with_capacity(addresses.len());
     for (sensor_index, address) in addresses.into_iter().enumerate() {
@@ -774,11 +803,12 @@ fn read_temperatures(hashboard: &AmlogicHashboardConfig) -> Result<Vec<Temperatu
 
 fn read_eeprom(hashboard: &AmlogicHashboardConfig) -> Result<Vec<u8>, BoardError> {
     let address = configured_eeprom_address(hashboard)?;
-    let mut device = LinuxI2cDevice::open(&hashboard.eeprom_i2c_device, address)
-        .map_err(|e| BoardError::InitializationFailed(format!(
+    let mut device = LinuxI2cDevice::open(&hashboard.eeprom_i2c_device, address).map_err(|e| {
+        BoardError::InitializationFailed(format!(
             "Failed to open EEPROM I2C device {}: {e}",
             hashboard.eeprom_i2c_device.display()
-        )))?;
+        ))
+    })?;
 
     match device.read_at(0, EEPROM_LEN) {
         Ok(data) => Ok(data),
@@ -797,9 +827,7 @@ fn read_eeprom(hashboard: &AmlogicHashboardConfig) -> Result<Vec<u8>, BoardError
     }
 }
 
-fn configured_tmp75_addresses(
-    hashboard: &AmlogicHashboardConfig,
-) -> Result<Vec<u16>, BoardError> {
+fn configured_tmp75_addresses(hashboard: &AmlogicHashboardConfig) -> Result<Vec<u16>, BoardError> {
     if !hashboard.temp_sensor_addresses.is_empty() {
         return hashboard
             .temp_sensor_addresses
@@ -876,7 +904,9 @@ fn read_psu_response_frame(dev: &mut LinuxI2cDevice) -> anyhow::Result<Vec<u8>> 
 
     let second = dev.read_byte_transaction()?;
     if second != 0xAA {
-        return Err(anyhow::anyhow!("invalid preamble continuation: 0x{second:02X}"));
+        return Err(anyhow::anyhow!(
+            "invalid preamble continuation: 0x{second:02X}"
+        ));
     }
 
     let length = dev.read_byte_transaction()?;
