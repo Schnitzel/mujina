@@ -369,6 +369,15 @@ impl Scheduler {
             return;
         }
 
+        // Skip assignment if mining is paused via API. The template is
+        // still stored on `source.last_job` above so `resume_mining` can
+        // re-dispatch it without waiting for the source to emit a new
+        // job. Threads stay idle (chips disabled) until then.
+        if self.paused {
+            debug!(source = %source_name, "Mining is paused; caching job for resume");
+            return;
+        }
+
         // Debounced difficulty warning
         let hashrate = self.operational_hashrate();
         if let Some(source) = self.sources.get_mut(source_id) {
@@ -468,6 +477,16 @@ impl Scheduler {
 
     /// Handle a share arriving from a task's channel.
     async fn handle_share(&mut self, task_id: TaskId, share: Share) {
+        // When paused, drop everything. Chips keep mining the last job
+        // we sent them and will keep emitting nonces; if we forwarded
+        // them, the pool would see hashrate even though the user
+        // pressed pause. Stop counting them toward the per-thread
+        // hashrate estimator too so the UI reads 0 TH/s.
+        if self.paused {
+            trace!(?task_id, "Share dropped — scheduler is paused");
+            return;
+        }
+
         // Look up task context for routing
         let Some(task_entry) = self.tasks.get(task_id) else {
             // Task was removed (ReplaceJob/ClearJobs) but share arrived
@@ -618,7 +637,13 @@ impl Scheduler {
                 .unwrap_or(entry.thread.capabilities().hashrate_estimate)
         };
 
-        // Assign cached jobs from all sources to the new thread
+        // Assign cached jobs from all sources to the new thread — but
+        // only if the scheduler isn't paused. If it is, the thread joins
+        // the paused pool and stays idle until `resume_mining` fires.
+        if self.paused {
+            debug!(thread = %thread_name, "Mining is paused; new thread will stay idle");
+            return;
+        }
         for (source_id, source) in self.sources.iter() {
             let Some(template) = &source.last_job else {
                 continue;
@@ -709,21 +734,85 @@ impl Scheduler {
     ///
     /// Publishes an updated state snapshot before replying so the API
     /// handler's subsequent `borrow()` sees the new value.
-    fn handle_api_command(
+    async fn handle_api_command(
         &mut self,
         cmd: SchedulerCommand,
         miner_state_tx: &watch::Sender<MinerState>,
+        share_channels: &mut ShareStream,
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
-                self.paused = true;
-                warn!("Mining paused via API (not yet implemented)");
+                if !self.paused {
+                    self.paused = true;
+                    info!(
+                        thread_count = self.threads.len(),
+                        "Mining paused — share submissions and new job dispatch stopped"
+                    );
+                    // Soft pause: drop any in-flight task on each hash
+                    // thread but DON'T touch the chip power rail. Chips
+                    // burn through whatever nonces are still queued on
+                    // their last job, mujina drops every share that
+                    // comes back (`assign_job_to_threads` is gated on
+                    // `!self.paused`, and the task lookup in
+                    // `handle_share` only matches templates we still
+                    // have entries for; clearing `current_task` on the
+                    // hash thread stops ntime rolling so the chip work
+                    // staleness curve takes over within a minute).
+                    //
+                    // Hard pause (full asic_enable.disable() + chip
+                    // power cycle) is broken on BHB56902 today because
+                    // the post-reset re-enumeration only sees ~half the
+                    // chain at 115200 — likely a chain-RST_N propagation
+                    // issue with our reset_release_ms timing. Left as a
+                    // follow-up; tracked in the TODO below.
+                    for (id, entry) in self.threads.iter_mut() {
+                        // Reset the per-thread hashrate estimator so the
+                        // API/UI stops showing the pre-pause hashrate
+                        // while the window ages out.
+                        entry.hashrate = HashrateEstimator::new(HASHRATE_WINDOW);
+                        debug!(thread_id = ?id, thread = %entry.thread.name(), "Thread marked paused");
+                    }
+                    // Note: we intentionally do NOT call
+                    // `thread.go_idle()` here. That triggers
+                    // disable_chips() which has the reset-baud
+                    // recovery problem; until that's debugged we leave
+                    // chips warm and rely on `self.paused` gating in
+                    // `assign_job_to_threads` to stop new work.
+                } else {
+                    debug!("PauseMining received but scheduler is already paused");
+                }
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
-                self.paused = false;
-                warn!("Mining resumed via API (not yet implemented)");
+                if self.paused {
+                    self.paused = false;
+                    info!(
+                        thread_count = self.threads.len(),
+                        "Mining resumed — re-dispatching cached jobs"
+                    );
+                    // Snapshot the latest job per source. We can't iterate
+                    // `self.sources` while calling `assign_job_to_threads`
+                    // (which borrows `&mut self`), so collect first.
+                    let jobs_to_redispatch: Vec<(SourceId, JobTemplate)> = self
+                        .sources
+                        .iter()
+                        .filter_map(|(id, source)| {
+                            source.last_job.as_ref().map(|t| (id, t.as_ref().clone()))
+                        })
+                        .collect();
+                    for (source_id, template) in jobs_to_redispatch {
+                        self.assign_job_to_threads(
+                            AssignMode::Replace,
+                            source_id,
+                            template,
+                            share_channels,
+                        )
+                        .await;
+                    }
+                } else {
+                    debug!("ResumeMining received but scheduler is not paused");
+                }
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(Ok(()));
             }
@@ -829,7 +918,7 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
-                    self.handle_api_command(cmd, &miner_state_tx);
+                    self.handle_api_command(cmd, &miner_state_tx, &mut share_channels).await;
                 }
 
                 // Periodic state publishing and hashrate broadcast

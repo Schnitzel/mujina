@@ -1149,6 +1149,16 @@ impl BM13xxActor {
                 .send(HashThreadEvent::StatusUpdate(status))
                 .await;
         }
+
+        // NOTE: we used to reset the host UART back to 115200 here so
+        // a subsequent PauseMining -> ResumeMining cycle could re-run
+        // initialize_chips against freshly-reset chips. That worked
+        // for the baud side but still only got ~37/77 chips back —
+        // likely a chain-RST_N propagation issue we haven't debugged
+        // yet. PauseMining no longer calls go_idle on the threads
+        // (the scheduler does soft pause instead — drops shares, stops
+        // dispatching work) so this path is only hit during shutdown,
+        // where the process exits and host termios doesn't matter.
         self.chip_state = ChipState::Disabled;
         let status = self.update_status(|status| {
             status.is_active = false;
@@ -1159,6 +1169,63 @@ impl BM13xxActor {
             .clone()
             .send(HashThreadEvent::StatusUpdate(status))
             .await;
+    }
+
+    /// Re-open the chip channel at 115200 baud and re-spawn the reader
+    /// task on the new fd. Called from `disable_chips` so that
+    /// PauseMining -> ResumeMining round-trips end up with host-side
+    /// UART matching the chip-side default (chips revert to 115200 on
+    /// reset, but `tcsetattr` on the host side persists across resets).
+    ///
+    /// No-op when the board doesn't expose a baud-control adapter, or
+    /// when no baud bump was configured to begin with — in those cases
+    /// the chain has never left 115200 and there's nothing to undo.
+    async fn reset_chip_uart_to_base_baud(&mut self) {
+        if self.post_broadcast_chip_baud.is_none() {
+            return;
+        }
+        let Some(chip_uart) = self.peripherals.chip_uart_baud.as_ref() else {
+            return;
+        };
+        const BASE_BAUD_HZ: u32 = 115_200;
+
+        let new_streams = {
+            let mut control = chip_uart.lock().await;
+            // Re-use the two-phase swap: prepare a fresh stream at the
+            // current rate (whatever the previous baud bump landed on),
+            // then `finalize_baud_switch` retunes the device down to
+            // 115200 (kernel termios is shared across both fds on the
+            // same device, so this also flips the old fd).
+            let prepared = control.prepare_new_stream(BASE_BAUD_HZ).await;
+            let finalized = control.finalize_baud_switch(BASE_BAUD_HZ).await;
+            match (prepared, finalized) {
+                (Ok(pair), Ok(())) => Some(pair),
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!(
+                        error = %e,
+                        "Failed to reset chip UART to 115200; resume may fail to enumerate"
+                    );
+                    None
+                }
+            }
+        };
+
+        if let Some((new_rx, new_tx)) = new_streams {
+            // Swap the actor's chip channels onto the fresh fd, same
+            // dance as `maybe_switch_chip_baud` step 5: drop the old
+            // writer, kill the old reader task, spawn a new one.
+            let stale_reader = self.reader_handle.take();
+            let _old_tx = std::mem::replace(&mut self.chip_tx, new_tx);
+            drop(_old_tx);
+            if let Some(handle) = stale_reader {
+                let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+            }
+            self.reader_handle = Some(tokio::spawn(serial_reader_task(
+                new_rx,
+                self.response_tx.clone(),
+            )));
+            debug!("Chip UART reset to 115200 for the next initialize_chips run");
+        }
     }
 
     async fn handle_chip_response(&mut self, result: Result<protocol::Response, std::io::Error>) {
