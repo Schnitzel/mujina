@@ -16,7 +16,7 @@ use crate::{
     api::{self, ApiConfig, BoardRegistry, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
-    board::s19j_pro_amlogic,
+    board::{s19j_pro_amlogic, s19k_pro_amlogic},
     config::{Config, HashboardModel},
     cpu_miner::CpuMinerConfig,
     display::gt_touch,
@@ -85,14 +85,43 @@ impl Daemon {
                 .as_ref()
                 .and_then(Config::enabled_amlogic_control_board)
             {
-                let device_id = s19j_pro_amlogic::device_id(config);
-                s19j_pro_amlogic::install_config(config.clone())?;
+                // Dispatch to the right board driver based on the
+                // first configured hashboard's model. Both S19j Pro
+                // and S19k Pro use the same Amlogic A113D control
+                // board; only the chip family and hashboard topology
+                // differ, so they share the AmlogicControlBoardConfig
+                // schema.
+                let model = config
+                    .hashboards
+                    .first()
+                    .map(|hb| hb.model)
+                    .unwrap_or(HashboardModel::S19jPro);
 
-                info!(board = %device_id, "Native Amlogic control board enabled from config");
+                let device_id = match model {
+                    HashboardModel::S19jPro => {
+                        let id = s19j_pro_amlogic::device_id(config);
+                        s19j_pro_amlogic::install_config(config.clone())?;
+                        id
+                    }
+                    HashboardModel::S19kPro => {
+                        let id = s19k_pro_amlogic::device_id(config);
+                        s19k_pro_amlogic::install_config(config.clone())?;
+                        id
+                    }
+                };
+
+                info!(
+                    board = %device_id,
+                    model = ?model,
+                    "Native Amlogic control board enabled from config"
+                );
 
                 let event =
                     TransportEvent::Amlogic(amlogic_transport::TransportEvent::DeviceConnected(
-                        AmlogicDeviceInfo { device_id },
+                        AmlogicDeviceInfo {
+                            device_id,
+                            model,
+                        },
                     ));
                 if let Err(e) = transport_tx.send(event).await {
                     error!("Failed to send native Amlogic board event: {}", e);
@@ -340,10 +369,13 @@ impl Daemon {
                     .as_ref()
                     .and_then(Config::enabled_amlogic_control_board)
                     .and_then(|config| config.hashboards.first())
-                    .map(|hashboard| match hashboard.model {
-                        HashboardModel::S19jPro => "BM1362".to_string(),
-                    });
-                let default_device_model = Some("S19j Pro (Amlogic control board)".to_string());
+                    .map(|hashboard| hashboard.model.asic_model_label().to_string());
+                let default_device_model = self
+                    .config
+                    .as_ref()
+                    .and_then(Config::enabled_amlogic_control_board)
+                    .and_then(|config| config.hashboards.first())
+                    .map(|hashboard| hashboard.model.board_model_label().to_string());
                 let default_voltage = self
                     .config
                     .as_ref()

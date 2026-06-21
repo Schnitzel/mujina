@@ -189,6 +189,12 @@ impl Sequencer {
     pub fn build_frequency_ramp(&self, target: Frequency) -> Vec<(Frequency, Step)> {
         const INITIAL_FREQ_MHZ: f32 = 56.25;
         const STEP_MHZ: f32 = 6.25;
+        // 100 ms gives chip PLLs roughly 10 lock periods between steps,
+        // empirically enough to land at the target rate without dropping
+        // chips. LuxOS spaces steps ~4 s apart on BHB56902 but that's
+        // tied to its readback-and-verify pattern (`4205 08` reads
+        // between every write); we don't do those reads so a faster
+        // cadence is fine.
         const STEP_DELAY: Duration = Duration::from_millis(100);
 
         let mut steps = vec![];
@@ -272,24 +278,26 @@ impl Sequencer {
             ));
         }
 
-        // InitControl (0xA8) = 0x00 broadcast - prepare chips for enumeration
-        // emberone-miner does this before ChainInactive. The value 0x02 comes later
-        // in per-chip configuration.
+        // InitControl (0xA8) broadcast - prepare chips for enumeration.
+        // The exact value is chip-family specific (BM1362 = 0, BM1366 =
+        // 0x0000_0700) and lives on the chip config so each family's
+        // init bytes match ESP-Miner exactly.
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: Register::InitControl {
-                raw_value: 0x0000_0000,
+                raw_value: self.chip_config.init_regs.init_control_broadcast,
             },
         }));
 
-        // MiscControl (0x18) broadcast - enables clock and core functionality
-        // Wire bytes: B0 00 C1 00
+        // MiscControl (0x18) broadcast - enables clock and core
+        // functionality. Chip-family specific (BM1362 wire bytes
+        // `B0 00 C1 00`, BM1366 `FF 0F C1 00`).
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: Register::MiscControl {
-                raw_value: 0x00C1_00B0,
+                raw_value: self.chip_config.init_regs.misc_control_broadcast,
             },
         }));
 
@@ -331,24 +339,19 @@ impl Sequencer {
 
     fn default_reg_config(&self, chain: &Chain) -> Vec<Step> {
         let mut steps = vec![];
+        let init = &self.chip_config.init_regs;
 
         // Phase 1: Broadcast configuration
-        // Core configuration - first two writes are broadcast
-        // BM1362 values from emberone-miner reference
-        steps.push(Step::new(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8540,
-            },
-        }));
-        steps.push(Step::new(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8008,
-            },
-        }));
+        // Core (0x3C) broadcasts. Values are chip-family specific:
+        // BM1362 wire bytes `40 85 00 80` + `08 80 00 80`; BM1366
+        // `80 00 85 40` + `80 00 80 20`.
+        for raw_value in init.core_broadcast {
+            steps.push(Step::new(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::Core { raw_value },
+            }));
+        }
 
         // TicketMask controls which nonces chips report.
         // Scale hashrate by chip count to maintain ~1 nonce/sec across the chain.
@@ -364,21 +367,27 @@ impl Sequencer {
             register: Register::TicketMask(TicketMask::new(reporting_interval)),
         }));
 
-        // AnalogMux (0x54) configuration from emberone-miner
-        // Wire bytes: 00 00 00 03
+        // AnalogMux (0x54) broadcast. Same wire bytes across BM1362
+        // and BM1366 (`00 00 00 03`) per ESP-Miner.
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: Register::AnalogMux {
-                raw_value: 0x0300_0000,
+                raw_value: init.analog_mux_broadcast,
             },
         }));
 
-        // Broadcast IO driver strength to all chips
+        // IO driver strength broadcast. BM1366 overrides the per-chain
+        // default with an exact wire pattern (`02 11 11 11`); other
+        // chips fall back to chip_config.io_driver.
+        let io_driver = init
+            .io_driver_broadcast_raw
+            .map(IoDriverStrength::from_raw_le_u32)
+            .unwrap_or(self.chip_config.io_driver);
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
-            register: Register::IoDriverStrength(self.chip_config.io_driver),
+            register: Register::IoDriverStrength(io_driver),
         }));
 
         // Basic PLL configuration at ~56 MHz (emberone-miner's starting frequency)
@@ -391,56 +400,74 @@ impl Sequencer {
             register: Register::PllDivider(PllConfig::new(0xDD, 2, 0x66)),
         }));
 
-        // Phase 2: Per-chip configuration with delays
-        // InitControl, MiscControl, and Core x3 per-chip with brief delay
-        // to allow cores to stabilize before moving to next chip.
+        // Phase 2: Per-chip configuration with delays.
+        //
+        // BM1366 prepends UartRelay (0x2C) writes that BM1362 skips. Two
+        // modes are supported (see `chip_config::ChainInitRegs`):
+        //   - `uart_relay_perdomain`: write to first + last chip of each
+        //     domain with a per-domain value (BHB56902 / S19k Pro).
+        //   - `uart_relay_perchip`: write the same value to every chip in
+        //     the chain (Bitaxe Supra single-domain).
+        // The rest of the sequence (InitControl, MiscControl, Core × 3) is
+        // shared in shape but uses chip-family raw bytes.
+        if let Some(spec) = init.uart_relay_perdomain {
+            for (host_dist, domain) in chain.domains_far_to_near().enumerate() {
+                let domain_idx = chain.domain_count().saturating_sub(host_dist + 1);
+                let raw_value = spec.value_for(domain_idx);
+                for &chip_id in &[
+                    chain.domain_first(domain.id),
+                    chain.domain_last(domain.id),
+                ] {
+                    let chip_address = chain.chip(chip_id).address;
+                    steps.push(Step::new(Command::WriteRegister {
+                        broadcast: false,
+                        chip_address,
+                        register: Register::UartRelay { raw_value },
+                    }));
+                }
+            }
+        }
+
         for (_, chip) in chain.chips() {
-            // InitControl (0xA8) = 0x02 per-chip
-            // Wire bytes: 00 00 00 02
+            if let Some(raw_value) = init.uart_relay_perchip {
+                steps.push(Step::new(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address: chip.address,
+                    register: Register::UartRelay { raw_value },
+                }));
+            }
+
             steps.push(Step::new(Command::WriteRegister {
                 broadcast: false,
                 chip_address: chip.address,
                 register: Register::InitControl {
-                    raw_value: 0x0200_0000,
+                    raw_value: init.init_control_perchip,
                 },
             }));
 
-            // MiscControl (0x18) per-chip
-            // Wire bytes: B0 00 C1 00
             steps.push(Step::new(Command::WriteRegister {
                 broadcast: false,
                 chip_address: chip.address,
                 register: Register::MiscControl {
-                    raw_value: 0x00C1_00B0,
+                    raw_value: init.misc_control_perchip,
                 },
             }));
 
-            // Core (0x3C) x3 per-chip - enables hashing cores
-            steps.push(Step::new(Command::WriteRegister {
-                broadcast: false,
-                chip_address: chip.address,
-                register: Register::Core {
-                    raw_value: 0x8000_8540,
-                },
-            }));
-            steps.push(Step::new(Command::WriteRegister {
-                broadcast: false,
-                chip_address: chip.address,
-                register: Register::Core {
-                    raw_value: 0x8000_8008,
-                },
-            }));
-            // Third Core write - critical for enabling actual hashing
-            steps.push(Step::with_delay(
-                Command::WriteRegister {
+            // Core (0x3C) × 3 per-chip — enables hashing cores. The
+            // last write gets a small post-delay so cores stabilise
+            // before the next chip's writes start.
+            for (i, raw_value) in init.core_perchip.iter().copied().enumerate() {
+                let cmd = Command::WriteRegister {
                     broadcast: false,
                     chip_address: chip.address,
-                    register: Register::Core {
-                        raw_value: 0x8000_82AA,
-                    },
-                },
-                Duration::from_millis(50), // Brief delay for core stabilization
-            ));
+                    register: Register::Core { raw_value },
+                };
+                if i + 1 == init.core_perchip.len() {
+                    steps.push(Step::with_delay(cmd, Duration::from_millis(50)));
+                } else {
+                    steps.push(Step::new(cmd));
+                }
+            }
         }
 
         // Phase 3: Final broadcast configuration
@@ -469,22 +496,16 @@ impl Sequencer {
     /// AnalogMux, IoDriverStrength, and initial PLL at ~56 MHz.
     fn default_reg_config_broadcast(&self, chain: &Chain) -> Vec<Step> {
         let mut steps = vec![];
+        let init = &self.chip_config.init_regs;
 
-        // Core configuration - first two writes are broadcast
-        steps.push(Step::new(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8540,
-            },
-        }));
-        steps.push(Step::new(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8008,
-            },
-        }));
+        // Core (0x3C) broadcast writes. Chip-family specific values.
+        for raw_value in init.core_broadcast {
+            steps.push(Step::new(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::Core { raw_value },
+            }));
+        }
 
         // TicketMask controls which nonces chips report.
         // Scale hashrate by chip count to maintain ~1 nonce/sec across the chain.
@@ -500,21 +521,51 @@ impl Sequencer {
             register: Register::TicketMask(TicketMask::new(reporting_interval)),
         }));
 
-        // AnalogMux (0x54)
+        // AnalogMux (0x54) broadcast.
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: Register::AnalogMux {
-                raw_value: 0x0300_0000,
+                raw_value: init.analog_mux_broadcast,
             },
         }));
 
-        // IO driver strength
+        // IO driver strength. BM1366 overrides with an exact raw
+        // pattern (`02 11 11 11`); other chips take the per-chain
+        // default.
+        let io_driver = init
+            .io_driver_broadcast_raw
+            .map(IoDriverStrength::from_raw_le_u32)
+            .unwrap_or(self.chip_config.io_driver);
         steps.push(Step::new(Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
-            register: Register::IoDriverStrength(self.chip_config.io_driver),
+            register: Register::IoDriverStrength(io_driver),
         }));
+
+        // Per-domain-boundary UartRelay (reg 0x2C). MUST go out here, at
+        // the slow baud, before the post-broadcast UART speed bump fires:
+        // these registers tune the chain's relay timing budget for the
+        // current bit rate. LuxOS sends them between IoDriverStrength and
+        // the UartBaud broadcast — anything that lands at the new (fast)
+        // baud drops chips downstream of the affected domain.
+        if let Some(spec) = init.uart_relay_perdomain {
+            for (host_dist, domain) in chain.domains_far_to_near().enumerate() {
+                let domain_idx = chain.domain_count().saturating_sub(host_dist + 1);
+                let raw_value = spec.value_for(domain_idx);
+                for &chip_id in &[
+                    chain.domain_first(domain.id),
+                    chain.domain_last(domain.id),
+                ] {
+                    let chip_address = chain.chip(chip_id).address;
+                    steps.push(Step::new(Command::WriteRegister {
+                        broadcast: false,
+                        chip_address,
+                        register: Register::UartRelay { raw_value },
+                    }));
+                }
+            }
+        }
 
         // NOTE: No PLL write here - emberone-miner sets initial PLL at start
         // of frequency ramp, not in broadcast config.
@@ -529,52 +580,55 @@ impl Sequencer {
     /// frequency.
     fn default_reg_config_perchip(&self, chain: &Chain) -> Vec<Step> {
         let mut steps = vec![];
+        let init = &self.chip_config.init_regs;
+
+        // NOTE: Per-domain-boundary UartRelay used to live here, but it
+        // must run BEFORE the post-broadcast UART baud bump. It now lives
+        // in `default_reg_config_broadcast` so the relay-timing registers
+        // are written at the slow baud where the chain is still tolerant.
 
         for (_, chip) in chain.chips() {
-            // InitControl (0xA8) = 0x02 per-chip
+            // BM1366 PerChip (Bitaxe Supra single-domain etc.). On boards
+            // using the per-domain-boundary path above, this is None.
+            if let Some(raw_value) = init.uart_relay_perchip {
+                steps.push(Step::new(Command::WriteRegister {
+                    broadcast: false,
+                    chip_address: chip.address,
+                    register: Register::UartRelay { raw_value },
+                }));
+            }
+
             steps.push(Step::new(Command::WriteRegister {
                 broadcast: false,
                 chip_address: chip.address,
                 register: Register::InitControl {
-                    raw_value: 0x0200_0000,
+                    raw_value: init.init_control_perchip,
                 },
             }));
 
-            // MiscControl (0x18) per-chip
             steps.push(Step::new(Command::WriteRegister {
                 broadcast: false,
                 chip_address: chip.address,
                 register: Register::MiscControl {
-                    raw_value: 0x00C1_00B0,
+                    raw_value: init.misc_control_perchip,
                 },
             }));
 
-            // Core (0x3C) x3 per-chip - enables hashing cores
-            steps.push(Step::new(Command::WriteRegister {
-                broadcast: false,
-                chip_address: chip.address,
-                register: Register::Core {
-                    raw_value: 0x8000_8540,
-                },
-            }));
-            steps.push(Step::new(Command::WriteRegister {
-                broadcast: false,
-                chip_address: chip.address,
-                register: Register::Core {
-                    raw_value: 0x8000_8008,
-                },
-            }));
-            // Third Core write - critical for enabling actual hashing
-            steps.push(Step::with_delay(
-                Command::WriteRegister {
+            // Core (0x3C) × N per-chip — enables hashing cores. The
+            // final write gets a small post-delay so cores stabilise
+            // before the next chip's writes start.
+            for (i, raw_value) in init.core_perchip.iter().copied().enumerate() {
+                let cmd = Command::WriteRegister {
                     broadcast: false,
                     chip_address: chip.address,
-                    register: Register::Core {
-                        raw_value: 0x8000_82AA,
-                    },
-                },
-                Duration::from_millis(50),
-            ));
+                    register: Register::Core { raw_value },
+                };
+                if i + 1 == init.core_perchip.len() {
+                    steps.push(Step::with_delay(cmd, Duration::from_millis(50)));
+                } else {
+                    steps.push(Step::new(cmd));
+                }
+            }
         }
 
         // Final broadcast: NonceRange and VersionMask
@@ -591,6 +645,26 @@ impl Sequencer {
             chip_address: 0x00,
             register: Register::VersionMask(VersionMask::full_rolling()),
         }));
+
+        // Post-per-chip TicketMask broadcast. LuxOS on BHB56902 issues
+        // this AFTER the per-chip writes (`captures/luxos-bhb56902-full-mining.log`
+        // shows broadcast `reg 0x14 val=0x000000c0` at t=+10.1s, between
+        // the post-per-chip NonceRange/PllDivider broadcasts and the
+        // start of the frequency ramp). Wire byte `0xC0` = `zero_bits=2`
+        // in our encoding (very low filter = chip ticks every nonce
+        // with 2+ leading zero bits up to the controller). The default
+        // `default_reg_config_broadcast` path runs BEFORE per-chip and
+        // uses a dynamically scaled mask suited for older small-chain
+        // boards — on BHB56902 we want to override it back to 0xC0 so
+        // the share rate is high enough for the LuxOS-equivalent hashrate
+        // estimator to converge.
+        if let Some(zero_bits) = self.chip_config.post_perchip_ticket_zero_bits {
+            steps.push(Step::new(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::TicketMask(TicketMask::from_zero_bits(zero_bits)),
+            }));
+        }
 
         steps
     }

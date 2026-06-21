@@ -124,8 +124,15 @@ impl Backplane {
     async fn handle_amlogic_event(&mut self, event: AmlogicTransportEvent) -> Result<()> {
         match event {
             AmlogicTransportEvent::DeviceConnected(device_info) => {
-                let Some(descriptor) = self.virtual_registry.find("s19j_pro_amlogic") else {
-                    error!("No virtual board descriptor found for s19j_pro_amlogic");
+                let descriptor_key = match device_info.model {
+                    crate::config::HashboardModel::S19jPro => "s19j_pro_amlogic",
+                    crate::config::HashboardModel::S19kPro => "s19k_pro_amlogic",
+                };
+                let Some(descriptor) = self.virtual_registry.find(descriptor_key) else {
+                    error!(
+                        descriptor = descriptor_key,
+                        "No virtual board descriptor found for Amlogic model"
+                    );
                     return Ok(());
                 };
 

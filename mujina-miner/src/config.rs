@@ -301,10 +301,39 @@ pub struct AmlogicHashboardConfig {
 }
 
 /// Supported hashboard types for config-driven native Amlogic bring-up.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// The variant of the *first* configured hashboard selects which board
+/// driver the daemon dispatches to. A mixed-model chassis isn't
+/// supported today; all hashboards in the config should share the
+/// same `model`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HashboardModel {
+    /// BHB42601 / BHB42611 (S19j Pro, S19j Pro+) — BM1362 chips, 126
+    /// per board across 42 voltage domains.
     S19jPro,
+    /// BHB56902 (S19k Pro) — BM1366 / BM1366BS chips, ~77 per board
+    /// across 11 voltage domains.
+    S19kPro,
+}
+
+impl HashboardModel {
+    /// Friendly board-model name surfaced via the API (matches the
+    /// `BOARD_MODEL` constants in the corresponding board impls).
+    pub fn board_model_label(self) -> &'static str {
+        match self {
+            HashboardModel::S19jPro => "S19j Pro (Amlogic control board)",
+            HashboardModel::S19kPro => "S19k Pro (Amlogic control board)",
+        }
+    }
+
+    /// Chip family identifier shown on the GT Touch display.
+    pub fn asic_model_label(self) -> &'static str {
+        match self {
+            HashboardModel::S19jPro => "BM1362",
+            HashboardModel::S19kPro => "BM1366",
+        }
+    }
 }
 
 /// API server configuration.

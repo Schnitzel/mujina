@@ -517,6 +517,7 @@ fn split_pool_url(url: &str) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_client::types::BoardState;
 
     #[test]
     fn formats_checked_responses() {

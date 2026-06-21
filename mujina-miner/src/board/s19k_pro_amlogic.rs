@@ -1,4 +1,4 @@
-//! S19j Pro support on a native Antminer Amlogic control board.
+//! S19k Pro support on a native Antminer Amlogic control board.
 //!
 //! This first implementation brings up one configured hashboard using the
 //! native Linux interfaces proven in `amlogic-cb-tools`.
@@ -48,8 +48,79 @@ use crate::{
     transport::serial::SerialStream,
 };
 
-const BOARD_MODEL: &str = "S19j Pro (Amlogic control board)";
-const DEFAULT_BOARD_NAME: &str = "s19jpro-amlogic";
+/// Adapter that lets the BM13xx hash thread retune the controller-side
+/// chip UART by closing+reopening `/dev/ttyS2`, matching the LuxOS
+/// behaviour observed in `captures/luxos-bhb56902-chain-init.log`
+/// (three separate `open64()` calls on that path during init). The
+/// Amlogic `meson_uart` driver does not switch baud cleanly mid-stream
+/// via `tcsetattr` at 3 Mbaud, so the reopen path is the only reliable
+/// way to get the chain to stay synced.
+struct SerialControlAdapter {
+    /// Device node path so we can re-open after each baud switch.
+    path: std::path::PathBuf,
+    /// Control side of the staged stream from the last
+    /// `prepare_new_stream` call. Held here so `finalize_baud_switch`
+    /// can retune it, and so the new fd stays open across the actor's
+    /// chip_tx swap (the kernel never sees `/dev/ttyS2` unclaimed,
+    /// matching LuxOS's "open before drop" pattern observed in
+    /// `captures/luxos-bhb56902-full-mining.log`).
+    staged_control: Option<crate::transport::serial::SerialControl>,
+    /// Keep-alive handle on the ORIGINAL `/dev/ttyS2` fd from board
+    /// init. LuxOS leaves its initial fd open for the entire mining
+    /// session — `captures/luxos-bhb56902-steady-state.log` shows
+    /// `OPEN64 fd=25` near t=0 followed by `OPEN64 fd=16` for each
+    /// later baud switch, but fd=25 itself never appears in a close
+    /// sequence. With nothing keeping the original fd alive, mujina
+    /// was hitting a brief no-fd window when the actor swapped
+    /// readers/writers, and the meson_uart driver glitched chips off
+    /// the chain.
+    _original_keepalive: Option<crate::transport::serial::SerialControl>,
+}
+
+#[async_trait::async_trait]
+impl bm13xx::chain_config::ChipUartBaudControl for SerialControlAdapter {
+    async fn prepare_new_stream(
+        &mut self,
+        current_baud_rate: u32,
+    ) -> anyhow::Result<(
+        bm13xx::chain_config::ChipRxStream,
+        bm13xx::chain_config::ChipTxSink,
+    )> {
+        let path = self.path.to_string_lossy().into_owned();
+        // Open at the SAME baud the chain is currently using so the
+        // kernel `tcsetattr` driven by `SerialStream::new` is a no-op
+        // for the device — both the existing and the new fd stay at
+        // the current bit rate, the in-flight broadcast can complete,
+        // and chips actually receive it.
+        let stream = SerialStream::new(&path, current_baud_rate).map_err(|e| {
+            anyhow::anyhow!("SerialStream::new({path}, {current_baud_rate}): {e}")
+        })?;
+        let (reader, writer, control) = stream.split();
+        control
+            .flush_input()
+            .map_err(|e| anyhow::anyhow!("SerialControl::flush_input: {e}"))?;
+        self.staged_control = Some(control);
+        let chip_rx = FramedRead::new(reader, bm13xx::FrameCodec);
+        let chip_tx = FramedWrite::new(writer, bm13xx::FrameCodec);
+        Ok((Box::pin(chip_rx), Box::pin(chip_tx)))
+    }
+
+    async fn finalize_baud_switch(
+        &mut self,
+        target_baud_rate: u32,
+    ) -> anyhow::Result<()> {
+        let control = self
+            .staged_control
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("finalize_baud_switch called without prepare_new_stream"))?;
+        control
+            .set_baud_rate(target_baud_rate)
+            .map_err(|e| anyhow::anyhow!("SerialControl::set_baud_rate({target_baud_rate}): {e}"))
+    }
+}
+
+const BOARD_MODEL: &str = "S19k Pro (Amlogic control board)";
+const DEFAULT_BOARD_NAME: &str = "s19kpro-amlogic";
 const FAN_PWM_PERIOD_NS: u32 = 10_000;
 const SERIAL_BAUD: u32 = 115_200;
 const PSU_RESPONSE_DELAY_MS: u64 = 500;
@@ -74,8 +145,8 @@ pub fn device_id(config: &AmlogicControlBoardConfig) -> String {
         .unwrap_or_else(|| DEFAULT_BOARD_NAME.to_string())
 }
 
-/// Native Amlogic S19j Pro board.
-pub struct S19jProAmlogic {
+/// Native Amlogic S19k Pro board.
+pub struct S19kProAmlogic {
     config: AmlogicControlBoardConfig,
     selected_hashboard: AmlogicHashboardConfig,
     board_serial: Option<String>,
@@ -85,7 +156,7 @@ pub struct S19jProAmlogic {
     telemetry_shutdown: CancellationToken,
 }
 
-impl S19jProAmlogic {
+impl S19kProAmlogic {
     fn new(
         config: AmlogicControlBoardConfig,
         selected_hashboard: AmlogicHashboardConfig,
@@ -122,7 +193,7 @@ impl S19jProAmlogic {
             board = %board_name,
             hashboard = selected_hashboard.index,
             serial = %selected_hashboard.serial_path.display(),
-            "Initializing native Amlogic S19j Pro board"
+            "Initializing native Amlogic S19k Pro board"
         );
 
         let (board_serial, initial_temperatures) =
@@ -154,26 +225,26 @@ impl S19jProAmlogic {
             psu_guard.measure_voltage().ok()
         };
 
-        // PIC handshake. On BHB42601 (S19j Pro PIC variant, and BHB42611 /
-        // S19j Pro+ etc.) the per-domain DC-DC regulators are gated by an
-        // on-hashboard PIC16F1704 microcontroller and must be explicitly
-        // enabled before the BM1362 chips have power to respond on UART.
+        // PIC handshake. The BHB56902 (S19k Pro), like its BHB42601 /
+        // BHB42611 (S19j Pro) siblings, gates the per-domain DC-DC
+        // regulators behind an on-hashboard PIC16F1704 microcontroller.
+        // The BM1366 chips have no power to respond on UART until we
+        // enable them via the PIC.
         // See "PIC vs noPIC Bitmain Miners":
         //   https://braiins.com/blog/pic-vs-nopic-bitmain-miners-...
         //
         // The protocol opcodes used by `PicChain` were lifted from the
         // decompiled S21 single_board_test in
         //   https://github.com/HashSource/bitmain_antminer_binaries
-        // (functions `reset_pic`, `start_app`, `get_pic_version`,
-        // `enable_dc_dc`, etc.) and confirmed against live ftrace captures
-        // of LuxOS on a BHB42601: the bring-up sequence below
+        // and confirmed against LuxOS ftrace captures on the BHB42601.
+        // The BHB56902 uses the same PIC firmware family (version 0x89
+        // observed on both) and reuses this sequence:
         //   reset -> start_app -> get_sw_ver -> disable_dc_dc -> enable_dc_dc
-        // matches what LuxOS sends byte-for-byte over /dev/i2c-0.
         //
         // The PIC's onboard LDO is fed from the 12 V rail, so handshake
-        // must run AFTER `set_enabled(true)` above. We tolerate failures
-        // here so noPIC-variant boards (BHB42603 / BHB42631) — which skot's
-        // earlier work targeted — still bring up via the existing path.
+        // must run AFTER `set_enabled(true)` above. Failures are
+        // tolerated so any future noPIC variant of the S19k Pro can
+        // still bring up via the existing path.
         let pic_addr = pic_address_for_slot(selected_hashboard.index);
         match PicChain::open(&selected_hashboard.eeprom_i2c_device, pic_addr) {
             Ok(mut pic) => match pic.handshake() {
@@ -235,7 +306,7 @@ impl S19jProAmlogic {
 }
 
 #[async_trait]
-impl Board for S19jProAmlogic {
+impl Board for S19kProAmlogic {
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
             model: BOARD_MODEL.into(),
@@ -294,10 +365,23 @@ impl Board for S19jProAmlogic {
         let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
         let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
+        // Hand the hash thread a handle for the chip-channel SerialStream
+        // so it can close+reopen `/dev/ttyS2` at a new baud rate mid-init.
+        // The original `data_control` is stashed in
+        // `_original_keepalive` so its Arc<SerialInner> reference keeps
+        // the first fd open for the lifetime of the adapter (and the
+        // mining session). LuxOS keeps its first fd open the entire
+        // time it runs — without that we get chip drops on the swap.
+        let chip_uart_baud = Arc::new(Mutex::new(SerialControlAdapter {
+            path: self.selected_hashboard.serial_path.clone(),
+            staged_control: None,
+            _original_keepalive: Some(data_control),
+        }));
+
         let config = ChainConfig {
-            name: format!("S19jProAmlogic-HB{}", self.selected_hashboard.index),
-            topology: TopologySpec::uniform_domains(42, 3, false),
-            chip_config: chip_config::bm1362(),
+            name: format!("S19kProAmlogic-HB{}", self.selected_hashboard.index),
+            topology: TopologySpec::uniform_domains(11, 7, false),
+            chip_config: chip_config::bm1366(),
             peripherals: ChainPeripherals {
                 asic_enable: Arc::new(Mutex::new(NativeResetControl {
                     gpio: SysfsGpio::new(self.selected_hashboard.reset_gpio),
@@ -306,9 +390,30 @@ impl Board for S19jProAmlogic {
                 voltage_regulator: Some(
                     Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
                 ),
-                chip_uart_baud: None,
+                chip_uart_baud: Some(chip_uart_baud
+                    as Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>),
             },
-            post_broadcast_chip_baud: None,
+            // Baud bump to 3.125 Mbaud. The post-broadcast switch is
+            // critical to break past the UART RX cap at 115200: with
+            // 77 chips producing ~32 TH/s of nonces, the 1000-frames/s
+            // ceiling at 115200 drops half the share-bearing nonces.
+            // LuxOS sustains 38 TH/s on this same hashboard at this
+            // baud (per `captures/luxos-bhb56902-steady-state.log`).
+            //
+            // Two prior mismatches were dropping chips on the switch:
+            //   1. mujina mapped `Baud3M` to 3_000_000 numeric. The
+            //      chip-side register `0x00003011` actually produces
+            //      3_125_000 baud, not 3_000_000 — the ~4 % mismatch
+            //      was enough to mangle frames on the long chain. Now
+            //      fixed in `thread_v2.rs`.
+            //   2. The board dropped the original `SerialControl` after
+            //      handing it to the actor, so when the actor swapped
+            //      to the new fd there was a brief no-fd window before
+            //      the new fd took over. LuxOS keeps its first fd open
+            //      the entire session — now `SerialControlAdapter
+            //      ._original_keepalive` holds the original control
+            //      alive for the whole adapter lifetime.
+            post_broadcast_chip_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
         };
 
         let thread = thread_v2::BM13xxThread::new(chip_rx, chip_tx, config).map_err(|e| {
@@ -657,28 +762,34 @@ impl VoltageRegulator for NativeAmlogicPsu {
     }
 
     fn voltage_range(&self) -> (f32, f32) {
-        // BHB42601 EEPROM specifies 13.20 V at 525 MHz (factory test
-        // setpoint, decoded from EEPROM `voltage_v` field). The generic
-        // `bm13xx::thread_v2::voltage_for_frequency_stacked()` formula is
-        // calibrated for emberone-style stacked regulators (per-chip
-        // 0.3 V at 500 MHz, multiplied by 12 chips = 3.6 V total) and
-        // returns ~12.6 V when applied to the 42-domain series chain on
-        // S19j Pro (0.3 V × 42). That's 0.6 V under spec and causes chips
-        // to fall off the chain mid-ramp under load.
+        // BHB56902 factory ATE setpoint is 13.90 V / 645 MHz (Braiins'
+        // `Detected hashboard #2: Voltage (Avg.) 13.90 V, Frequency
+        // (Avg.) 645 MHz, Hashrate 44400.51 GH/s`).
         //
-        // Clamping the min here (`applied.clamp(min_v, max_v)` in
-        // thread_v2) forces the ramp to program at least 13.2 V from the
-        // first step. Above-spec at low frequencies is harmless; the chips
-        // just have headroom they don't use.
+        // The min is set to the factory chain voltage. The shared
+        // frequency-ramp voltage formula (`voltage_for_frequency_stacked`)
+        // was tuned for BM1362 and returns ~0.3 V/chip; with 11
+        // domains it would set 3.46 V across the chain, which is far
+        // below what BM1366 needs to PLL-lock at 645 MHz. With a
+        // 13.9 V floor the ramp clamps up to the factory setpoint
+        // immediately, matching what LuxOS and Braiins do (they set
+        // voltage to target *before* ramping frequency).
         //
-        // Long-term fix is per-chip-family voltage-frequency tables in
-        // chip_config.rs but that's a wider refactor.
-        (13.2, 15.0)
+        // verify_chain after ramp reports few chips alive at 13.9 V
+        // (e.g. 16/77), but observed hashrate (~27 TH/s on the dummy
+        // source vs ~14 TH/s at the 13.0 V floor with 67 reported)
+        // shows that more chips are actually mining than the polled
+        // verify can see at 3.125 Mbaud — the polled read is what's
+        // flaky, not the chips themselves.
+        (13.9, 14.5)
     }
 
     fn target_voltage(&self) -> f32 {
-        // Match EEPROM-specified operating voltage for BHB42601.
-        13.2
+        // Factory-equivalent operating point, matching Braiins's
+        // `Voltage(13.9)` for this hashboard. With 500 MHz frequency
+        // mujina was at ~21 TH/s; at 645 MHz + 13.9 V Braiins gets
+        // ~30 TH/s on the same chips.
+        13.9
     }
 
     fn voltage_step(&self) -> f32 {
@@ -837,19 +948,37 @@ async fn native_telemetry_task(
     // share one PIC handle and the same i2c-0 transactions don't race.
     // Failing to open just disables the heartbeat (board may still come up
     // briefly).
+    // Probe for the PIC at the expected i2c address. The BHB56902
+    // (S19k Pro) is a noPIC variant — no chip ACKs at 0x21 / 0x22.
+    // Without a probe we'd spam a "PIC heartbeat failed" warning every
+    // ~2 s for the life of the process. Try one heartbeat; if it
+    // fails, disable the path entirely.
     let pic_addr = pic_address_for_slot(hashboard.index);
-    let mut pic_for_heartbeat: Option<PicChain> =
-        match PicChain::open(&hashboard.eeprom_i2c_device, pic_addr) {
-            Ok(p) => Some(p),
+    let mut pic_for_heartbeat: Option<PicChain> = match PicChain::open(
+        &hashboard.eeprom_i2c_device,
+        pic_addr,
+    ) {
+        Ok(mut p) => match p.heartbeat() {
+            Ok(()) => Some(p),
             Err(e) => {
-                warn!(
+                info!(
                     addr = format_args!("0x{:02x}", pic_addr),
                     error = %e,
-                    "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
+                    "PIC absent on this hashboard (likely a noPIC variant like BHB56902); \
+                     skipping heartbeat path"
                 );
                 None
             }
-        };
+        },
+        Err(e) => {
+            warn!(
+                addr = format_args!("0x{:02x}", pic_addr),
+                error = %e,
+                "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
+            );
+            None
+        }
+    };
 
     loop {
         if shutdown.is_cancelled() {
@@ -906,7 +1035,7 @@ async fn native_telemetry_task(
         // conservative fixed cutoff: this code path is exercised on the
         // bench (limited cooling) much more than in chassis, and the
         // failure mode of running a hashboard hot is severe (the original
-        // BHB42601 we used to bring this up arced its 12 V input plane).
+        // BHB56902 we used to bring this up arced its 12 V input plane).
         // A configurable threshold is the right long-term answer; left as
         // future work to keep this PR focused.
         const OVERTEMP_CUTOFF_C: f32 = 75.0;
@@ -1005,7 +1134,7 @@ async fn read_fan_states(config: &AmlogicControlBoardConfig, target_percent: u8)
 fn read_temperatures(
     hashboard: &AmlogicHashboardConfig,
 ) -> Result<Vec<TemperatureSensor>, BoardError> {
-    // Try PIC-mediated temps first (PIC-variant boards: BHB42601 / S19j Pro
+    // Try PIC-mediated temps first (PIC-variant boards: BHB56902 / S19k Pro
     // family, where asic_sensor_type=0 in EEPROM and pic_sensor_type != 0).
     // These can only be read while PSU output is ON because the PIC's LDO
     // is fed from the 12V rail; tolerate a failure here and fall back to
@@ -1181,18 +1310,18 @@ async fn create_amlogic_board()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let (selected_hashboard, board_serial, psu) = S19jProAmlogic::initialize(&config, &state_tx)
+    let (selected_hashboard, board_serial, psu) = S19kProAmlogic::initialize(&config, &state_tx)
         .await
         .map_err(|e| Error::Hardware(format!("Failed to initialize native Amlogic board: {e}")))?;
 
-    let board = S19jProAmlogic::new(config, selected_hashboard, board_serial, psu, state_tx);
+    let board = S19kProAmlogic::new(config, selected_hashboard, board_serial, psu, state_tx);
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
 }
 
 inventory::submit! {
     VirtualBoardDescriptor {
-        device_type: "s19j_pro_amlogic",
+        device_type: "s19k_pro_amlogic",
         name: BOARD_MODEL,
         create_fn: || Box::pin(create_amlogic_board()),
     }

@@ -354,6 +354,14 @@ impl TicketMask {
         }
     }
 
+    /// Build a TicketMask directly from the `zero_bits` field, bypassing
+    /// the `ReportingInterval` derivation. Use when a board has a known
+    /// good final TicketMask value from a stock-firmware capture (e.g.
+    /// `zero_bits=2` on BHB56902 to match LuxOS's `wire 0xC0`).
+    pub const fn from_zero_bits(zero_bits: u8) -> Self {
+        Self { zero_bits }
+    }
+
     /// Encode ticket mask to wire format bytes
     pub fn to_wire_bytes(&self) -> [u8; 4] {
         if self.zero_bits == 0 {
@@ -423,8 +431,13 @@ impl From<BaudRate> for [u8; 4] {
             // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
             // All three chips use identical register value for 1Mbaud
             BaudRate::Baud1M => 0x00023011,
-            // From S21 Pro captures (BM1370 multi-chip chains)
-            BaudRate::Baud3M => 0x00003001,
+            // Wire bytes `11 30 00 00` (LE u32 = 0x00003011) for 3 Mbaud.
+            // Confirmed by live LuxOS capture on BHB56902 (S19k Pro / BM1366):
+            // see `captures/luxos-bhb56902-chain-init.log` for the broadcast
+            // `55aa 5109 00 28 11300000 1e` and dmesg showing the controller
+            // baud bump from 115200 → 3000000 right after. Earlier value
+            // 0x00003001 was an untested guess.
+            BaudRate::Baud3M => 0x00003011,
             BaudRate::Custom(val) => val,
         };
         value.to_le_bytes()
@@ -452,6 +465,28 @@ impl IoDriverStrength {
         // 0x1111f100 = 0001 0001 0001 0001 1111 0001 0000 0000
         Self {
             strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
+        }
+    }
+
+    /// Construct from an exact-wire `u32` (little-endian, matching the
+    /// register's on-wire byte order). Used for chip-family-specific
+    /// raw values where the per-signal-group decomposition isn't
+    /// meaningful — e.g. BM1366's `02 11 11 11` reg-0x58 broadcast
+    /// from ESP-Miner's init139, which doesn't map cleanly onto the
+    /// "normal middle / strong boundary" preset shape.
+    pub fn from_raw_le_u32(raw: u32) -> Self {
+        let bytes = raw.to_le_bytes();
+        Self {
+            strengths: [
+                bytes[0] & 0x0F,
+                (bytes[0] >> 4) & 0x0F,
+                bytes[1] & 0x0F,
+                (bytes[1] >> 4) & 0x0F,
+                bytes[2] & 0x0F,
+                (bytes[2] >> 4) & 0x0F,
+                bytes[3] & 0x0F,
+                (bytes[3] >> 4) & 0x0F,
+            ],
         }
     }
 }
@@ -534,9 +569,19 @@ pub enum RegisterAddress {
     UartBaud = 0x28,
     UartRelay = 0x2C,
     Core = 0x3C,
+    /// BM1366/BM1368 Clock Order Control 0 — broadcast write during init (esp-miner BM1366.c).
+    ClockOrderControl0 = 0x40,
+    /// BM1366/BM1368 Clock Order Control 1 — broadcast write during init (esp-miner BM1366.c).
+    ClockOrderControl1 = 0x44,
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
+    /// BM1366 Clock Order Status — chip auto-reports during PLL/clock transitions.
+    ClockOrderStatus = 0x60,
     Pll3Parameter = 0x68,
+    /// BM1366 Frequency Sweep Control — used by nonce auto-sweep features.
+    FrequencySweepControl = 0x80,
+    /// BM1366 Golden Nonce for Sweep Return.
+    GoldenNonceForSweepReturn = 0x84,
     VersionMask = 0xA4,
     InitControl = 0xA8,
     MiscSettings = 0xB9,
@@ -562,11 +607,26 @@ pub enum Register {
     Core {
         raw_value: u32,
     },
+    ClockOrderControl0 {
+        raw_value: u32,
+    },
+    ClockOrderControl1 {
+        raw_value: u32,
+    },
     AnalogMux {
         raw_value: u32,
     },
     IoDriverStrength(IoDriverStrength),
+    ClockOrderStatus {
+        raw_value: u32,
+    },
     Pll3Parameter {
+        raw_value: u32,
+    },
+    FrequencySweepControl {
+        raw_value: u32,
+    },
+    GoldenNonceForSweepReturn {
         raw_value: u32,
     },
     VersionMask(VersionMask),
@@ -609,6 +669,8 @@ impl Register {
             }
             RegisterAddress::UartRelay => Register::UartRelay { raw_value },
             RegisterAddress::Core => Register::Core { raw_value },
+            RegisterAddress::ClockOrderControl0 => Register::ClockOrderControl0 { raw_value },
+            RegisterAddress::ClockOrderControl1 => Register::ClockOrderControl1 { raw_value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value },
             RegisterAddress::IoDriverStrength => {
                 // Parse driver strength from raw value
@@ -618,7 +680,12 @@ impl Register {
                 }
                 Register::IoDriverStrength(IoDriverStrength { strengths })
             }
+            RegisterAddress::ClockOrderStatus => Register::ClockOrderStatus { raw_value },
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value },
+            RegisterAddress::FrequencySweepControl => Register::FrequencySweepControl { raw_value },
+            RegisterAddress::GoldenNonceForSweepReturn => {
+                Register::GoldenNonceForSweepReturn { raw_value }
+            }
             RegisterAddress::VersionMask => {
                 let mask = (raw_value >> 16) as u16;
                 let control = (raw_value & 0xffff) as u16;
@@ -640,9 +707,16 @@ impl Register {
             Register::UartBaud(_) => RegisterAddress::UartBaud,
             Register::UartRelay { .. } => RegisterAddress::UartRelay,
             Register::Core { .. } => RegisterAddress::Core,
+            Register::ClockOrderControl0 { .. } => RegisterAddress::ClockOrderControl0,
+            Register::ClockOrderControl1 { .. } => RegisterAddress::ClockOrderControl1,
             Register::AnalogMux { .. } => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
+            Register::ClockOrderStatus { .. } => RegisterAddress::ClockOrderStatus,
             Register::Pll3Parameter { .. } => RegisterAddress::Pll3Parameter,
+            Register::FrequencySweepControl { .. } => RegisterAddress::FrequencySweepControl,
+            Register::GoldenNonceForSweepReturn { .. } => {
+                RegisterAddress::GoldenNonceForSweepReturn
+            }
             Register::VersionMask(_) => RegisterAddress::VersionMask,
             Register::InitControl { .. } => RegisterAddress::InitControl,
             Register::MiscSettings { .. } => RegisterAddress::MiscSettings,
@@ -683,8 +757,13 @@ impl Register {
             }
             Register::MiscControl { raw_value }
             | Register::UartRelay { raw_value }
+            | Register::ClockOrderControl0 { raw_value }
+            | Register::ClockOrderControl1 { raw_value }
             | Register::AnalogMux { raw_value }
+            | Register::ClockOrderStatus { raw_value }
             | Register::Pll3Parameter { raw_value }
+            | Register::FrequencySweepControl { raw_value }
+            | Register::GoldenNonceForSweepReturn { raw_value }
             | Register::InitControl { raw_value }
             | Register::MiscSettings { raw_value } => {
                 dst.put_u32_le(*raw_value);
@@ -724,16 +803,26 @@ impl std::fmt::Debug for Register {
             Register::VersionMask(mask) => f.debug_tuple("VersionMask").field(mask).finish(),
             Register::MiscControl { raw_value }
             | Register::UartRelay { raw_value }
+            | Register::ClockOrderControl0 { raw_value }
+            | Register::ClockOrderControl1 { raw_value }
             | Register::AnalogMux { raw_value }
+            | Register::ClockOrderStatus { raw_value }
             | Register::Pll3Parameter { raw_value }
+            | Register::FrequencySweepControl { raw_value }
+            | Register::GoldenNonceForSweepReturn { raw_value }
             | Register::InitControl { raw_value }
             | Register::Core { raw_value }
             | Register::MiscSettings { raw_value } => {
                 let register_name = match self {
                     Register::MiscControl { .. } => "MiscControl",
                     Register::UartRelay { .. } => "UartRelay",
+                    Register::ClockOrderControl0 { .. } => "ClockOrderControl0",
+                    Register::ClockOrderControl1 { .. } => "ClockOrderControl1",
                     Register::AnalogMux { .. } => "AnalogMux",
+                    Register::ClockOrderStatus { .. } => "ClockOrderStatus",
                     Register::Pll3Parameter { .. } => "Pll3Parameter",
+                    Register::FrequencySweepControl { .. } => "FrequencySweepControl",
+                    Register::GoldenNonceForSweepReturn { .. } => "GoldenNonceForSweepReturn",
                     Register::InitControl { .. } => "InitControl",
                     Register::Core { .. } => "Core",
                     Register::MiscSettings { .. } => "MiscSettings",
@@ -2690,6 +2779,12 @@ impl BM13xxProtocol {
             RegisterAddress::UartBaud => Register::UartBaud(BaudRate::Custom(value)),
             RegisterAddress::UartRelay => Register::UartRelay { raw_value: value },
             RegisterAddress::Core => Register::Core { raw_value: value },
+            RegisterAddress::ClockOrderControl0 => {
+                Register::ClockOrderControl0 { raw_value: value }
+            }
+            RegisterAddress::ClockOrderControl1 => {
+                Register::ClockOrderControl1 { raw_value: value }
+            }
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value: value },
             RegisterAddress::IoDriverStrength => {
                 let mut strengths = [0u8; 8];
@@ -2698,7 +2793,14 @@ impl BM13xxProtocol {
                 }
                 Register::IoDriverStrength(IoDriverStrength { strengths })
             }
+            RegisterAddress::ClockOrderStatus => Register::ClockOrderStatus { raw_value: value },
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value: value },
+            RegisterAddress::FrequencySweepControl => {
+                Register::FrequencySweepControl { raw_value: value }
+            }
+            RegisterAddress::GoldenNonceForSweepReturn => {
+                Register::GoldenNonceForSweepReturn { raw_value: value }
+            }
             RegisterAddress::VersionMask => {
                 let mask = (value >> 16) as u16;
                 let control = (value & 0xffff) as u16;
