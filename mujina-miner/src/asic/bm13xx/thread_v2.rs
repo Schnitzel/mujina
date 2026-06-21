@@ -34,8 +34,13 @@ use crate::{
     },
     job_source::MerkleRootKind,
     tracing::prelude::*,
-    types::{Difficulty, HashRate},
+    types::{Difficulty, HashRate, HashrateEstimator},
 };
+
+/// Window used by the per-thread hashrate estimator that drives
+/// `status.hashrate`. 5 minutes matches the scheduler-side estimator
+/// so the per-board and the chain-wide hashrate views agree.
+const ACTOR_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Minimum chip count required for initialization to succeed.
 ///
@@ -132,6 +137,7 @@ impl BM13xxThread {
                 cmd_rx,
                 evt_tx,
                 status: status_clone,
+                hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
                 estimated_hashrate: initial_hashrate,
                 response_rx,
                 chip_tx,
@@ -267,6 +273,16 @@ struct BM13xxActor {
     cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     status: Arc<RwLock<HashThreadStatus>>,
+    /// Live per-thread hashrate, computed from shares the chips
+    /// actually produce. Read in `handle_chip_response` after every
+    /// accepted share and written into `status.hashrate` so the API /
+    /// per-board UI matches the chain-wide hashrate the scheduler
+    /// computes the same way.
+    hashrate_estimator: HashrateEstimator,
+    /// Last value pulled out of `hashrate_estimator`. Cached so other
+    /// code paths (e.g. status updates that don't have a fresh share
+    /// to record) read a meaningful number instead of falling back
+    /// to the static `capabilities.hashrate_estimate`.
     estimated_hashrate: HashRate,
     /// Responses from chips, forwarded by the reader task.
     response_rx: mpsc::Receiver<Result<protocol::Response, std::io::Error>>,
@@ -1159,6 +1175,11 @@ impl BM13xxActor {
         // (the scheduler does soft pause instead — drops shares, stops
         // dispatching work) so this path is only hit during shutdown,
         // where the process exits and host termios doesn't matter.
+        // Drop the per-thread hashrate estimator so a subsequent
+        // re-init starts from zero instead of carrying old samples.
+        self.hashrate_estimator = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
+        self.estimated_hashrate = HashRate::default();
+
         self.chip_state = ChipState::Disabled;
         let status = self.update_status(|status| {
             status.is_active = false;
@@ -1318,6 +1339,15 @@ impl BM13xxActor {
                         extranonce2: task.en2,
                         expected_work: task.share_target.to_work(),
                     };
+
+                    // Feed the per-thread hashrate estimator BEFORE we
+                    // move `share` into the channel send. We feed regardless
+                    // of whether the scheduler ultimately accepts the share —
+                    // any nonce that passed our local share_target is
+                    // chip-side proof-of-work and should count toward the
+                    // per-board hashrate display.
+                    self.hashrate_estimator.record(share.expected_work);
+                    self.estimated_hashrate = self.hashrate_estimator.hashrate();
 
                     // Send via task's dedicated channel
                     if task.share_tx.send(share).await.is_err() {
@@ -1572,6 +1602,7 @@ mod tests {
             cmd_rx,
             evt_tx,
             status,
+            hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             response_rx,
             chip_tx: Box::pin(chip_tx),

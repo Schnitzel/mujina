@@ -237,7 +237,11 @@ impl Board for S19jProAmlogic {
         })?;
 
         let thread_name = thread.name().to_string();
-        let thread_hashrate = u64::from(thread.capabilities().hashrate_estimate);
+        // Seed the initial hashrate at 0; the actor's HashrateEstimator
+        // takes over once shares start flowing. See the matching change
+        // in `thread_hashrate_value` below for why the static
+        // `capabilities.hashrate_estimate` is no longer surfaced.
+        let thread_hashrate = 0u64;
 
         self.state_tx.send_modify(|state| {
             state.serial = self
@@ -336,13 +340,13 @@ impl BoardStateHashThread {
     }
 }
 
-fn thread_hashrate_value(status: &HashThreadStatus, capabilities: &HashThreadCapabilities) -> u64 {
-    let measured = u64::from(status.hashrate);
-    if measured > 0 {
-        measured
-    } else {
-        u64::from(capabilities.hashrate_estimate)
-    }
+fn thread_hashrate_value(status: &HashThreadStatus, _capabilities: &HashThreadCapabilities) -> u64 {
+    // Report the actual measured hashrate, including 0 when the thread
+    // hasn't accepted any shares yet (init, frequency ramp, pause).
+    // The previous fallback to `capabilities.hashrate_estimate` made
+    // the per-board UI show a static 6.39 TH/s during ramp-up while
+    // the chain-wide hashrate was still 0 — confusing.
+    u64::from(status.hashrate)
 }
 
 #[async_trait]
