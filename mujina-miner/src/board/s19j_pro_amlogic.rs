@@ -14,6 +14,7 @@ use amlogic_cb_tools::{
     eeprom_antminer::decode_antminer_eeprom,
     gpio::SysfsGpio,
     linux_i2c::LinuxI2cDevice,
+    pic::{PicChain, pic_address_for_slot},
     protocol::{
         CMD_GET_VOLTAGE, CMD_MEASURE_VOLTAGE, CMD_SET_VOLTAGE, CMD_WATCHDOG, NAK_BYTE, build_frame,
         decode_dac_to_voltage, decode_measured_voltage, encode_voltage_to_dac, parse_frame,
@@ -136,9 +137,12 @@ impl S19jProAmlogic {
             psu_guard
                 .set_enabled(true)
                 .map_err(|e| BoardError::HardwareControl(format!("Failed to enable PSU: {e}")))?;
-            psu_guard.config_watchdog(0x00).map_err(|e| {
-                BoardError::HardwareControl(format!("Failed to disable PSU watchdog: {e}"))
-            })?;
+            if let Err(e) = psu_guard.config_watchdog(0x00) {
+                warn!(
+                    "PSU watchdog disable rejected (firmware variant?), continuing: {}",
+                    e
+                );
+            }
             psu_guard
                 .set_voltage(config.startup.initial_voltage)
                 .await
@@ -149,6 +153,65 @@ impl S19jProAmlogic {
             tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
             psu_guard.measure_voltage().ok()
         };
+
+        // PIC handshake. On BHB42601 (S19j Pro PIC variant, and BHB42611 /
+        // S19j Pro+ etc.) the per-domain DC-DC regulators are gated by an
+        // on-hashboard PIC16F1704 microcontroller and must be explicitly
+        // enabled before the BM1362 chips have power to respond on UART.
+        // See "PIC vs noPIC Bitmain Miners":
+        //   https://braiins.com/blog/pic-vs-nopic-bitmain-miners-...
+        //
+        // The protocol opcodes used by `PicChain` were lifted from the
+        // decompiled S21 single_board_test in
+        //   https://github.com/HashSource/bitmain_antminer_binaries
+        // (functions `reset_pic`, `start_app`, `get_pic_version`,
+        // `enable_dc_dc`, etc.) and confirmed against live ftrace captures
+        // of LuxOS on a BHB42601: the bring-up sequence below
+        //   reset -> start_app -> get_sw_ver -> disable_dc_dc -> enable_dc_dc
+        // matches what LuxOS sends byte-for-byte over /dev/i2c-0.
+        //
+        // The PIC's onboard LDO is fed from the 12 V rail, so handshake
+        // must run AFTER `set_enabled(true)` above. We tolerate failures
+        // here so noPIC-variant boards (BHB42603 / BHB42631) — which skot's
+        // earlier work targeted — still bring up via the existing path.
+        let pic_addr = pic_address_for_slot(selected_hashboard.index);
+        match PicChain::open(&selected_hashboard.eeprom_i2c_device, pic_addr) {
+            Ok(mut pic) => match pic.handshake() {
+                Ok(version) => {
+                    info!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        version = format_args!("0x{:02x}", version),
+                        "PIC handshake ok"
+                    );
+                    if let Err(e) = pic.enable_dc_dc() {
+                        warn!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            error = %e,
+                            "PIC enable_dc_dc failed; chips may not power up"
+                        );
+                    } else {
+                        info!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            "PIC DC-DC enabled; chips powering up"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        error = %e,
+                        "PIC handshake failed; chain may not respond on UART"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    addr = format_args!("0x{:02x}", pic_addr),
+                    error = %e,
+                    "Could not open PIC i2c device; non-PIC hashboard variant?"
+                );
+            }
+        }
 
         let fan_states = build_fan_state(config, config.startup.default_fan_percent);
         let power_states = vec![PowerMeasurement {
@@ -191,6 +254,22 @@ impl Board for S19jProAmlogic {
 
         assert_all_resets(&self.config)?;
         configure_fans(&self.config, 0)?;
+
+        // Best-effort disable of PIC DC-DC before cutting the rail. If this
+        // fails the PSU output-off below still safes the chips.
+        let pic_addr = pic_address_for_slot(self.selected_hashboard.index);
+        if let Ok(mut pic) =
+            PicChain::open(&self.selected_hashboard.eeprom_i2c_device, pic_addr)
+        {
+            if let Err(e) = pic.disable_dc_dc() {
+                warn!(
+                    addr = format_args!("0x{:02x}", pic_addr),
+                    error = %e,
+                    "PIC disable_dc_dc on shutdown failed (non-fatal)"
+                );
+            }
+        }
+
         self.psu
             .lock()
             .await
@@ -528,26 +607,76 @@ impl VoltageRegulator for NativeAmlogicPsu {
         let clamped = volts.clamp(12.0, 15.0);
         let dac = encode_voltage_to_dac(clamped);
 
-        match self.exchange(CMD_SET_VOLTAGE, &[dac, 0x00]) {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                let readback = self.read_target_voltage()?;
-                if (readback - clamped).abs() <= 0.15 {
-                    warn!(requested = clamped, readback, error = %err, "PSU accepted voltage by readback after transient response issue");
-                    Ok(())
-                } else {
-                    Err(err)
+        // The APW12 firmware on this control board (`get-fw` reports
+        // 0x0010, `get-hw` 0x0071) intermittently NAKs response frames
+        // even when the underlying DAC write succeeds — observed by doing
+        // a `get-voltage` immediately after a NAK'd `set-voltage` and
+        // seeing the requested DAC echoed back. Retry up to four times
+        // and fall back to readback comparison; if the DAC reads back at
+        // the requested voltage we treat the NAK as transient and accept.
+        // Without this the chain ramp stalls on the first NAK because
+        // bm13xx's chain init bubbles the error up and the scheduler
+        // refuses to assign jobs.
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..4 {
+            match self.exchange(CMD_SET_VOLTAGE, &[dac, 0x00]) {
+                Ok(_) => {
+                    if attempt > 0 {
+                        warn!(
+                            requested = clamped,
+                            attempt,
+                            "PSU set_voltage succeeded after retry"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Try a readback; if that succeeds and matches, the
+                    // earlier write probably did land. If readback itself
+                    // NAKs, retry the whole thing.
+                    if let Ok(readback) = self.read_target_voltage() {
+                        if (readback - clamped).abs() <= 0.15 {
+                            warn!(
+                                requested = clamped,
+                                readback,
+                                attempt,
+                                error = %err,
+                                "PSU accepted voltage by readback after transient response issue"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    last_err = Some(err);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("PSU set_voltage retries exhausted")))
     }
 
     fn voltage_range(&self) -> (f32, f32) {
-        (12.0, 15.0)
+        // BHB42601 EEPROM specifies 13.20 V at 525 MHz (factory test
+        // setpoint, decoded from EEPROM `voltage_v` field). The generic
+        // `bm13xx::thread_v2::voltage_for_frequency_stacked()` formula is
+        // calibrated for emberone-style stacked regulators (per-chip
+        // 0.3 V at 500 MHz, multiplied by 12 chips = 3.6 V total) and
+        // returns ~12.6 V when applied to the 42-domain series chain on
+        // S19j Pro (0.3 V × 42). That's 0.6 V under spec and causes chips
+        // to fall off the chain mid-ramp under load.
+        //
+        // Clamping the min here (`applied.clamp(min_v, max_v)` in
+        // thread_v2) forces the ramp to program at least 13.2 V from the
+        // first step. Above-spec at low frequencies is harmless; the chips
+        // just have headroom they don't use.
+        //
+        // Long-term fix is per-chip-family voltage-frequency tables in
+        // chip_config.rs but that's a wider refactor.
+        (13.2, 15.0)
     }
 
     fn target_voltage(&self) -> f32 {
-        12.6
+        // Match EEPROM-specified operating voltage for BHB42601.
+        13.2
     }
 
     fn voltage_step(&self) -> f32 {
@@ -695,18 +824,108 @@ async fn native_telemetry_task(
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+    // Open a dedicated PIC handle for the heartbeat path. LuxOS sends a
+    // PIC heartbeat (opcode 0x16) periodically while mining — captured at
+    // roughly every 1.5 s in our ftrace runs. Without heartbeats the PIC
+    // appears to disable DC-DC after a watchdog timeout (we observed chips
+    // dropping mid-ramp without it). The exact timeout isn't documented;
+    // LuxOS firmware never lets the gap grow large enough to find out.
+    //
+    // We piggy-back on the 2 s telemetry tick so heartbeat + temp reads
+    // share one PIC handle and the same i2c-0 transactions don't race.
+    // Failing to open just disables the heartbeat (board may still come up
+    // briefly).
+    let pic_addr = pic_address_for_slot(hashboard.index);
+    let mut pic_for_heartbeat: Option<PicChain> =
+        match PicChain::open(&hashboard.eeprom_i2c_device, pic_addr) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(
+                    addr = format_args!("0x{:02x}", pic_addr),
+                    error = %e,
+                    "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
+                );
+                None
+            }
+        };
+
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        let temperatures = match read_temperatures(&hashboard) {
-            Ok(temperatures) => temperatures,
-            Err(error) => {
-                debug!(board = %hashboard.index, error = %error, "Native telemetry temperature read failed");
-                Vec::new()
+        // Heartbeat + read PIC-mediated temps using a single PIC handle to
+        // avoid racing with a separately-opened temp reader.
+        let mut temperatures: Vec<TemperatureSensor> = Vec::new();
+        if let Some(ref mut pic) = pic_for_heartbeat {
+            if let Err(e) = pic.heartbeat() {
+                warn!(
+                    addr = format_args!("0x{:02x}", pic_addr),
+                    error = %e,
+                    "PIC heartbeat failed"
+                );
             }
-        };
+            match pic.read_temperatures_celsius() {
+                Ok(temps) => {
+                    for (i, t) in temps.iter().enumerate() {
+                        temperatures.push(TemperatureSensor {
+                            name: format!("HB{}-PIC{}", hashboard.index, i),
+                            temperature_c: Some(*t),
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        error = %e,
+                        "PIC temperature read failed"
+                    );
+                }
+            }
+        }
+        // Fallback to TMP75 path when no PIC-mediated temps were returned
+        // (e.g. noPIC variants). read_temperatures() handles the TMP75 case.
+        if temperatures.is_empty() {
+            match read_temperatures(&hashboard) {
+                Ok(t) => temperatures = t,
+                Err(error) => {
+                    debug!(board = %hashboard.index, error = %error, "Native telemetry temperature read failed");
+                }
+            }
+        }
+
+        // Overtemp protection: if any PIC sensor exceeds the cutoff,
+        // immediately disable DC-DC (cuts chip power but keeps PIC alive)
+        // and PSU output, then cancel telemetry so the daemon notices and
+        // shuts the board down.
+        //
+        // Stock Bitmain firmware uses ~95 °C for hard shutdown and ~85 °C
+        // for throttling on this chip family. We use 75 °C as a
+        // conservative fixed cutoff: this code path is exercised on the
+        // bench (limited cooling) much more than in chassis, and the
+        // failure mode of running a hashboard hot is severe (the original
+        // BHB42601 we used to bring this up arced its 12 V input plane).
+        // A configurable threshold is the right long-term answer; left as
+        // future work to keep this PR focused.
+        const OVERTEMP_CUTOFF_C: f32 = 75.0;
+        let hottest = temperatures
+            .iter()
+            .filter_map(|t| t.temperature_c)
+            .fold(0f32, f32::max);
+        if hottest >= OVERTEMP_CUTOFF_C {
+            error!(
+                board = %hashboard.index,
+                hottest = hottest,
+                cutoff = OVERTEMP_CUTOFF_C,
+                "OVERTEMP — disabling PIC DC-DC and PSU output"
+            );
+            if let Some(ref mut pic) = pic_for_heartbeat {
+                let _ = pic.disable_dc_dc();
+            }
+            let _ = psu.lock().await.set_enabled(false);
+            shutdown.cancel();
+            break;
+        }
 
         let fans = read_fan_states(&config, config.startup.default_fan_percent).await;
         let voltage_v = match psu.lock().await.measure_voltage() {
@@ -784,8 +1003,27 @@ async fn read_fan_states(config: &AmlogicControlBoardConfig, target_percent: u8)
 fn read_temperatures(
     hashboard: &AmlogicHashboardConfig,
 ) -> Result<Vec<TemperatureSensor>, BoardError> {
+    // Try PIC-mediated temps first (PIC-variant boards: BHB42601 / S19j Pro
+    // family, where asic_sensor_type=0 in EEPROM and pic_sensor_type != 0).
+    // These can only be read while PSU output is ON because the PIC's LDO
+    // is fed from the 12V rail; tolerate a failure here and fall back to
+    // ASIC-bus TMP75.
+    let mut sensors = Vec::new();
+    let pic_addr = pic_address_for_slot(hashboard.index);
+    if let Ok(mut pic) = PicChain::open(&hashboard.eeprom_i2c_device, pic_addr) {
+        if let Ok(temps) = pic.read_temperatures_celsius() {
+            for (i, t) in temps.iter().enumerate() {
+                sensors.push(TemperatureSensor {
+                    name: format!("HB{}-PIC{}", hashboard.index, i),
+                    temperature_c: Some(*t),
+                });
+            }
+            return Ok(sensors);
+        }
+    }
+
+    // Fallback: TMP75 sensors on the ASIC bus (older / noPIC variants).
     let addresses = configured_tmp75_addresses(hashboard)?;
-    let mut sensors = Vec::with_capacity(addresses.len());
     for (sensor_index, address) in addresses.into_iter().enumerate() {
         let raw = read_tmp75_raw(&hashboard.temp_i2c_device, address).map_err(|e| {
             BoardError::InitializationFailed(format!(
@@ -794,7 +1032,7 @@ fn read_temperatures(
             ))
         })?;
         sensors.push(TemperatureSensor {
-            name: format!("HB{}-Temp{}", hashboard.index, sensor_index),
+            name: format!("HB{}-TMP75-{}", hashboard.index, sensor_index),
             temperature_c: Some(decode_tmp75_celsius(raw)),
         });
     }
