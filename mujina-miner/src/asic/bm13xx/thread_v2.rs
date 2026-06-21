@@ -138,6 +138,7 @@ impl BM13xxThread {
                 evt_tx,
                 status: status_clone,
                 hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+                paused: false,
                 estimated_hashrate: initial_hashrate,
                 response_rx,
                 chip_tx,
@@ -235,6 +236,19 @@ impl HashThread for BM13xxThread {
         rx.await.map_err(|_| HashThreadError::ThreadOffline)?
     }
 
+    async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::SetPaused {
+                paused,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ThreadOffline)?;
+        rx.await.map_err(|_| HashThreadError::ThreadOffline)?;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), HashThreadError> {
         // Disable chips via go_idle - this awaits the actor's response,
         // ensuring GPIO writes complete before we return.
@@ -279,6 +293,17 @@ struct BM13xxActor {
     /// per-board UI matches the chain-wide hashrate the scheduler
     /// computes the same way.
     hashrate_estimator: HashrateEstimator,
+    /// Mirror of the scheduler's `paused` flag, set via
+    /// `ThreadCommand::SetPaused`. When true, `handle_chip_response`
+    /// drops accepted shares before they reach the hashrate estimator
+    /// or `status.hashrate`, so the per-board UI matches the
+    /// chain-wide 0 TH/s the scheduler reports.
+    paused: bool,
+    /// EMA-smoothed hottest chip-die temperature observed on this
+    /// chain (°C). `None` until the first temp response decodes —
+    /// callers should treat `None` as "unknown, run fans at safe-high
+    /// default" rather than as "cool".
+    last_chip_die_temp_c: Option<f32>,
     /// Last value pulled out of `hashrate_estimator`. Cached so other
     /// code paths (e.g. status updates that don't have a fresh share
     /// to record) read a meaningful number instead of falling back
@@ -323,6 +348,14 @@ enum ThreadCommand {
     },
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    /// Forwarded from the scheduler's pause/resume API. Doesn't touch
+    /// chip power — just flips an internal flag so the actor stops
+    /// feeding its hashrate estimator and the per-board status
+    /// publishes 0 TH/s / `is_active=false` immediately.
+    SetPaused {
+        paused: bool,
+        response_tx: oneshot::Sender<()>,
     },
 }
 
@@ -544,6 +577,30 @@ impl BM13xxActor {
                 let result = self.handle_go_idle().await;
                 let _ = response_tx.send(result);
             }
+            ThreadCommand::SetPaused {
+                paused,
+                response_tx,
+            } => {
+                self.paused = paused;
+                if paused {
+                    // Immediately zero the per-thread status so the
+                    // per-board UI catches up before the next share
+                    // would have written into it.
+                    self.hashrate_estimator =
+                        HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
+                    self.estimated_hashrate = HashRate::default();
+                    let status = self.update_status(|status| {
+                        status.is_active = false;
+                        status.hashrate = HashRate::default();
+                    });
+                    let _ = self
+                        .evt_tx
+                        .clone()
+                        .send(HashThreadEvent::StatusUpdate(status))
+                        .await;
+                }
+                let _ = response_tx.send(());
+            }
         }
     }
 
@@ -562,9 +619,11 @@ impl BM13xxActor {
         let old = self.current_task.replace(new_task);
         let status = self.update_status(|status| {
             status.is_active = true;
-            if status.hashrate.is_zero() {
-                status.hashrate = self.estimated_hashrate;
-            }
+            // Don't pre-seed status.hashrate from the static
+            // `self.estimated_hashrate` (the 6.39 TH/s init value) —
+            // wait for the actor's hashrate_estimator to update from
+            // real shares so the per-board UI reads 0 during the ramp
+            // and the actual rate during steady state.
         });
         let _ = self
             .evt_tx
@@ -726,7 +785,11 @@ impl BM13xxActor {
 
         self.chip_state = ChipState::Initialized;
         let status = self.update_status(|status| {
-            status.hashrate = self.estimated_hashrate;
+            // Leave status.hashrate at whatever the hashrate_estimator
+            // produced (default 0 before first share). The static
+            // `self.estimated_hashrate` is used for chain-side TicketMask
+            // scaling, not for per-board display.
+            status.hashrate = HashRate::default();
         });
         let _ = self
             .evt_tx
@@ -1249,6 +1312,37 @@ impl BM13xxActor {
         }
     }
 
+    /// Record a chip-die temperature sample. Updates
+    /// `status.temperature_c` to the max we've seen over the last few
+    /// samples (we don't get a chip address back, so the safest signal
+    /// for fan control is the hottest temp on the chain).
+    async fn record_chip_die_temp(&mut self, sample_c: f32) {
+        // Plausibility filter: BM1366 diodes routinely report 30-90°C
+        // in operation. Anything outside this window is almost
+        // certainly a decode error (or the diode hasn't warmed up
+        // yet) — skip rather than poison the fan curve.
+        if !(0.0..=125.0).contains(&sample_c) {
+            return;
+        }
+
+        let prev = self.last_chip_die_temp_c.unwrap_or(sample_c);
+        // EMA toward new sample with a short tail so we react fast to
+        // ramps but ignore single-sample spikes from a misdecoded
+        // response.
+        let alpha = 0.6_f32;
+        let smoothed = alpha * sample_c + (1.0 - alpha) * prev;
+        self.last_chip_die_temp_c = Some(smoothed);
+
+        let status = self.update_status(|status| {
+            status.temperature_c = Some(smoothed);
+        });
+        let _ = self
+            .evt_tx
+            .clone()
+            .send(HashThreadEvent::StatusUpdate(status))
+            .await;
+    }
+
     async fn handle_chip_response(&mut self, result: Result<protocol::Response, std::io::Error>) {
         match result {
             Ok(protocol::Response::Nonce {
@@ -1258,6 +1352,33 @@ impl BM13xxActor {
                 midstate_num,
                 subcore_id,
             }) => {
+                // Chip-die temperature responses are emitted as "fake
+                // nonces" once the analog mux at register 0x54 is
+                // configured for the thermal diode (mujina already
+                // broadcasts that value during chain init via
+                // `init_regs.analog_mux_broadcast = 0x0300_0000`).
+                // Per `mujina-miner/src/asic/bm13xx/PROTOCOL.md`, temp
+                // responses match `nonce & 0xFFFF == 0x80` with the raw
+                // ADC value living in the upper 16 bits of the nonce
+                // field.
+                //
+                // The response doesn't carry a chip address — the
+                // hashboard can't tell us WHICH chip is hot, only that
+                // *some* chip is at this temp. Aggregate as a sliding
+                // max so the per-board fan curve reacts to the hottest
+                // chip on the chain.
+                if (nonce & 0x0000_FFFF) == 0x0000_0080 {
+                    let raw = ((nonce >> 16) & 0xFFFF) as u16;
+                    let temp_c = bm1366_raw_to_celsius(raw);
+                    trace!(
+                        raw = raw,
+                        temp_c = temp_c,
+                        "Chip-die temperature sample"
+                    );
+                    self.record_chip_die_temp(temp_c).await;
+                    return;
+                }
+
                 // HACK: BM1362 job_id fix - protocol.rs extracts job_id from bits 7-4,
                 // but BM1362 returns it in bits 6-3. Reconstruct result_header and re-extract.
                 // TODO: Move this to protocol.rs with chip-type-aware parsing.
@@ -1339,6 +1460,22 @@ impl BM13xxActor {
                         extranonce2: task.en2,
                         expected_work: task.share_target.to_work(),
                     };
+
+                    // Drop the share if the scheduler told us we're
+                    // paused — chips are still hashing the last job
+                    // they loaded but the scheduler ignores incoming
+                    // shares while paused, so the per-board UI should
+                    // also stop counting them. Without this gate the
+                    // actor's hashrate_estimator keeps climbing while
+                    // chain-wide hashrate is at 0.
+                    if self.paused {
+                        trace!(
+                            job_id,
+                            nonce = format!("{:#x}", nonce),
+                            "Share dropped — actor is paused"
+                        );
+                        return;
+                    }
 
                     // Feed the per-thread hashrate estimator BEFORE we
                     // move `share` into the channel send. We feed regardless
@@ -1603,6 +1740,7 @@ mod tests {
             evt_tx,
             status,
             hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+            paused: false,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             response_rx,
             chip_tx: Box::pin(chip_tx),

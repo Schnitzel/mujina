@@ -748,6 +748,14 @@ impl Scheduler {
                         thread_count = self.threads.len(),
                         "Mining paused — share submissions and new job dispatch stopped"
                     );
+                    // Tell every hash thread so its own status (per-board
+                    // hashrate + is_active) zeroes immediately, instead
+                    // of carrying pre-pause numbers in the UI.
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_paused(true).await {
+                            warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_paused(true) failed");
+                        }
+                    }
                     // Soft pause: drop any in-flight task on each hash
                     // thread but DON'T touch the chip power rail. Chips
                     // burn through whatever nonces are still queued on
@@ -791,6 +799,15 @@ impl Scheduler {
                         thread_count = self.threads.len(),
                         "Mining resumed — re-dispatching cached jobs"
                     );
+                    // Tell every thread to start feeding its own status
+                    // hashrate again. assign_job_to_threads below will
+                    // also re-dispatch cached work so shares start
+                    // flowing back.
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_paused(false).await {
+                            warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_paused(false) failed");
+                        }
+                    }
                     // Snapshot the latest job per source. We can't iterate
                     // `self.sources` while calling `assign_job_to_threads`
                     // (which borrows `&mut self`), so collect first.
