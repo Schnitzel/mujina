@@ -575,6 +575,17 @@ impl HashThread for BoardStateHashThread {
         result
     }
 
+    async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
+        let result = self.inner.set_paused(paused).await;
+        // On pause: actor just zeroed its status, so reflect that
+        // in the per-board state too. On resume: leave is_active
+        // alone — the next share will set it.
+        if paused {
+            self.sync_thread_state(Some(false));
+        }
+        result
+    }
+
     fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<HashThreadEvent>> {
         self.inner.take_event_receiver()
     }

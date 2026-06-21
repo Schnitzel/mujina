@@ -138,6 +138,7 @@ impl BM13xxThread {
                 evt_tx,
                 status: status_clone,
                 hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+                paused: false,
                 estimated_hashrate: initial_hashrate,
                 response_rx,
                 chip_tx,
@@ -235,6 +236,19 @@ impl HashThread for BM13xxThread {
         rx.await.map_err(|_| HashThreadError::ThreadOffline)?
     }
 
+    async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::SetPaused {
+                paused,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ThreadOffline)?;
+        rx.await.map_err(|_| HashThreadError::ThreadOffline)?;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Result<(), HashThreadError> {
         // Disable chips via go_idle - this awaits the actor's response,
         // ensuring GPIO writes complete before we return.
@@ -279,6 +293,12 @@ struct BM13xxActor {
     /// per-board UI matches the chain-wide hashrate the scheduler
     /// computes the same way.
     hashrate_estimator: HashrateEstimator,
+    /// Mirror of the scheduler's `paused` flag, set via
+    /// `ThreadCommand::SetPaused`. When true, `handle_chip_response`
+    /// drops accepted shares before they reach the hashrate estimator
+    /// or `status.hashrate`, so the per-board UI matches the
+    /// chain-wide 0 TH/s the scheduler reports.
+    paused: bool,
     /// Last value pulled out of `hashrate_estimator`. Cached so other
     /// code paths (e.g. status updates that don't have a fresh share
     /// to record) read a meaningful number instead of falling back
@@ -323,6 +343,14 @@ enum ThreadCommand {
     },
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    /// Forwarded from the scheduler's pause/resume API. Doesn't touch
+    /// chip power — just flips an internal flag so the actor stops
+    /// feeding its hashrate estimator and the per-board status
+    /// publishes 0 TH/s / `is_active=false` immediately.
+    SetPaused {
+        paused: bool,
+        response_tx: oneshot::Sender<()>,
     },
 }
 
@@ -544,6 +572,30 @@ impl BM13xxActor {
                 let result = self.handle_go_idle().await;
                 let _ = response_tx.send(result);
             }
+            ThreadCommand::SetPaused {
+                paused,
+                response_tx,
+            } => {
+                self.paused = paused;
+                if paused {
+                    // Immediately zero the per-thread status so the
+                    // per-board UI catches up before the next share
+                    // would have written into it.
+                    self.hashrate_estimator =
+                        HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
+                    self.estimated_hashrate = HashRate::default();
+                    let status = self.update_status(|status| {
+                        status.is_active = false;
+                        status.hashrate = HashRate::default();
+                    });
+                    let _ = self
+                        .evt_tx
+                        .clone()
+                        .send(HashThreadEvent::StatusUpdate(status))
+                        .await;
+                }
+                let _ = response_tx.send(());
+            }
         }
     }
 
@@ -562,9 +614,11 @@ impl BM13xxActor {
         let old = self.current_task.replace(new_task);
         let status = self.update_status(|status| {
             status.is_active = true;
-            if status.hashrate.is_zero() {
-                status.hashrate = self.estimated_hashrate;
-            }
+            // Don't pre-seed status.hashrate from the static
+            // `self.estimated_hashrate` (the 6.39 TH/s init value) —
+            // wait for the actor's hashrate_estimator to update from
+            // real shares so the per-board UI reads 0 during the ramp
+            // and the actual rate during steady state.
         });
         let _ = self
             .evt_tx
@@ -726,7 +780,11 @@ impl BM13xxActor {
 
         self.chip_state = ChipState::Initialized;
         let status = self.update_status(|status| {
-            status.hashrate = self.estimated_hashrate;
+            // Leave status.hashrate at whatever the hashrate_estimator
+            // produced (default 0 before first share). The static
+            // `self.estimated_hashrate` is used for chain-side TicketMask
+            // scaling, not for per-board display.
+            status.hashrate = HashRate::default();
         });
         let _ = self
             .evt_tx
@@ -1340,6 +1398,22 @@ impl BM13xxActor {
                         expected_work: task.share_target.to_work(),
                     };
 
+                    // Drop the share if the scheduler told us we're
+                    // paused — chips are still hashing the last job
+                    // they loaded but the scheduler ignores incoming
+                    // shares while paused, so the per-board UI should
+                    // also stop counting them. Without this gate the
+                    // actor's hashrate_estimator keeps climbing while
+                    // chain-wide hashrate is at 0.
+                    if self.paused {
+                        trace!(
+                            job_id,
+                            nonce = format!("{:#x}", nonce),
+                            "Share dropped — actor is paused"
+                        );
+                        return;
+                    }
+
                     // Feed the per-thread hashrate estimator BEFORE we
                     // move `share` into the channel send. We feed regardless
                     // of whether the scheduler ultimately accepts the share —
@@ -1603,6 +1677,7 @@ mod tests {
             evt_tx,
             status,
             hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+            paused: false,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             response_rx,
             chip_tx: Box::pin(chip_tx),

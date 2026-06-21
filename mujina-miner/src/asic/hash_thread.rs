@@ -259,6 +259,25 @@ pub trait HashThread: Send {
     /// Thread enters low-power mode, stops hashing.
     async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError>;
 
+    /// Tell the thread the scheduler-level pause flag flipped.
+    ///
+    /// While paused the thread should:
+    ///   - immediately publish a zeroed `HashThreadStatus`
+    ///     (`hashrate = 0`, `is_active = false`) so the per-board UI
+    ///     stops showing pre-pause numbers
+    ///   - stop feeding its own hashrate estimator from incoming
+    ///     shares (chips may still emit nonces from the last loaded
+    ///     job, but the scheduler discards them via `handle_share`,
+    ///     so the per-thread display should match)
+    ///   - keep chips powered and ready — the soft pause we ship
+    ///     today doesn't reset chips, so resume can be instant
+    ///
+    /// Default impl is a no-op for thread backends (e.g. CPU miner)
+    /// that don't have a separate per-thread status display.
+    async fn set_paused(&mut self, _paused: bool) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
     /// Permanently shut down the thread, releasing hardware resources.
     ///
     /// This compensates for Rust's lack of async Drop. Callers must invoke
