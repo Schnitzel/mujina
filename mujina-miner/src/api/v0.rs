@@ -82,7 +82,13 @@ async fn patch_miner(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         // Result layers: timeout / channel-closed / command-error.
-        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        // 5 minutes covers a full ResumeMining round-trip: the scheduler
+        // calls assign_job_to_threads -> handle_work_assignment ->
+        // initialize_chips on every hash thread, which includes a 500ms
+        // power-on wait, full enumeration, register config, and the
+        // BM1366 frequency ramp (typically ~2 min end-to-end). PauseMining
+        // is fast (just disable_chips) so this bound only matters on resume.
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(300), rx).await else {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
     }
