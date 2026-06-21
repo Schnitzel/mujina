@@ -11,6 +11,7 @@
 //! are passed to the constructor separately from config. A future design might
 //! use a factory or allow stream replacement.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,11 +78,24 @@ impl BM13xxThread {
     /// Returns error if `config.peripherals.asic_enable` is missing.
     pub fn new<R, W>(chip_rx: R, chip_tx: W, config: ChainConfig) -> Result<Self, HashThreadError>
     where
-        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
-        W: Sink<protocol::Command> + Unpin + Send + 'static,
-        W::Error: std::fmt::Debug,
+        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Send + 'static,
+        W: Sink<protocol::Command, Error = std::io::Error> + Send + 'static,
     {
-        // Build chain model from topology
+        let chip_rx: Pin<
+            Box<dyn Stream<Item = Result<protocol::Response, std::io::Error>> + Send + 'static>,
+        > = Box::pin(chip_rx);
+        let chip_tx: Pin<
+            Box<dyn Sink<protocol::Command, Error = std::io::Error> + Send + 'static>,
+        > = Box::pin(chip_tx);
+        // Build chain model from topology.
+        //
+        // Address interval=2 outperforms the ESP-Miner BM1366 default
+        // of 256/chip_count (=3 for 77 chips): live S19k Pro tests
+        // showed interval=2 enumerates 34/77 chips while interval=3
+        // enumerates only 22/77, both with the BM1366 register
+        // decoder fully patched. The reason isn't clear yet — likely
+        // a bus-integrity quirk on this hashboard layout — so retain
+        // interval=2 as the empirically-better default.
         let mut chain = Chain::from_topology(&config.topology);
         chain.assign_addresses().map_err(|e| {
             HashThreadError::InitializationFailed(format!("Address assignment failed: {}", e))
@@ -109,7 +123,8 @@ impl BM13xxThread {
 
         // Spawn reader task - continuously reads from serial to prevent USB
         // CDC-ACM flow control from blocking TX. Runs until chip_rx closes.
-        tokio::spawn(serial_reader_task(chip_rx, response_tx));
+        let reader_handle =
+            tokio::spawn(serial_reader_task(chip_rx, response_tx.clone()));
 
         // Spawn actor - it will initialize chips lazily on first work assignment
         tokio::spawn(async move {
@@ -120,7 +135,10 @@ impl BM13xxThread {
                 estimated_hashrate: initial_hashrate,
                 response_rx,
                 chip_tx,
+                reader_handle: Some(reader_handle),
+                response_tx,
                 peripherals: config.peripherals,
+                post_broadcast_chip_baud: config.post_broadcast_chip_baud,
                 chain,
                 sequencer,
                 chip_state: ChipState::Disabled,
@@ -148,12 +166,12 @@ impl BM13xxThread {
 /// Without a continuous reader, TX blocks after ~7-8 commands. This task
 /// ensures RX is always being serviced, forwarding decoded responses to
 /// the actor via channel.
-async fn serial_reader_task<R>(
-    mut chip_rx: R,
+async fn serial_reader_task(
+    mut chip_rx: Pin<
+        Box<dyn Stream<Item = Result<protocol::Response, std::io::Error>> + Send + 'static>,
+    >,
     response_tx: mpsc::Sender<Result<protocol::Response, std::io::Error>>,
-) where
-    R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
-{
+) {
     while let Some(response) = chip_rx.next().await {
         if response_tx.send(response).await.is_err() {
             // Actor dropped, exit reader
@@ -245,15 +263,26 @@ impl std::fmt::Debug for BM13xxThread {
 /// Serial RX is handled by a separate reader task that forwards decoded
 /// responses via `response_rx`. This ensures continuous reading from the
 /// serial port, which is required for USB CDC-ACM flow control.
-struct BM13xxActor<W> {
+struct BM13xxActor {
     cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     status: Arc<RwLock<HashThreadStatus>>,
     estimated_hashrate: HashRate,
     /// Responses from chips, forwarded by the reader task.
     response_rx: mpsc::Receiver<Result<protocol::Response, std::io::Error>>,
-    chip_tx: W,
+    chip_tx: Pin<Box<dyn Sink<protocol::Command, Error = std::io::Error> + Send + 'static>>,
+    /// Handle on the currently-running serial reader task. Replaced
+    /// when the actor swaps the underlying serial stream (baud bump).
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Sender used by the reader task to forward decoded responses to
+    /// `response_rx`. Retained so we can re-spawn a fresh reader task
+    /// after a baud-rate swap.
+    response_tx: mpsc::Sender<Result<protocol::Response, std::io::Error>>,
     peripherals: super::chain_config::ChainPeripherals,
+    /// If set, after the broadcast-phase init the actor sends a UartBaud
+    /// broadcast and switches the controller-side serial to this rate
+    /// before running the per-chip phase. See `ChainConfig`.
+    post_broadcast_chip_baud: Option<super::protocol::BaudRate>,
 
     /// Chain model with chip addresses and domain structure.
     chain: Chain,
@@ -371,9 +400,13 @@ fn voltage_for_frequency_stacked(
 ///
 /// When polling each chip individually, this is how long to wait for a single
 /// response before declaring the chip unresponsive. At 115200 baud, an 11-byte
-/// response takes ~1ms on the wire; 100ms is generous headroom for USB
-/// buffering and chip processing.
-const PER_CHIP_TIMEOUT: Duration = Duration::from_millis(100);
+/// response takes ~1ms on the wire; 500ms is generous headroom for USB
+/// buffering, chip processing, and post-baud-bump nonce traffic that the
+/// verify drains-and-ignores between each addressed read. On BHB56902 at
+/// 3.125 Mbaud, 100 ms reported 10–61 chips "missing" even though chain
+/// hashrate showed all 77 contributing; bumping the cap reduces the
+/// false-negative rate.
+const PER_CHIP_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Convert HashTask to JobFullFormat for chip hardware.
 ///
@@ -419,11 +452,7 @@ fn task_to_job_full(
     })
 }
 
-impl<W> BM13xxActor<W>
-where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
-{
+impl BM13xxActor {
     fn update_status(&self, mutate: impl FnOnce(&mut HashThreadStatus)) -> HashThreadStatus {
         let mut status = self.status.write();
         mutate(&mut status);
@@ -658,12 +687,25 @@ where
         // 5. Execute broadcast register configuration (Phase 1)
         self.execute_reg_config_broadcast().await?;
 
+        // 5b. Optionally bump the chip↔controller UART baud rate before
+        // the per-chip writes. This matches LuxOS on BHB56902, which
+        // switches the chain to 3 Mbaud right after the broadcasts (115200
+        // is the throughput bottleneck on chains with ~10+ domains).
+        self.maybe_switch_chip_baud().await?;
+
         // 6. Execute per-chip register configuration (Phase 2)
         // Enables cores before frequency ramp (experimenting with order).
         self.execute_reg_config_perchip().await?;
 
-        // 7. Ramp frequency to target (flat voltage throughout)
-        self.execute_frequency_ramp(protocol::Frequency::from_mhz(500.0))
+        // 7. Ramp frequency to target. Per-chip-family target lives on
+        //    `ChipConfig::target_frequency_mhz`; falls back to 500 MHz
+        //    for older configurations that haven't been profiled.
+        let target_mhz = self
+            .sequencer
+            .chip_config()
+            .target_frequency_mhz
+            .unwrap_or(500.0);
+        self.execute_frequency_ramp(protocol::Frequency::from_mhz(target_mhz))
             .await?;
 
         self.chip_state = ChipState::Initialized;
@@ -730,6 +772,142 @@ where
         let steps = self.sequencer.build_reg_config_perchip(&self.chain);
         self.execute_sequence(steps, "per-chip register config")
             .await
+    }
+
+    /// If [`ChainConfig::post_broadcast_chip_baud`] is set, send the
+    /// chip-side `UartBaud` broadcast, then ask the board to close the
+    /// current `/dev/ttyS2` handle and re-open it at the new rate. The
+    /// reader task is torn down and respawned around the new stream so
+    /// per-chip writes and steady-state work both flow at the new rate.
+    async fn maybe_switch_chip_baud(&mut self) -> Result<(), HashThreadError> {
+        let Some(target_baud) = self.post_broadcast_chip_baud else {
+            return Ok(());
+        };
+        let Some(chip_uart) = self.peripherals.chip_uart_baud.as_ref() else {
+            warn!(
+                target_baud = ?target_baud,
+                "post_broadcast_chip_baud configured but peripherals.chip_uart_baud is None; skipping"
+            );
+            return Ok(());
+        };
+
+        let numeric_baud = match target_baud {
+            protocol::BaudRate::Baud115200 => 115_200,
+            protocol::BaudRate::Baud1M => 1_000_000,
+            // 3,125,000 — NOT 3,000,000. The chip-side register value
+            // `0x00003011` (wire bytes `11 30 00 00`) produces an
+            // actual 3.125 Mbaud, not 3.0 Mbaud (Braiins log:
+            // `Set baud rate @ requested: 3125000, actual: 3125000`,
+            // and the LuxOS sniff in
+            // `captures/luxos-bhb56902-steady-state.log` opens the new
+            // fd at 3.125 Mbaud after broadcasting the same wire
+            // value). With mujina commanding 3,000,000 the controller
+            // and chip-side rates were ~4% apart, which is enough to
+            // mangle frames on long chains and drop chips. 3,125,000
+            // matches both ends exactly.
+            protocol::BaudRate::Baud3M => 3_125_000,
+            protocol::BaudRate::Custom(_) => {
+                warn!("Custom UartBaud values can't be auto-mapped to a controller baud; skipping");
+                return Ok(());
+            }
+        };
+
+        info!(target_baud_hz = numeric_baud, "Bumping chip UART baud");
+
+        // Two-phase LuxOS-matched baud switch:
+        //
+        // From `captures/luxos-bhb56902-full-mining.log`:
+        //   t=508.025  OPEN64 fd=23      (open new fd ~2 s before broadcast)
+        //   t=510.127  TX fd=23  UartBaud broadcast (still at 115200)
+        //   t=510.340  OPEN64 fd=25      (213 ms after broadcast)
+        //   t=510.4+   per-chip writes on the new fd at 3 Mbaud
+        //
+        // The key is that the new fd is open BEFORE the broadcast, but
+        // not retuned to the target baud — both fds stay at 115200 while
+        // the broadcast lands on chips. Only AFTER the broadcast does
+        // the active fd get tcsetattr'd to the higher rate.
+
+        // 1. Pre-open the new fd at the CURRENT baud (115200). The
+        //    kernel tcsetattr inside `SerialStream::new` is a no-op for
+        //    the device since it's already at 115200, so the in-flight
+        //    broadcast can still complete cleanly. /dev/ttyS2 now has
+        //    two fds open through the rest of the switch.
+        const CURRENT_BAUD_HZ: u32 = 115_200;
+        let (new_rx, new_tx) = {
+            let mut control = chip_uart.lock().await;
+            control
+                .prepare_new_stream(CURRENT_BAUD_HZ)
+                .await
+                .map_err(|e| {
+                    HashThreadError::InitializationFailed(format!(
+                        "Failed to pre-open chip UART at {CURRENT_BAUD_HZ}: {e:?}"
+                    ))
+                })?
+        };
+
+        // 2. Broadcast UartBaud on the OLD writer. Kernel termios is
+        //    still 115200, so the bytes leave the wire at 115200 and
+        //    chips can decode them and apply their internal baud
+        //    change.
+        self.chip_tx
+            .send(protocol::Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: protocol::Register::UartBaud(target_baud),
+            })
+            .await
+            .map_err(|e| {
+                HashThreadError::InitializationFailed(format!(
+                    "Failed to send UartBaud broadcast: {e:?}"
+                ))
+            })?;
+        self.chip_tx.flush().await.ok();
+
+        // 3. Wait for chips to apply their internal baud change. LuxOS
+        //    sees 213 ms broadcast → next OPEN64 in capture; with our
+        //    timing at 213 ms we got 44/77 chips, at 213 ms with longer
+        //    post-settle we got 67/77. Lean longer here to recover the
+        //    far-end chips: their relay timing is more marginal.
+        time::sleep(Duration::from_millis(500)).await;
+
+        // 4. Retune the new fd's termios to the target baud rate.
+        //    Because termios is shared across fds on the same device,
+        //    this also flips the OLD fd's effective hw baud to 3 M —
+        //    fine, since we're done using it.
+        {
+            let mut control = chip_uart.lock().await;
+            control
+                .finalize_baud_switch(numeric_baud)
+                .await
+                .map_err(|e| {
+                    HashThreadError::InitializationFailed(format!(
+                        "Failed to finalize baud switch to {numeric_baud}: {e:?}"
+                    ))
+                })?;
+        }
+
+        // 5. Swap the actor's chip channels onto the new fd. The OLD
+        //    writer is dropped here, and we drain the reader task
+        //    waiting for it to observe its stream ending. The kernel
+        //    still has the new fd open, so the device never goes
+        //    unclaimed.
+        let stale_reader = self.reader_handle.take();
+        let _old_tx = std::mem::replace(&mut self.chip_tx, new_tx);
+        drop(_old_tx);
+        if let Some(handle) = stale_reader {
+            let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        }
+        self.reader_handle = Some(tokio::spawn(serial_reader_task(
+            new_rx,
+            self.response_tx.clone(),
+        )));
+
+        // 6. Settle before the per-chip writes start. Pad generously —
+        //    the cost of waiting an extra 100-200 ms on init is small
+        //    versus losing a chip out of the chain.
+        time::sleep(Duration::from_millis(250)).await;
+
+        Ok(())
     }
 
     /// Execute coordinated voltage-frequency ramp to target.
@@ -860,62 +1038,90 @@ where
         let expected_count = self.chain.chip_count();
         let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
 
-        let mut responding_count: usize = 0;
+        // Multi-pass: poll all chips, then re-poll the missing ones up to
+        // two more times. On BHB56902 at 3.125 Mbaud the first sweep
+        // consistently reports the first ~10 chips (addresses 0x00..0x12,
+        // closest to host) as missing even though chain hashrate math
+        // shows them contributing — likely chain-traffic shadowing the
+        // first sweep, not dead chips.
+        const VERIFY_PASSES: usize = 3;
 
-        for &addr in &addresses {
-            // Drain any stale responses before each query
-            while self.response_rx.try_recv().is_ok() {}
+        let mut to_poll: Vec<u8> = addresses;
+        let mut alive: Vec<u8> = Vec::new();
 
-            if let Err(e) = self
-                .chip_tx
-                .send(Command::ReadRegister {
-                    broadcast: false,
-                    chip_address: addr,
-                    register_address: RegisterAddress::ChipId,
-                })
-                .await
-            {
-                error!(error = ?e, "Failed to send verification query");
-                return responding_count;
-            }
+        for pass in 0..VERIFY_PASSES {
+            let mut missing_this_pass: Vec<u8> = Vec::new();
 
-            // Wait for a single response
-            let got_response = loop {
-                tokio::select! {
-                    response = self.response_rx.recv() => {
-                        match response {
-                            Some(Ok(protocol::Response::ReadRegister {
-                                register: Register::ChipId { .. },
-                                ..
-                            })) => break true,
-                            Some(Ok(_)) | Some(Err(_)) => {
-                                // Ignore non-ChipId responses and errors,
-                                // keep waiting for the real response.
-                                continue;
-                            }
-                            None => break false,
-                        }
-                    }
-                    _ = time::sleep(PER_CHIP_TIMEOUT) => {
-                        break false;
-                    }
+            for &addr in &to_poll {
+                // Drain any stale responses before each query
+                while self.response_rx.try_recv().is_ok() {}
+
+                if let Err(e) = self
+                    .chip_tx
+                    .send(Command::ReadRegister {
+                        broadcast: false,
+                        chip_address: addr,
+                        register_address: RegisterAddress::ChipId,
+                    })
+                    .await
+                {
+                    error!(error = ?e, "Failed to send verification query");
+                    return alive.len();
                 }
-            };
 
-            if got_response {
-                responding_count += 1;
+                let got_response = loop {
+                    tokio::select! {
+                        response = self.response_rx.recv() => {
+                            match response {
+                                Some(Ok(protocol::Response::ReadRegister {
+                                    register: Register::ChipId { .. },
+                                    ..
+                                })) => break true,
+                                Some(Ok(_)) | Some(Err(_)) => continue,
+                                None => break false,
+                            }
+                        }
+                        _ = time::sleep(PER_CHIP_TIMEOUT) => break false,
+                    }
+                };
+
+                if got_response {
+                    alive.push(addr);
+                } else {
+                    missing_this_pass.push(addr);
+                }
             }
+
+            debug!(
+                pass = pass + 1,
+                total_passes = VERIFY_PASSES,
+                alive = alive.len(),
+                still_missing = missing_this_pass.len(),
+                "Verify pass complete"
+            );
+
+            if missing_this_pass.is_empty() {
+                break;
+            }
+            to_poll = missing_this_pass;
         }
 
-        // Log result
+        let responding_count = alive.len();
         if responding_count == expected_count {
             debug!(count = responding_count, "Chain verification passed");
         } else {
+            let missing_str = to_poll
+                .iter()
+                .map(|a| format!("0x{:02x}", a))
+                .collect::<Vec<_>>()
+                .join(",");
             error!(
                 expected = expected_count,
                 responding = responding_count,
                 missing = expected_count.saturating_sub(responding_count),
-                "Chain verification failed: not all chips responded"
+                missing_addrs = missing_str,
+                passes = VERIFY_PASSES,
+                "Chain verification failed: not all chips responded after retries"
             );
         }
 
@@ -967,6 +1173,15 @@ where
                 // HACK: BM1362 job_id fix - protocol.rs extracts job_id from bits 7-4,
                 // but BM1362 returns it in bits 6-3. Reconstruct result_header and re-extract.
                 // TODO: Move this to protocol.rs with chip-type-aware parsing.
+                //
+                // Empirically required on BM1366 too: gating this to BM1362
+                // only collapsed BM1366 mining hashrate from ~29 TH/s to
+                // ~3 TH/s on a BHB56902. The BM1366 nonce response uses
+                // the BM1362-style 5-bit-job-id / 3-bit-subcore packing,
+                // NOT the standard 4+4 layout that the protocol decoder
+                // assumes. Until we move chip-type-aware parsing into
+                // protocol.rs, the universal fix-up here is what makes
+                // BM1366 work.
                 let result_header = (job_id << 4) | subcore_id;
                 let job_id = (result_header >> 3) & 0x0f;
 
@@ -1161,6 +1376,17 @@ mod tests {
         }
     }
 
+    /// Drain-style sink with the `Error = std::io::Error` bound the
+    /// production `ChipTxSink` requires. Tests previously passed
+    /// `futures::sink::drain()` directly, but that has
+    /// `Error = std::convert::Infallible`, so it no longer matches.
+    fn drain_sink() -> impl Sink<Command, Error = std::io::Error> + Send + 'static {
+        use futures::sink::SinkExt;
+        futures::sink::drain().sink_map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "drain")
+        })
+    }
+
     /// Sink that fails on first send---used to test send error handling.
     struct FailingSink;
 
@@ -1246,7 +1472,9 @@ mod tests {
             peripherals: ChainPeripherals {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
+                chip_uart_baud: None,
             },
+            post_broadcast_chip_baud: None,
         }
     }
 
@@ -1259,10 +1487,9 @@ mod tests {
         chain: Chain,
         sequencer: Sequencer,
         asic_enable: MockAsicEnable,
-    ) -> BM13xxActor<W>
+    ) -> BM13xxActor
     where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
+        W: Sink<protocol::Command, Error = std::io::Error> + Send + 'static,
     {
         let (_cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, _evt_rx) = mpsc::channel(100);
@@ -1280,11 +1507,15 @@ mod tests {
             status,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             response_rx,
-            chip_tx,
+            chip_tx: Box::pin(chip_tx),
+            reader_handle: None,
+            response_tx,
             peripherals: ChainPeripherals {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
+                chip_uart_baud: None,
             },
+            post_broadcast_chip_baud: None,
             chain,
             sequencer,
             chip_state: ChipState::Disabled,
@@ -1306,7 +1537,7 @@ mod tests {
     async fn construction_succeeds() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
         let chip_rx = stream::iter(responses);
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let config = test_config(1, MockAsicEnable::new());
         let result = BM13xxThread::new(chip_rx, chip_tx, config);
@@ -1320,7 +1551,7 @@ mod tests {
     async fn go_idle_on_idle_thread_returns_none() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
         let chip_rx = stream::iter(responses);
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let config = test_config(1, MockAsicEnable::new());
         let mut thread = BM13xxThread::new(chip_rx, chip_tx, config).unwrap();
@@ -1334,7 +1565,7 @@ mod tests {
     async fn actor_exits_when_facade_dropped() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
         let chip_rx = stream::iter(responses);
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let config = test_config(1, MockAsicEnable::new());
         let thread = BM13xxThread::new(chip_rx, chip_tx, config).unwrap();
@@ -1348,7 +1579,7 @@ mod tests {
     async fn initialize_single_chip_succeeds() {
         // Topology expects 1 chip, hardware provides 1 chip response
         let responses = vec![chip_id_response(ChipType::BM1362, 0x00)];
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(1);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
@@ -1365,7 +1596,7 @@ mod tests {
         let responses: Vec<_> = (0..12)
             .map(|i| chip_id_response(ChipType::BM1362, i * 2)) // interval 2
             .collect();
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(12);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
@@ -1384,7 +1615,7 @@ mod tests {
         let responses: Vec<_> = (0..responding)
             .map(|i| chip_id_response(ChipType::BM1362, (i * 2) as u8))
             .collect();
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(expected);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
@@ -1403,7 +1634,7 @@ mod tests {
         let responses: Vec<_> = (0..responding)
             .map(|i| chip_id_response(ChipType::BM1362, (i * 2) as u8))
             .collect();
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(expected);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
@@ -1422,7 +1653,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn initialize_enable_failure_propagates() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(1);
         let mut actor = test_actor(
@@ -1590,7 +1821,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn disable_chips_noop_when_already_disabled() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(1);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
@@ -1603,7 +1834,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn handle_go_idle_disables_and_clears_task() {
         let responses: Vec<Result<protocol::Response, io::Error>> = vec![];
-        let chip_tx = futures::sink::drain();
+        let chip_tx = drain_sink();
 
         let (chain, sequencer) = chain_and_sequencer(1);
         let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());

@@ -49,6 +49,19 @@ pub struct ChainConfig {
 
     /// Hardware control interfaces for this chain.
     pub peripherals: ChainPeripherals,
+
+    /// After the broadcast register-config phase completes, the hash
+    /// thread sends a UartBaud broadcast to switch the chips to this
+    /// baud rate, then calls [`ChainPeripherals::set_chip_uart_baud`]
+    /// to switch the controller side. Per-chip writes and steady-state
+    /// mining traffic then run at this rate.
+    ///
+    /// `None` keeps the link at the rate the SerialStream was opened
+    /// with (default 115200). Set this to a higher rate (e.g.
+    /// `BaudRate::Baud3M`) on boards with long chains where 115200 is
+    /// the chain throughput bottleneck — confirmed for BHB56902 via the
+    /// LuxOS capture (see `captures/luxos-bhb56902-findings.md`).
+    pub post_broadcast_chip_baud: Option<super::protocol::BaudRate>,
 }
 
 /// Hardware interfaces for a chain.
@@ -75,6 +88,74 @@ pub struct ChainPeripherals {
 
     /// Voltage regulator control (optional, may be shared across chains).
     pub voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>>,
+
+    /// Optional handle for retuning the controller-side chip UART baud
+    /// rate mid-init. Boards that own the [`SerialStream`] for the chip
+    /// channel can wrap its `SerialControl` here so the hash thread can
+    /// switch to a higher rate after sending the chip-side
+    /// [`UartBaud`](super::protocol::Register::UartBaud) broadcast.
+    pub chip_uart_baud: Option<Arc<Mutex<dyn ChipUartBaudControl + Send>>>,
+}
+
+/// Boxed type for the chip → controller response stream.
+pub type ChipRxStream = std::pin::Pin<
+    Box<
+        dyn futures::Stream<Item = Result<super::protocol::Response, std::io::Error>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Boxed type for the controller → chip command sink.
+pub type ChipTxSink = std::pin::Pin<
+    Box<
+        dyn futures::Sink<super::protocol::Command, Error = std::io::Error>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Controller-side handle for changing the chip-channel UART baud rate.
+///
+/// Implementations wrap a [`SerialControl`](crate::transport::serial::SerialControl)
+/// or equivalent so the hash thread can drive a mid-init baud bump.
+///
+/// The recommended pattern on the Amlogic `meson_uart` driver is the
+/// "close + reopen" approach (matching LuxOS — see
+/// `captures/luxos-bhb56902-findings.md` for the 3 separate `open64()`
+/// calls observed during init): drop the current `SerialStream`, open
+/// a fresh one at the new baud rate, and return a new pair of typed
+/// channels. The `tcsetattr(Drain)` baud-switch path drops chips at
+/// 3 Mbaud on BHB56902.
+#[async_trait::async_trait]
+pub trait ChipUartBaudControl {
+    /// Pre-open a second `/dev/ttyS2` handle at `current_baud_rate`
+    /// (matching the current kernel termios so the hardware baud
+    /// doesn't change yet) and return fresh I/O channels backed by
+    /// that handle. The implementation must keep the new handle's
+    /// control side alive internally so it can be retuned in
+    /// `finalize_baud_switch`.
+    ///
+    /// This is the open-without-bumping side of the two-phase LuxOS
+    /// baud-switch pattern: two fds end up open on the same device,
+    /// the old writer carries the chip-side `UartBaud` broadcast at
+    /// the current rate, and only afterward does the new fd get
+    /// retuned to the target rate.
+    async fn prepare_new_stream(
+        &mut self,
+        current_baud_rate: u32,
+    ) -> anyhow::Result<(ChipRxStream, ChipTxSink)>;
+
+    /// Apply `target_baud_rate` to the stream prepared by the last
+    /// `prepare_new_stream` call. Per Linux `termios` semantics, this
+    /// also retunes the underlying device — so the hash thread must
+    /// have already finished its broadcast on the OLD writer and
+    /// waited for chips to apply their internal baud change before
+    /// calling this.
+    async fn finalize_baud_switch(
+        &mut self,
+        target_baud_rate: u32,
+    ) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
@@ -111,6 +192,7 @@ mod tests {
         let peripherals = ChainPeripherals {
             asic_enable: enable,
             voltage_regulator: None,
+            chip_uart_baud: None,
         };
 
         // Hash thread enables
