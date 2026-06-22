@@ -299,11 +299,6 @@ struct BM13xxActor {
     /// or `status.hashrate`, so the per-board UI matches the
     /// chain-wide 0 TH/s the scheduler reports.
     paused: bool,
-    /// EMA-smoothed hottest chip-die temperature observed on this
-    /// chain (°C). `None` until the first temp response decodes —
-    /// callers should treat `None` as "unknown, run fans at safe-high
-    /// default" rather than as "cool".
-    last_chip_die_temp_c: Option<f32>,
     /// Last value pulled out of `hashrate_estimator`. Cached so other
     /// code paths (e.g. status updates that don't have a fresh share
     /// to record) read a meaningful number instead of falling back
@@ -1340,37 +1335,6 @@ impl BM13xxActor {
         }
     }
 
-    /// Record a chip-die temperature sample. Updates
-    /// `status.temperature_c` to the max we've seen over the last few
-    /// samples (we don't get a chip address back, so the safest signal
-    /// for fan control is the hottest temp on the chain).
-    async fn record_chip_die_temp(&mut self, sample_c: f32) {
-        // Plausibility filter: BM1366 diodes routinely report 30-90°C
-        // in operation. Anything outside this window is almost
-        // certainly a decode error (or the diode hasn't warmed up
-        // yet) — skip rather than poison the fan curve.
-        if !(0.0..=125.0).contains(&sample_c) {
-            return;
-        }
-
-        let prev = self.last_chip_die_temp_c.unwrap_or(sample_c);
-        // EMA toward new sample with a short tail so we react fast to
-        // ramps but ignore single-sample spikes from a misdecoded
-        // response.
-        let alpha = 0.6_f32;
-        let smoothed = alpha * sample_c + (1.0 - alpha) * prev;
-        self.last_chip_die_temp_c = Some(smoothed);
-
-        let status = self.update_status(|status| {
-            status.temperature_c = Some(smoothed);
-        });
-        let _ = self
-            .evt_tx
-            .clone()
-            .send(HashThreadEvent::StatusUpdate(status))
-            .await;
-    }
-
     async fn handle_chip_response(&mut self, result: Result<protocol::Response, std::io::Error>) {
         match result {
             Ok(protocol::Response::Nonce {
@@ -1380,33 +1344,6 @@ impl BM13xxActor {
                 midstate_num,
                 subcore_id,
             }) => {
-                // Chip-die temperature responses are emitted as "fake
-                // nonces" once the analog mux at register 0x54 is
-                // configured for the thermal diode (mujina already
-                // broadcasts that value during chain init via
-                // `init_regs.analog_mux_broadcast = 0x0300_0000`).
-                // Per `mujina-miner/src/asic/bm13xx/PROTOCOL.md`, temp
-                // responses match `nonce & 0xFFFF == 0x80` with the raw
-                // ADC value living in the upper 16 bits of the nonce
-                // field.
-                //
-                // The response doesn't carry a chip address — the
-                // hashboard can't tell us WHICH chip is hot, only that
-                // *some* chip is at this temp. Aggregate as a sliding
-                // max so the per-board fan curve reacts to the hottest
-                // chip on the chain.
-                if (nonce & 0x0000_FFFF) == 0x0000_0080 {
-                    let raw = ((nonce >> 16) & 0xFFFF) as u16;
-                    let temp_c = bm1366_raw_to_celsius(raw);
-                    trace!(
-                        raw = raw,
-                        temp_c = temp_c,
-                        "Chip-die temperature sample"
-                    );
-                    self.record_chip_die_temp(temp_c).await;
-                    return;
-                }
-
                 // HACK: BM1362 job_id fix - protocol.rs extracts job_id from bits 7-4,
                 // but BM1362 returns it in bits 6-3. Reconstruct result_header and re-extract.
                 // TODO: Move this to protocol.rs with chip-type-aware parsing.
