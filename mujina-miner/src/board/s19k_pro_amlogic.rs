@@ -457,6 +457,8 @@ impl Board for S19kProAmlogic {
             Box::new(thread),
             self.state_tx.clone(),
             Arc::clone(&self.thread_states),
+            Arc::clone(&self.psu),
+            self.config.startup.psu_settle_ms,
         );
 
         let config = self.config.clone();
@@ -477,6 +479,15 @@ struct BoardStateHashThread {
     inner: Box<dyn HashThread>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+    /// PSU rail to drop on hard pause and re-energize on resume.
+    /// Shared with `native_telemetry_task` (which reads voltage and is
+    /// the other safety-cutoff lever); guarded by the same async mutex
+    /// so a pause and an overtemp cutoff serialize cleanly.
+    psu: Arc<Mutex<NativeAmlogicPsu>>,
+    /// Wait between `psu.set_enabled(true)` and the inner thread's
+    /// resume so the APW12 has time to stabilize its output before the
+    /// next UpdateTask hits and triggers the cold init / freq ramp.
+    psu_settle_ms: u64,
 }
 
 impl BoardStateHashThread {
@@ -484,11 +495,15 @@ impl BoardStateHashThread {
         inner: Box<dyn HashThread>,
         state_tx: watch::Sender<BoardState>,
         thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+        psu: Arc<Mutex<NativeAmlogicPsu>>,
+        psu_settle_ms: u64,
     ) -> Self {
         Self {
             inner,
             state_tx,
             thread_states,
+            psu,
+            psu_settle_ms,
         }
     }
 
@@ -576,14 +591,47 @@ impl HashThread for BoardStateHashThread {
     }
 
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
-        let result = self.inner.set_paused(paused).await;
-        // On pause: actor just zeroed its status, so reflect that
-        // in the per-board state too. On resume: leave is_active
-        // alone — the next share will set it.
+        // Hard pause: drop the chip power rail. The chain comes back
+        // cold-booted on resume, which is the same path `start_async`
+        // uses at process startup and is known to work — unlike the
+        // UART `disable_chips()` path that gets only ~37/77 chips
+        // back on BHB56902 after re-enumeration.
+        //
+        // Order matters:
+        //   - on pause:  zero the inner thread first (so the per-board
+        //                UI publishes 0 TH/s before chips lose power
+        //                and the chain goes quiet), THEN drop PSU.
+        //   - on resume: bring PSU up + settle BEFORE the inner thread
+        //                comes out of paused state, so the next
+        //                UpdateTask that arrives can immediately drive
+        //                `initialize_chips()` against a powered chain.
         if paused {
+            let result = self.inner.set_paused(true).await;
             self.sync_thread_state(Some(false));
+            if let Err(e) = self.psu.lock().await.set_enabled(false) {
+                warn!(error = %e, "set_paused(true) succeeded on chain but PSU disable failed; chips still powered");
+            } else {
+                info!(
+                    thread = %self.inner.name(),
+                    "Hard pause: PSU output disabled — chips drained, board will cool"
+                );
+            }
+            result
+        } else {
+            if let Err(e) = self.psu.lock().await.set_enabled(true) {
+                warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
+                return Err(HashThreadError::InitializationFailed(format!(
+                    "PSU re-enable failed: {e}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(self.psu_settle_ms)).await;
+            info!(
+                thread = %self.inner.name(),
+                settle_ms = self.psu_settle_ms,
+                "Hard resume: PSU back on; next UpdateTask will trigger cold init"
+            );
+            self.inner.set_paused(false).await
         }
-        result
     }
 
     fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<HashThreadEvent>> {

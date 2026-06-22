@@ -583,12 +583,31 @@ impl BM13xxActor {
             } => {
                 self.paused = paused;
                 if paused {
-                    // Immediately zero the per-thread status so the
-                    // per-board UI catches up before the next share
-                    // would have written into it.
+                    // Hard pause. The board layer is about to drop the
+                    // chip power rail; the actor must:
+                    //
+                    //   1. Zero the per-thread status so the per-board
+                    //      UI catches up before the next would-be share.
+                    //   2. Drop `current_task` and mark `chip_state =
+                    //      Disabled`. The chain will be cold when it
+                    //      comes back, so the next `UpdateTask` MUST
+                    //      route through `initialize_chips()` rather
+                    //      than re-using the stale `current_task` /
+                    //      assuming the chips are still configured.
+                    //
+                    // We deliberately do NOT call `disable_chips()`
+                    // here. That path issues a chain RST_N pulse over
+                    // UART and then attempts a re-enumeration at
+                    // 115200; on BHB56902 the re-enumeration only sees
+                    // ~37/77 chips back. The PSU-cycle path below
+                    // sidesteps that because it ends up at the same
+                    // cold-boot state `start_async` enters at startup,
+                    // which works reliably.
                     self.hashrate_estimator =
                         HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
                     self.estimated_hashrate = HashRate::default();
+                    self.current_task = None;
+                    self.chip_state = ChipState::Disabled;
                     let status = self.update_status(|status| {
                         status.is_active = false;
                         status.hashrate = HashRate::default();
@@ -598,6 +617,15 @@ impl BM13xxActor {
                         .clone()
                         .send(HashThreadEvent::StatusUpdate(status))
                         .await;
+                } else {
+                    // Resume. The board layer has already brought PSU
+                    // back up and waited for the rail to settle. Chips
+                    // will come up cold at their default 115200 baud,
+                    // but the host serial may still be configured at
+                    // the post-broadcast bumped rate (e.g. 3.125 Mbaud)
+                    // from before pause. Reset the host fd back to
+                    // base baud so the cold-init register reads land.
+                    self.reset_chip_uart_to_base_baud().await;
                 }
                 let _ = response_tx.send(());
             }
