@@ -352,6 +352,11 @@ impl Board for S19jProAmlogic {
             Arc::clone(&self.thread_states),
             Arc::clone(&self.psu),
             self.config.startup.psu_settle_ms,
+            self.selected_hashboard.reset_gpio,
+            self.config.startup.reset_assert_ms,
+            self.config.startup.initial_voltage,
+            self.selected_hashboard.eeprom_i2c_device.clone(),
+            self.selected_hashboard.index,
         );
 
         let config = self.config.clone();
@@ -374,6 +379,26 @@ struct BoardStateHashThread {
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     psu_settle_ms: u64,
+    /// Reset GPIO for the active hashboard. Driven low on resume
+    /// *before* the PSU comes back up so chips power up while held in
+    /// reset (matching the cold-boot `assert_all_resets()` step).
+    reset_gpio: u32,
+    /// Hold time after asserting reset before bringing the rail
+    /// down on pause / up on resume. Without this, RST_N is asserted
+    /// only nanoseconds before the rail transition and the daisy-chained
+    /// signal does not propagate to all chips in time.
+    reset_assert_ms: u64,
+    /// Cold-boot PSU voltage (12 V). The APW12 retains the last
+    /// commanded voltage across enable/disable, so without this
+    /// resume comes back at 13.9 V and chips start hot.
+    initial_voltage_v: f32,
+    /// i2c device + slot for the PIC handshake. On S19j Pro PIC
+    /// variants (BHB42601 / BHB42611) the per-domain DC-DCs are
+    /// gated by an on-board PIC that loses state when the PSU rail
+    /// drops. Hard resume must re-run the handshake (start_app +
+    /// enable_dc_dc) before chips have rail to respond on UART.
+    pic_i2c_device: PathBuf,
+    pic_slot_index: u8,
 }
 
 impl BoardStateHashThread {
@@ -383,6 +408,11 @@ impl BoardStateHashThread {
         thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
         psu: Arc<Mutex<NativeAmlogicPsu>>,
         psu_settle_ms: u64,
+        reset_gpio: u32,
+        reset_assert_ms: u64,
+        initial_voltage_v: f32,
+        pic_i2c_device: PathBuf,
+        pic_slot_index: u8,
     ) -> Self {
         Self {
             inner,
@@ -390,6 +420,11 @@ impl BoardStateHashThread {
             thread_states,
             psu,
             psu_settle_ms,
+            reset_gpio,
+            reset_assert_ms,
+            initial_voltage_v,
+            pic_i2c_device,
+            pic_slot_index,
         }
     }
 
@@ -485,27 +520,80 @@ impl HashThread for BoardStateHashThread {
         if paused {
             let result = self.inner.set_paused(true).await;
             self.sync_thread_state(Some(false));
+            // Drive RST_N LOW before dropping the rail so chips
+            // enter synchronous reset before power-off — avoids the
+            // mid-mining power-yank that left internal flip-flops in
+            // indeterminate states and broke re-enumeration.
+            if let Err(e) = SysfsGpio::new(self.reset_gpio).set_output_low() {
+                warn!(error = %e, reset_gpio = self.reset_gpio, "Failed to assert reset before PSU drop; chain may not pause cleanly");
+            }
+            tokio::time::sleep(Duration::from_millis(self.reset_assert_ms)).await;
             if let Err(e) = self.psu.lock().await.set_enabled(false) {
                 warn!(error = %e, "set_paused(true) succeeded on chain but PSU disable failed; chips still powered");
             } else {
                 info!(
                     thread = %self.inner.name(),
-                    "Hard pause: PSU output disabled — chips drained, board will cool"
+                    "Hard pause: reset asserted then PSU output disabled — chips drained, board will cool"
                 );
             }
             result
         } else {
-            if let Err(e) = self.psu.lock().await.set_enabled(true) {
-                warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
-                return Err(HashThreadError::InitializationFailed(format!(
-                    "PSU re-enable failed: {e}"
-                )));
+            // Hard resume — mirror the cold-boot order in
+            // `S19jProAmlogic::initialize`:
+            //   1. Assert hashboard reset BEFORE PSU comes on so chips
+            //      power up while held in reset.
+            //   2. Drop PSU voltage back to the cold-boot setpoint
+            //      (12 V); the APW12 retains the last value across
+            //      enable cycles and chips need to start at the low rail.
+            //   3. Enable PSU + settle.
+            //   4. Re-run the PIC handshake. On PIC-variant S19j Pro
+            //      hashboards (BHB42601 / BHB42611) the on-board PIC
+            //      loses state when the rail drops; without re-enabling
+            //      the per-domain DC-DCs the chips have no rail to
+            //      respond on UART. noPIC variants tolerate the
+            //      handshake failing.
+            //   5. Resume the inner thread; its next UpdateTask runs
+            //      `initialize_chips()` which releases reset and
+            //      enumerates.
+            if let Err(e) = SysfsGpio::new(self.reset_gpio).set_output_low() {
+                warn!(error = %e, reset_gpio = self.reset_gpio, "Failed to assert reset on resume; chain may enumerate poorly");
+            }
+            // Hold reset asserted before PSU comes up so RST_N
+            // propagates to all chips in the daisy-chain.
+            tokio::time::sleep(Duration::from_millis(self.reset_assert_ms)).await;
+            {
+                let mut psu = self.psu.lock().await;
+                if let Err(e) = psu.set_voltage(self.initial_voltage_v).await {
+                    warn!(error = %e, "Failed to reset PSU voltage to initial setpoint on resume");
+                }
+                if let Err(e) = psu.set_enabled(true) {
+                    warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
+                    return Err(HashThreadError::InitializationFailed(format!(
+                        "PSU re-enable failed: {e}"
+                    )));
+                }
             }
             tokio::time::sleep(Duration::from_millis(self.psu_settle_ms)).await;
+            // PIC handshake — best-effort, same as cold boot.
+            let pic_addr = pic_address_for_slot(self.pic_slot_index);
+            match PicChain::open(&self.pic_i2c_device, pic_addr) {
+                Ok(mut pic) => {
+                    if let Err(e) = pic.handshake() {
+                        warn!(addr = format_args!("0x{:02x}", pic_addr), error = %e, "PIC handshake failed on resume; chips may not power up");
+                    } else if let Err(e) = pic.enable_dc_dc() {
+                        warn!(addr = format_args!("0x{:02x}", pic_addr), error = %e, "PIC enable_dc_dc failed on resume");
+                    }
+                }
+                Err(e) => {
+                    debug!(addr = format_args!("0x{:02x}", pic_addr), error = %e, "PIC absent on resume (noPIC variant) — continuing");
+                }
+            }
             info!(
                 thread = %self.inner.name(),
                 settle_ms = self.psu_settle_ms,
-                "Hard resume: PSU back on; next UpdateTask will trigger cold init"
+                initial_voltage_v = self.initial_voltage_v,
+                reset_gpio = self.reset_gpio,
+                "Hard resume: reset asserted, PSU back on at initial voltage, PIC handshake attempted; next UpdateTask will release reset and enumerate"
             );
             self.inner.set_paused(false).await
         }

@@ -989,14 +989,25 @@ impl BM13xxActor {
         }
 
         // 5. Swap the actor's chip channels onto the new fd. The OLD
-        //    writer is dropped here, and we drain the reader task
-        //    waiting for it to observe its stream ending. The kernel
-        //    still has the new fd open, so the device never goes
-        //    unclaimed.
+        //    writer is dropped here. The OLD reader task must be
+        //    aborted explicitly: its `chip_rx` shares the underlying
+        //    fd via `Arc<SerialInner>`, and `serial_reader_task` has
+        //    no exit signal (it only returns when the stream errors,
+        //    which never happens for a live tty), so waiting on the
+        //    JoinHandle would block forever. Without an abort the old
+        //    reader stays alive sharing /dev/ttyS2 with the new
+        //    reader; the kernel TTY buffer hands raw bytes to whoever
+        //    asks first, so frames get split between the two tasks
+        //    and produce the scattered "Failed to decode response"
+        //    warnings + the random ~30/77 chips seen on
+        //    pause/resume cold init. Abort, then wait briefly for
+        //    the task to actually finish (which releases its Arc and
+        //    closes the old fd).
         let stale_reader = self.reader_handle.take();
         let _old_tx = std::mem::replace(&mut self.chip_tx, new_tx);
         drop(_old_tx);
         if let Some(handle) = stale_reader {
+            handle.abort();
             let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
         }
         self.reader_handle = Some(tokio::spawn(serial_reader_task(
@@ -1254,13 +1265,19 @@ impl BM13xxActor {
 
         // NOTE: we used to reset the host UART back to 115200 here so
         // a subsequent PauseMining -> ResumeMining cycle could re-run
-        // initialize_chips against freshly-reset chips. That worked
-        // for the baud side but still only got ~37/77 chips back —
-        // likely a chain-RST_N propagation issue we haven't debugged
-        // yet. PauseMining no longer calls go_idle on the threads
-        // (the scheduler does soft pause instead — drops shares, stops
-        // dispatching work) so this path is only hit during shutdown,
-        // where the process exits and host termios doesn't matter.
+        // initialize_chips against freshly-reset chips. That originally
+        // got only ~37/77 chips back; the root cause turned out to be
+        // a leaked reader task on the OLD chip fd (the JoinHandle was
+        // awaited with a 200 ms timeout but never aborted, so its
+        // Arc<SerialInner> kept the fd open and both the old and the
+        // new reader raced for kernel TTY bytes — splitting frames
+        // and producing scattered chip dropouts). The fix is in
+        // `maybe_switch_chip_baud` / `reset_chip_uart_to_base_baud`
+        // step 5: `handle.abort()` before awaiting the JoinHandle.
+        // Hard pause on BHB56902 now drops the PSU rail instead of
+        // touching this code path; that path is only hit during
+        // shutdown, where the process exits and host termios doesn't
+        // matter.
         // Drop the per-thread hashrate estimator so a subsequent
         // re-init starts from zero instead of carrying old samples.
         self.hashrate_estimator = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
@@ -1318,13 +1335,18 @@ impl BM13xxActor {
         };
 
         if let Some((new_rx, new_tx)) = new_streams {
-            // Swap the actor's chip channels onto the fresh fd, same
-            // dance as `maybe_switch_chip_baud` step 5: drop the old
-            // writer, kill the old reader task, spawn a new one.
+            // Swap the actor's chip channels onto the fresh fd. The
+            // OLD reader task must be aborted: see comment in
+            // `maybe_switch_chip_baud` step 5 — the reader task has
+            // no natural exit signal and its Arc<SerialInner> keeps
+            // the old fd alive, so without an abort the old reader
+            // races the new reader for kernel TTY bytes and splits
+            // frames.
             let stale_reader = self.reader_handle.take();
             let _old_tx = std::mem::replace(&mut self.chip_tx, new_tx);
             drop(_old_tx);
             if let Some(handle) = stale_reader {
+                handle.abort();
                 let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
             }
             self.reader_handle = Some(tokio::spawn(serial_reader_task(

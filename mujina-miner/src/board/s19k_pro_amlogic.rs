@@ -459,6 +459,11 @@ impl Board for S19kProAmlogic {
             Arc::clone(&self.thread_states),
             Arc::clone(&self.psu),
             self.config.startup.psu_settle_ms,
+            self.selected_hashboard.reset_gpio,
+            self.config.startup.reset_assert_ms,
+            self.config.startup.initial_voltage,
+            self.selected_hashboard.eeprom_i2c_device.clone(),
+            self.selected_hashboard.index,
         );
 
         let config = self.config.clone();
@@ -488,6 +493,32 @@ struct BoardStateHashThread {
     /// resume so the APW12 has time to stabilize its output before the
     /// next UpdateTask hits and triggers the cold init / freq ramp.
     psu_settle_ms: u64,
+    /// Reset GPIO for the active hashboard. Driven low on resume
+    /// *before* the PSU comes back up so chips power up while held in
+    /// reset (matching the cold-boot `assert_all_resets()` step in
+    /// `initialize()`), and released only when the actor's
+    /// `initialize_chips()` runs.
+    reset_gpio: u32,
+    /// Hold time after asserting reset and before bringing the PSU
+    /// back up. Without this, RST_N is asserted only nanoseconds
+    /// before the rail comes alive and the daisy-chained signal does
+    /// not propagate to all 77 chips in time, leaving a random ~30/77
+    /// in indeterminate state. Mirrors the `reset_assert_ms` sleep
+    /// inside cold-boot `assert_all_resets()`.
+    reset_assert_ms: u64,
+    /// Voltage to command on resume *before* PSU enable, so chips
+    /// power up at the same level as a cold boot (12 V) rather than
+    /// the last operating voltage (13.9 V) which the APW12 retains
+    /// across enable cycles. The frequency ramp brings it back up.
+    initial_voltage_v: f32,
+    /// i2c device path and PIC address used to re-handshake the on-
+    /// hashboard PIC16F1704 on resume. The PIC's LDO is fed from the
+    /// same 12 V rail we drop on pause, so it loses state and the
+    /// per-domain DC-DCs come back disabled. Without re-running
+    /// handshake → enable_dc_dc, only chips on domains that happen to
+    /// power up on their own respond on UART (scattered ~30/77).
+    pic_i2c_device: PathBuf,
+    pic_slot_index: u8,
 }
 
 impl BoardStateHashThread {
@@ -497,6 +528,11 @@ impl BoardStateHashThread {
         thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
         psu: Arc<Mutex<NativeAmlogicPsu>>,
         psu_settle_ms: u64,
+        reset_gpio: u32,
+        reset_assert_ms: u64,
+        initial_voltage_v: f32,
+        pic_i2c_device: PathBuf,
+        pic_slot_index: u8,
     ) -> Self {
         Self {
             inner,
@@ -504,6 +540,11 @@ impl BoardStateHashThread {
             thread_states,
             psu,
             psu_settle_ms,
+            reset_gpio,
+            reset_assert_ms,
+            initial_voltage_v,
+            pic_i2c_device,
+            pic_slot_index,
         }
     }
 
@@ -608,27 +649,124 @@ impl HashThread for BoardStateHashThread {
         if paused {
             let result = self.inner.set_paused(true).await;
             self.sync_thread_state(Some(false));
+            // Drive RST_N LOW BEFORE dropping the rail. Chips were
+            // running with reset released; if we kill power while
+            // they're still in a free-running state, internal logic
+            // can land in indeterminate flip-flop states that survive
+            // a brief power dip — exactly the failure mode the legacy
+            // disable_chips() path hit (~37/77 chips back, comment
+            // at thread_v2.rs:1255-1263). Driving reset low first puts
+            // chips into a known synchronous reset state before the
+            // rail falls.
+            if let Err(e) = SysfsGpio::new(self.reset_gpio).set_output_low() {
+                warn!(error = %e, reset_gpio = self.reset_gpio, "Failed to assert reset before PSU drop; chain may not pause cleanly");
+            }
+            // Give the reset edge time to be sampled by every chip in
+            // the daisy-chain before the rail collapses.
+            tokio::time::sleep(Duration::from_millis(self.reset_assert_ms)).await;
             if let Err(e) = self.psu.lock().await.set_enabled(false) {
                 warn!(error = %e, "set_paused(true) succeeded on chain but PSU disable failed; chips still powered");
             } else {
                 info!(
                     thread = %self.inner.name(),
-                    "Hard pause: PSU output disabled — chips drained, board will cool"
+                    "Hard pause: reset asserted then PSU output disabled — chips drained, board will cool"
                 );
             }
             result
         } else {
-            if let Err(e) = self.psu.lock().await.set_enabled(true) {
-                warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
-                return Err(HashThreadError::InitializationFailed(format!(
-                    "PSU re-enable failed: {e}"
-                )));
+            // Hard resume — mirror the cold-boot sequence in
+            // `S19kProAmlogic::initialize`:
+            //
+            //   1. Assert hashboard reset BEFORE the PSU comes on.
+            //      Chips power up while held in reset. The previous
+            //      version didn't do this; chips powered up with reset
+            //      already released and ended up in indeterminate state.
+            //      Verify_chain then saw a random ~30/77 each pass.
+            //   2. Drop the PSU voltage back to the cold-boot setpoint
+            //      (12 V). The APW12 retains the last commanded
+            //      voltage across an enable/disable cycle, so without
+            //      this re-enable comes back at 13.9 V — too hot a
+            //      start for cold chips, plus the frequency ramp
+            //      expects to begin at the low rail anyway.
+            //   3. Enable the PSU. Chips now have power, are at 12 V,
+            //      and are held in reset by step 1.
+            //   4. Sleep psu_settle_ms so the APW12 stabilizes.
+            //   5. Resume the inner thread. Its next UpdateTask
+            //      triggers `initialize_chips()`, which calls
+            //      `asic_enable.enable()` to release reset and then
+            //      runs enumeration — exactly the cold-boot path.
+            if let Err(e) = SysfsGpio::new(self.reset_gpio).set_output_low() {
+                warn!(error = %e, reset_gpio = self.reset_gpio, "Failed to assert reset on resume; chain may enumerate poorly");
+            }
+            // Hold reset asserted before PSU comes up. Without this
+            // the RST_N edge happens microseconds before the rail
+            // appears and does not propagate to all 77 daisy-chained
+            // chips, leaving a random ~30/77 in indeterminate state.
+            tokio::time::sleep(Duration::from_millis(self.reset_assert_ms)).await;
+            {
+                let mut psu = self.psu.lock().await;
+                if let Err(e) = psu.set_voltage(self.initial_voltage_v).await {
+                    warn!(error = %e, "Failed to reset PSU voltage to initial setpoint on resume");
+                }
+                if let Err(e) = psu.set_enabled(true) {
+                    warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
+                    return Err(HashThreadError::InitializationFailed(format!(
+                        "PSU re-enable failed: {e}"
+                    )));
+                }
             }
             tokio::time::sleep(Duration::from_millis(self.psu_settle_ms)).await;
+
+            // PIC handshake — BHB56902 has a PIC16F1704 that gates the
+            // per-domain DC-DCs and is fed from the same 12 V rail we
+            // just dropped. Without re-running handshake →
+            // enable_dc_dc, only chips on the handful of domains that
+            // happen to come up power-on survive (verified: scattered
+            // ~30/77). Mirror the cold-boot path in `initialize`.
+            //
+            // Best-effort: any failure here gets a WARN like cold boot;
+            // the next initialize_chips() will still try to enumerate
+            // (and will likely fail visibly, which is the right signal).
+            let pic_addr = pic_address_for_slot(self.pic_slot_index);
+            match PicChain::open(&self.pic_i2c_device, pic_addr) {
+                Ok(mut pic) => match pic.handshake() {
+                    Ok(version) => {
+                        info!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            version = format_args!("0x{:02x}", version),
+                            "PIC handshake ok on resume"
+                        );
+                        if let Err(e) = pic.enable_dc_dc() {
+                            warn!(
+                                addr = format_args!("0x{:02x}", pic_addr),
+                                error = %e,
+                                "PIC enable_dc_dc failed on resume; chips may not power up"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            error = %e,
+                            "PIC handshake failed on resume; chain may not respond on UART"
+                        );
+                    }
+                },
+                Err(e) => {
+                    debug!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        error = %e,
+                        "PIC absent on resume (noPIC variant?)"
+                    );
+                }
+            }
+
             info!(
                 thread = %self.inner.name(),
                 settle_ms = self.psu_settle_ms,
-                "Hard resume: PSU back on; next UpdateTask will trigger cold init"
+                initial_voltage_v = self.initial_voltage_v,
+                reset_gpio = self.reset_gpio,
+                "Hard resume: reset asserted, PSU back on at initial voltage, PIC re-handshaked; next UpdateTask will release reset and enumerate"
             );
             self.inner.set_paused(false).await
         }
