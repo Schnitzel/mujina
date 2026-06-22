@@ -9,7 +9,7 @@ write_register = 17
 enable_gpio = 437
 
 [hardware.amlogic_control_board.startup]
-default_fan_percent = 50
+default_fan_percent = 100
 initial_voltage = 12.0
 psu_settle_ms = 2000
 reset_assert_ms = 100

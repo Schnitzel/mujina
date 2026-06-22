@@ -1231,10 +1231,15 @@ async fn native_telemetry_task(
         pics.push((pic_addr, hb.clone(), pic));
     }
 
-    // Stock Bitmain firmware uses ~95 °C hard shutdown / ~85 °C throttle
-    // on this chip family. 75 °C is conservative for the bench setup;
-    // configurable threshold is future work.
-    const OVERTEMP_CUTOFF_C: f32 = 75.0;
+    // Tracks the last duty applied to the fans by the dynamic curve so we
+    // only call configure_fans on actual changes. None means "never set
+    // by this task yet" — the next iteration will issue the first write.
+    let mut applied_fan_percent: Option<u8> = None;
+    // Wall-clock of the last successful temperature read; the watchdog
+    // below pins fans to 100 % once this gets stale. Initialize to NOW
+    // so we tolerate the first read taking a little while before
+    // declaring the sensor dead.
+    let mut last_temp_at = std::time::Instant::now();
 
     loop {
         if shutdown.is_cancelled() {
@@ -1288,16 +1293,56 @@ async fn native_telemetry_task(
             }
         }
 
-        // Overtemp gate: ANY sensor on ANY hashboard above cutoff
-        // kills DC-DC on every PIC + cuts the shared PSU output.
-        let hottest = temperatures
+        // ----- Fan + overtemp control --------------------------------
+        //
+        // The BHB56902 doesn't expose the BM1366's on-die thermal
+        // diode the way a Bitaxe does (which routes it to an EMC2101
+        // fan controller, then reads it over i2c — see
+        // `bitaxeorg/ESP-Miner::main/thermal/EMC2101.{c,h}` and
+        // `Thermal_get_chip_temp` in main/thermal/thermal.c). The only
+        // signal we have on this hashboard is the pair of TMP75
+        // sensors on the PCB, and they're poorly thermally coupled to
+        // the chips — a TMP75 reading of 30 °C can sit alongside a
+        // chip die at 80+ °C, which is exactly how two of our test
+        // boards smoked before this code existed.
+        //
+        // Strategy until a better signal arrives:
+        //
+        //   1. Drive a dynamic fan curve off the hottest available
+        //      sensor across every present hashboard — multi-board
+        //      mode aggregates all TMP75 readings into `temperatures`,
+        //      so the curve naturally tracks whichever board runs
+        //      hottest. Floor at 60 % so the cooling can't drop to
+        //      nothing while the curve is still cold.
+        //   2. Hard cutoff at 65 °C TMP75 — sensor under-reads die by
+        //      ~20 °C, so 65 here is ~85 °C actual die.
+        //   3. Watchdog: if we haven't even READ a temperature in 30 s
+        //      (i2c stuck, sensor died, telemetry task stalled and we
+        //      just got back), pin fans to 100 % until we recover.
+        //   4. The boot-time `default_fan_percent` from the toml is
+        //      now 100 — the previous 50–60 % default was the
+        //      open-loop value that ran during the entire pre-mining
+        //      window with no temp signal at all.
+        const TMP75_OVERTEMP_C: f32 = 65.0;
+        const FAN_FLOOR_PERCENT: u8 = 60;
+        const FAN_RAMP_START_C: f32 = 40.0;
+        const FAN_RAMP_FULL_C: f32 = 60.0;
+        const TEMP_STALE_AFTER: Duration = Duration::from_secs(30);
+
+        let board_hottest = temperatures
             .iter()
             .filter_map(|t| t.temperature_c)
-            .fold(0f32, f32::max);
-        if hottest >= OVERTEMP_CUTOFF_C {
+            .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))));
+        if board_hottest.is_some() {
+            last_temp_at = std::time::Instant::now();
+        }
+
+        if let Some(t) = board_hottest
+            && t >= TMP75_OVERTEMP_C
+        {
             error!(
-                hottest = hottest,
-                cutoff = OVERTEMP_CUTOFF_C,
+                hottest = t,
+                cutoff = TMP75_OVERTEMP_C,
                 "OVERTEMP — disabling all PIC DC-DC outputs and PSU output"
             );
             for (_, _, pic_opt) in pics.iter_mut() {
@@ -1310,7 +1355,48 @@ async fn native_telemetry_task(
             break;
         }
 
-        let fans = read_fan_states(&config, config.startup.default_fan_percent).await;
+        let temp_stale = last_temp_at.elapsed() >= TEMP_STALE_AFTER;
+        let target_fan_percent: u8 = if temp_stale {
+            warn!(
+                "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
+            );
+            100
+        } else if let Some(t) = board_hottest {
+            if t <= FAN_RAMP_START_C {
+                FAN_FLOOR_PERCENT
+            } else if t >= FAN_RAMP_FULL_C {
+                100
+            } else {
+                let span = FAN_RAMP_FULL_C - FAN_RAMP_START_C;
+                let into_ramp = t - FAN_RAMP_START_C;
+                let pct = FAN_FLOOR_PERCENT as f32
+                    + ((100.0 - FAN_FLOOR_PERCENT as f32) * (into_ramp / span));
+                pct.round().clamp(FAN_FLOOR_PERCENT as f32, 100.0) as u8
+            }
+        } else {
+            // Pre-mining / first tick — sit at the boot value but
+            // never below the floor.
+            config.startup.default_fan_percent.max(FAN_FLOOR_PERCENT)
+        };
+
+        if Some(target_fan_percent) != applied_fan_percent {
+            if let Err(e) = configure_fans(&config, target_fan_percent) {
+                warn!(
+                    target_percent = target_fan_percent,
+                    error = %e,
+                    "configure_fans failed; previous duty still applied"
+                );
+            } else {
+                info!(
+                    target_percent = target_fan_percent,
+                    board_temp_c = board_hottest.unwrap_or(0.0),
+                    "Adjusted fan PWM"
+                );
+                applied_fan_percent = Some(target_fan_percent);
+            }
+        }
+
+        let fans = read_fan_states(&config, target_fan_percent).await;
         let voltage_v = match psu.lock().await.measure_voltage() {
             Ok(voltage_v) => Some(voltage_v),
             Err(error) => {
@@ -1482,10 +1568,20 @@ fn validate_i2c_address(address: u16) -> Result<u16, BoardError> {
 }
 
 fn tmp75_addresses(board_index: u8) -> Result<[u8; 2], BoardError> {
+    // Per the Bitmain hardware mapping documented in
+    // `skot/amlogic-cb-tools::bin/hashboard_s19jpro.rs` (function
+    // `tmp75_addresses` and the `--help` banner):
+    //   HB0 → 0x48, 0x4C
+    //   HB1 → 0x4D, 0x49
+    //   HB2 → 0x4E, 0x4A
+    // mujina previously had HB0 and HB2 swapped, which silently sent
+    // the overtemp cutoff to read whichever board was wired to the
+    // OTHER slot's TMP75 pair — a real safety bug for any deployment
+    // not running on HB1.
     match board_index {
-        0 => Ok([0x4E, 0x4A]),
+        0 => Ok([0x48, 0x4C]),
         1 => Ok([0x4D, 0x49]),
-        2 => Ok([0x48, 0x4C]),
+        2 => Ok([0x4E, 0x4A]),
         _ => Err(BoardError::InitializationFailed(format!(
             "invalid hashboard index: {board_index}"
         ))),

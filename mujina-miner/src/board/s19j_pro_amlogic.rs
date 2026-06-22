@@ -987,6 +987,27 @@ async fn native_telemetry_task(
             }
         };
 
+    // ----- Fan + overtemp control --------------------------------
+    //
+    // s19j_pro has a PIC, which gives us PIC-mediated thermal reads
+    // (above) in addition to the TMP75 PCB sensors. We use whichever
+    // sensor pool we actually got back (PIC first, TMP75 fallback)
+    // and drive a single dynamic fan curve + overtemp cutoff off the
+    // hottest value.
+    //
+    // See `s19k_pro_amlogic.rs::native_telemetry_task` for the
+    // longer discussion of why 65 °C ~= 80 °C die ~= stock's "hot"
+    // boundary, and why we treat 100 % fan as the floor for a
+    // failed/stale sensor read.
+    const TMP75_OVERTEMP_C: f32 = 65.0;
+    const FAN_FLOOR_PERCENT: u8 = 60;
+    const FAN_RAMP_START_C: f32 = 40.0;
+    const FAN_RAMP_FULL_C: f32 = 60.0;
+    const TEMP_STALE_AFTER: Duration = Duration::from_secs(30);
+
+    let mut applied_fan_percent: Option<u8> = None;
+    let mut last_temp_at = std::time::Instant::now();
+
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -1032,29 +1053,21 @@ async fn native_telemetry_task(
             }
         }
 
-        // Overtemp protection: if any PIC sensor exceeds the cutoff,
-        // immediately disable DC-DC (cuts chip power but keeps PIC alive)
-        // and PSU output, then cancel telemetry so the daemon notices and
-        // shuts the board down.
-        //
-        // Stock Bitmain firmware uses ~95 °C for hard shutdown and ~85 °C
-        // for throttling on this chip family. We use 75 °C as a
-        // conservative fixed cutoff: this code path is exercised on the
-        // bench (limited cooling) much more than in chassis, and the
-        // failure mode of running a hashboard hot is severe (the original
-        // BHB42601 we used to bring this up arced its 12 V input plane).
-        // A configurable threshold is the right long-term answer; left as
-        // future work to keep this PR focused.
-        const OVERTEMP_CUTOFF_C: f32 = 75.0;
-        let hottest = temperatures
+        let board_hottest = temperatures
             .iter()
             .filter_map(|t| t.temperature_c)
-            .fold(0f32, f32::max);
-        if hottest >= OVERTEMP_CUTOFF_C {
+            .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))));
+        if board_hottest.is_some() {
+            last_temp_at = std::time::Instant::now();
+        }
+
+        if let Some(t) = board_hottest
+            && t >= TMP75_OVERTEMP_C
+        {
             error!(
                 board = %hashboard.index,
-                hottest = hottest,
-                cutoff = OVERTEMP_CUTOFF_C,
+                hottest = t,
+                cutoff = TMP75_OVERTEMP_C,
                 "OVERTEMP — disabling PIC DC-DC and PSU output"
             );
             if let Some(ref mut pic) = pic_for_heartbeat {
@@ -1065,7 +1078,49 @@ async fn native_telemetry_task(
             break;
         }
 
-        let fans = read_fan_states(&config, config.startup.default_fan_percent).await;
+        let temp_stale = last_temp_at.elapsed() >= TEMP_STALE_AFTER;
+        let target_fan_percent: u8 = if temp_stale {
+            warn!(
+                board = %hashboard.index,
+                "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
+            );
+            100
+        } else if let Some(t) = board_hottest {
+            if t <= FAN_RAMP_START_C {
+                FAN_FLOOR_PERCENT
+            } else if t >= FAN_RAMP_FULL_C {
+                100
+            } else {
+                let span = FAN_RAMP_FULL_C - FAN_RAMP_START_C;
+                let into_ramp = t - FAN_RAMP_START_C;
+                let pct = FAN_FLOOR_PERCENT as f32
+                    + ((100.0 - FAN_FLOOR_PERCENT as f32) * (into_ramp / span));
+                pct.round().clamp(FAN_FLOOR_PERCENT as f32, 100.0) as u8
+            }
+        } else {
+            config.startup.default_fan_percent.max(FAN_FLOOR_PERCENT)
+        };
+
+        if Some(target_fan_percent) != applied_fan_percent {
+            if let Err(e) = configure_fans(&config, target_fan_percent) {
+                warn!(
+                    board = %hashboard.index,
+                    target_percent = target_fan_percent,
+                    error = %e,
+                    "configure_fans failed; previous duty still applied"
+                );
+            } else {
+                info!(
+                    board = %hashboard.index,
+                    target_percent = target_fan_percent,
+                    board_temp_c = board_hottest.unwrap_or(0.0),
+                    "Adjusted fan PWM"
+                );
+                applied_fan_percent = Some(target_fan_percent);
+            }
+        }
+
+        let fans = read_fan_states(&config, target_fan_percent).await;
         let voltage_v = match psu.lock().await.measure_voltage() {
             Ok(voltage_v) => Some(voltage_v),
             Err(error) => {
@@ -1237,10 +1292,20 @@ fn validate_i2c_address(address: u16) -> Result<u16, BoardError> {
 }
 
 fn tmp75_addresses(board_index: u8) -> Result<[u8; 2], BoardError> {
+    // Per the Bitmain hardware mapping documented in
+    // `skot/amlogic-cb-tools::bin/hashboard_s19jpro.rs` (function
+    // `tmp75_addresses` and the `--help` banner):
+    //   HB0 → 0x48, 0x4C
+    //   HB1 → 0x4D, 0x49
+    //   HB2 → 0x4E, 0x4A
+    // mujina previously had HB0 and HB2 swapped, which silently sent
+    // the overtemp cutoff to read whichever board was wired to the
+    // OTHER slot's TMP75 pair — a real safety bug for any deployment
+    // not running on HB1.
     match board_index {
-        0 => Ok([0x4E, 0x4A]),
+        0 => Ok([0x48, 0x4C]),
         1 => Ok([0x4D, 0x49]),
-        2 => Ok([0x48, 0x4C]),
+        2 => Ok([0x4E, 0x4A]),
         _ => Err(BoardError::InitializationFailed(format!(
             "invalid hashboard index: {board_index}"
         ))),
