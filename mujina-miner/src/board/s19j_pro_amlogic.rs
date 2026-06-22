@@ -271,6 +271,8 @@ impl Board for S19jProAmlogic {
             Box::new(thread),
             self.state_tx.clone(),
             Arc::clone(&self.thread_states),
+            Arc::clone(&self.psu),
+            self.config.startup.psu_settle_ms,
         );
 
         let config = self.config.clone();
@@ -291,6 +293,8 @@ struct BoardStateHashThread {
     inner: Box<dyn HashThread>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+    psu: Arc<Mutex<NativeAmlogicPsu>>,
+    psu_settle_ms: u64,
 }
 
 impl BoardStateHashThread {
@@ -298,11 +302,15 @@ impl BoardStateHashThread {
         inner: Box<dyn HashThread>,
         state_tx: watch::Sender<BoardState>,
         thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+        psu: Arc<Mutex<NativeAmlogicPsu>>,
+        psu_settle_ms: u64,
     ) -> Self {
         Self {
             inner,
             state_tx,
             thread_states,
+            psu,
+            psu_settle_ms,
         }
     }
 
@@ -390,14 +398,38 @@ impl HashThread for BoardStateHashThread {
     }
 
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
-        let result = self.inner.set_paused(paused).await;
-        // On pause: actor just zeroed its status, so reflect that
-        // in the per-board state too. On resume: leave is_active
-        // alone — the next share will set it.
+        // See `s19k_pro_amlogic.rs::BoardStateHashThread::set_paused`
+        // for the longer rationale — same hard-pause approach: zero
+        // the inner thread, drop PSU; on resume, energize PSU and
+        // settle before clearing the paused flag so the next
+        // UpdateTask hits a powered chain.
         if paused {
+            let result = self.inner.set_paused(true).await;
             self.sync_thread_state(Some(false));
+            if let Err(e) = self.psu.lock().await.set_enabled(false) {
+                warn!(error = %e, "set_paused(true) succeeded on chain but PSU disable failed; chips still powered");
+            } else {
+                info!(
+                    thread = %self.inner.name(),
+                    "Hard pause: PSU output disabled — chips drained, board will cool"
+                );
+            }
+            result
+        } else {
+            if let Err(e) = self.psu.lock().await.set_enabled(true) {
+                warn!(error = %e, "PSU re-enable failed on resume; chain will not respond");
+                return Err(HashThreadError::InitializationFailed(format!(
+                    "PSU re-enable failed: {e}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(self.psu_settle_ms)).await;
+            info!(
+                thread = %self.inner.name(),
+                settle_ms = self.psu_settle_ms,
+                "Hard resume: PSU back on; next UpdateTask will trigger cold init"
+            );
+            self.inner.set_paused(false).await
         }
-        result
     }
 
     fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<HashThreadEvent>> {
