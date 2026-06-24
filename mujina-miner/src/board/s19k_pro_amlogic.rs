@@ -145,11 +145,26 @@ pub fn device_id(config: &AmlogicControlBoardConfig) -> String {
         .unwrap_or_else(|| DEFAULT_BOARD_NAME.to_string())
 }
 
+/// One hashboard, after `select_present_hashboards` + `perform_health_gate`.
+#[derive(Clone)]
+struct SelectedHashboard {
+    config: AmlogicHashboardConfig,
+    board_serial: Option<String>,
+}
+
 /// Native Amlogic S19k Pro board.
+///
+/// Holds one or more `SelectedHashboard`s — the BHB56902 hardware
+/// supports up to three hashboards on the same APW12 / Amlogic SoC,
+/// and `select_present_hashboards` picks every slot whose detect GPIO
+/// reads "present". `create_hash_threads` then spawns one
+/// [`BoardStateHashThread`] per board so each chain mines
+/// independently; the shared APW12 is coordinated through a
+/// [`bm13xx::chain_config::ChainCoordinator`] so the per-step voltage
+/// commands during the frequency ramp don't oscillate across chains.
 pub struct S19kProAmlogic {
     config: AmlogicControlBoardConfig,
-    selected_hashboard: AmlogicHashboardConfig,
-    board_serial: Option<String>,
+    selected_hashboards: Vec<SelectedHashboard>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
@@ -159,15 +174,13 @@ pub struct S19kProAmlogic {
 impl S19kProAmlogic {
     fn new(
         config: AmlogicControlBoardConfig,
-        selected_hashboard: AmlogicHashboardConfig,
-        board_serial: Option<String>,
+        selected_hashboards: Vec<SelectedHashboard>,
         psu: Arc<Mutex<NativeAmlogicPsu>>,
         state_tx: watch::Sender<BoardState>,
     ) -> Self {
         Self {
             config,
-            selected_hashboard,
-            board_serial,
+            selected_hashboards,
             psu,
             state_tx,
             thread_states: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -178,26 +191,34 @@ impl S19kProAmlogic {
     async fn initialize(
         config: &AmlogicControlBoardConfig,
         state_tx: &watch::Sender<BoardState>,
-    ) -> Result<
-        (
-            AmlogicHashboardConfig,
-            Option<String>,
-            Arc<Mutex<NativeAmlogicPsu>>,
-        ),
-        BoardError,
-    > {
-        let selected_hashboard = select_hashboard(config)?;
+    ) -> Result<(Vec<SelectedHashboard>, Arc<Mutex<NativeAmlogicPsu>>), BoardError> {
         let board_name = device_id(config);
+        let present = select_present_hashboards(config)?;
 
         info!(
             board = %board_name,
-            hashboard = selected_hashboard.index,
-            serial = %selected_hashboard.serial_path.display(),
+            slots = %present
+                .iter()
+                .map(|hb| hb.index.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             "Initializing native Amlogic S19k Pro board"
         );
 
-        let (board_serial, initial_temperatures) =
-            perform_health_gate(config, &selected_hashboard)?;
+        // Health-gate every present hashboard before energizing chips.
+        // EEPROM + temperature reads can fail individually; a failure
+        // here aborts board init for now (we don't want a "ghost"
+        // hashboard with bad EEPROM coming up with the others).
+        let mut selected: Vec<SelectedHashboard> = Vec::with_capacity(present.len());
+        let mut all_temps: Vec<TemperatureSensor> = Vec::new();
+        for hb in &present {
+            let (board_serial, initial_temperatures) = perform_health_gate(config, hb)?;
+            all_temps.extend(initial_temperatures);
+            selected.push(SelectedHashboard {
+                config: hb.clone(),
+                board_serial,
+            });
+        }
 
         configure_fans(config, config.startup.default_fan_percent)?;
         assert_all_resets(config)?;
@@ -225,64 +246,73 @@ impl S19kProAmlogic {
             psu_guard.measure_voltage().ok()
         };
 
-        // PIC handshake. The BHB56902 (S19k Pro), like its BHB42601 /
-        // BHB42611 (S19j Pro) siblings, gates the per-domain DC-DC
-        // regulators behind an on-hashboard PIC16F1704 microcontroller.
-        // The BM1366 chips have no power to respond on UART until we
-        // enable them via the PIC.
+        // PIC handshake — best-effort per present hashboard. On
+        // PIC-variant boards (BHB42601 / BHB42611) the per-domain
+        // DC-DC regulators are gated by an on-hashboard PIC16F1704
+        // microcontroller and have to be unlocked here. On noPIC
+        // variants (BHB56902 / S19k Pro family) the open or
+        // handshake fails and we continue — the chain still comes up
+        // via the existing path.
+        //
         // See "PIC vs noPIC Bitmain Miners":
         //   https://braiins.com/blog/pic-vs-nopic-bitmain-miners-...
-        //
-        // The protocol opcodes used by `PicChain` were lifted from the
-        // decompiled S21 single_board_test in
+        // The protocol opcodes used by `PicChain` were lifted from
+        // the decompiled S21 single_board_test in
         //   https://github.com/HashSource/bitmain_antminer_binaries
-        // and confirmed against LuxOS ftrace captures on the BHB42601.
-        // The BHB56902 uses the same PIC firmware family (version 0x89
-        // observed on both) and reuses this sequence:
-        //   reset -> start_app -> get_sw_ver -> disable_dc_dc -> enable_dc_dc
-        //
-        // The PIC's onboard LDO is fed from the 12 V rail, so handshake
-        // must run AFTER `set_enabled(true)` above. Failures are
-        // tolerated so any future noPIC variant of the S19k Pro can
-        // still bring up via the existing path.
-        let pic_addr = pic_address_for_slot(selected_hashboard.index);
-        match PicChain::open(&selected_hashboard.eeprom_i2c_device, pic_addr) {
-            Ok(mut pic) => match pic.handshake() {
-                Ok(version) => {
-                    info!(
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        version = format_args!("0x{:02x}", version),
-                        "PIC handshake ok"
-                    );
-                    if let Err(e) = pic.enable_dc_dc() {
-                        warn!(
+        // and confirmed against LuxOS ftrace captures on BHB42601.
+        for sel in &selected {
+            let pic_addr = pic_address_for_slot(sel.config.index);
+            match PicChain::open(&sel.config.eeprom_i2c_device, pic_addr) {
+                Ok(mut pic) => match pic.handshake() {
+                    Ok(version) => {
+                        info!(
+                            hashboard = sel.config.index,
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            version = format_args!("0x{:02x}", version),
+                            "PIC handshake ok"
+                        );
+                        if let Err(e) = pic.enable_dc_dc() {
+                            warn!(
+                                hashboard = sel.config.index,
+                                addr = format_args!("0x{:02x}", pic_addr),
+                                error = %e,
+                                "PIC enable_dc_dc failed; chips may not power up"
+                            );
+                        } else {
+                            info!(
+                                hashboard = sel.config.index,
+                                addr = format_args!("0x{:02x}", pic_addr),
+                                "PIC DC-DC enabled; chips powering up"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            hashboard = sel.config.index,
                             addr = format_args!("0x{:02x}", pic_addr),
                             error = %e,
-                            "PIC enable_dc_dc failed; chips may not power up"
-                        );
-                    } else {
-                        info!(
-                            addr = format_args!("0x{:02x}", pic_addr),
-                            "PIC DC-DC enabled; chips powering up"
+                            "PIC handshake failed (noPIC variant?); continuing"
                         );
                     }
-                }
+                },
                 Err(e) => {
-                    warn!(
+                    debug!(
+                        hashboard = sel.config.index,
                         addr = format_args!("0x{:02x}", pic_addr),
                         error = %e,
-                        "PIC handshake failed; chain may not respond on UART"
+                        "PIC i2c open failed (noPIC variant?); continuing"
                     );
                 }
-            },
-            Err(e) => {
-                warn!(
-                    addr = format_args!("0x{:02x}", pic_addr),
-                    error = %e,
-                    "Could not open PIC i2c device; non-PIC hashboard variant?"
-                );
             }
         }
+
+        // First board's serial gets reported as the board serial.
+        // Could expose all serials in the future, but the API model
+        // currently has one serial per BoardState.
+        let primary_serial = selected
+            .iter()
+            .find_map(|s| s.board_serial.clone())
+            .or_else(|| Some(board_name.clone()));
 
         let fan_states = build_fan_state(config, config.startup.default_fan_percent);
         let power_states = vec![PowerMeasurement {
@@ -295,13 +325,13 @@ impl S19kProAmlogic {
         state_tx.send_modify(|state| {
             state.name = board_name.clone();
             state.model = BOARD_MODEL.into();
-            state.serial = board_serial.clone().or_else(|| Some(board_name.clone()));
-            state.temperatures = initial_temperatures.clone();
+            state.serial = primary_serial.clone();
+            state.temperatures = all_temps.clone();
             state.fans = fan_states.clone();
             state.powers = power_states.clone();
         });
 
-        Ok((selected_hashboard, board_serial, psu))
+        Ok((selected, psu))
     }
 }
 
@@ -312,8 +342,9 @@ impl Board for S19kProAmlogic {
             model: BOARD_MODEL.into(),
             firmware_version: None,
             serial_number: self
-                .board_serial
-                .clone()
+                .selected_hashboards
+                .iter()
+                .find_map(|s| s.board_serial.clone())
                 .or_else(|| Some(device_id(&self.config))),
         }
     }
@@ -326,18 +357,20 @@ impl Board for S19kProAmlogic {
         assert_all_resets(&self.config)?;
         configure_fans(&self.config, 0)?;
 
-        // Best-effort disable of PIC DC-DC before cutting the rail. If this
-        // fails the PSU output-off below still safes the chips.
-        let pic_addr = pic_address_for_slot(self.selected_hashboard.index);
-        if let Ok(mut pic) =
-            PicChain::open(&self.selected_hashboard.eeprom_i2c_device, pic_addr)
-        {
-            if let Err(e) = pic.disable_dc_dc() {
-                warn!(
-                    addr = format_args!("0x{:02x}", pic_addr),
-                    error = %e,
-                    "PIC disable_dc_dc on shutdown failed (non-fatal)"
-                );
+        // Best-effort disable PIC DC-DC on every present hashboard
+        // before cutting the rail. PSU output-off below still safes
+        // the chips even if some PIC opens fail (noPIC variants).
+        for sel in &self.selected_hashboards {
+            let pic_addr = pic_address_for_slot(sel.config.index);
+            if let Ok(mut pic) = PicChain::open(&sel.config.eeprom_i2c_device, pic_addr) {
+                if let Err(e) = pic.disable_dc_dc() {
+                    debug!(
+                        hashboard = sel.config.index,
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        error = %e,
+                        "PIC disable_dc_dc on shutdown failed (non-fatal)"
+                    );
+                }
             }
         }
 
@@ -351,132 +384,148 @@ impl Board for S19kProAmlogic {
     }
 
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
-        let data_stream = SerialStream::new(
-            &self.selected_hashboard.serial_path.to_string_lossy(),
-            SERIAL_BAUD,
-        )
-        .map_err(|e| BoardError::InitializationFailed(format!("Failed to open data port: {e}")))?;
-        let (data_reader, data_writer, data_control) = data_stream.split();
-
-        data_control.flush_input().map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to flush serial buffer: {e}"))
-        })?;
-
-        let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
-        let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
-
-        // Hand the hash thread a handle for the chip-channel SerialStream
-        // so it can close+reopen `/dev/ttyS2` at a new baud rate mid-init.
-        // The original `data_control` is stashed in
-        // `_original_keepalive` so its Arc<SerialInner> reference keeps
-        // the first fd open for the lifetime of the adapter (and the
-        // mining session). LuxOS keeps its first fd open the entire
-        // time it runs — without that we get chip drops on the swap.
-        let chip_uart_baud = Arc::new(Mutex::new(SerialControlAdapter {
-            path: self.selected_hashboard.serial_path.clone(),
-            staged_control: None,
-            _original_keepalive: Some(data_control),
-        }));
-
-        let config = ChainConfig {
-            name: format!("S19kProAmlogic-HB{}", self.selected_hashboard.index),
-            topology: TopologySpec::uniform_domains(11, 7, false),
-            chip_config: chip_config::bm1366(),
-            peripherals: ChainPeripherals {
-                asic_enable: Arc::new(Mutex::new(NativeResetControl {
-                    gpio: SysfsGpio::new(self.selected_hashboard.reset_gpio),
-                    reset_release_ms: self.config.startup.reset_release_ms,
-                })),
-                voltage_regulator: Some(
-                    Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
-                ),
-                chip_uart_baud: Some(chip_uart_baud
-                    as Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>),
-            },
-            // Baud bump to 3.125 Mbaud. The post-broadcast switch is
-            // critical to break past the UART RX cap at 115200: with
-            // 77 chips producing ~32 TH/s of nonces, the 1000-frames/s
-            // ceiling at 115200 drops half the share-bearing nonces.
-            // LuxOS sustains 38 TH/s on this same hashboard at this
-            // baud (per `captures/luxos-bhb56902-steady-state.log`).
-            //
-            // Two prior mismatches were dropping chips on the switch:
-            //   1. mujina mapped `Baud3M` to 3_000_000 numeric. The
-            //      chip-side register `0x00003011` actually produces
-            //      3_125_000 baud, not 3_000_000 — the ~4 % mismatch
-            //      was enough to mangle frames on the long chain. Now
-            //      fixed in `thread_v2.rs`.
-            //   2. The board dropped the original `SerialControl` after
-            //      handing it to the actor, so when the actor swapped
-            //      to the new fd there was a brief no-fd window before
-            //      the new fd took over. LuxOS keeps its first fd open
-            //      the entire session — now `SerialControlAdapter
-            //      ._original_keepalive` holds the original control
-            //      alive for the whole adapter lifetime.
-            post_broadcast_chip_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
+        let n_chains = self.selected_hashboards.len();
+        // Single APW12 across all hashboards. Lockstep voltage commands
+        // through a shared coordinator when there's more than one chain,
+        // otherwise leave the legacy path where each actor drives its
+        // own regulator independently.
+        let ramp_coordinator = if n_chains > 1 {
+            Some(Arc::new(bm13xx::chain_config::ChainCoordinator::new(
+                n_chains,
+            )))
+        } else {
+            None
         };
 
-        let thread = thread_v2::BM13xxThread::new(chip_rx, chip_tx, config).map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to create hash thread: {e}"))
-        })?;
+        let mut threads: Vec<Box<dyn HashThread>> = Vec::with_capacity(n_chains);
+        let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
+            Vec::with_capacity(n_chains);
 
-        let thread_name = thread.name().to_string();
-        // Seed the initial hashrate at 0; the actor's HashrateEstimator
-        // takes over once shares start flowing. Reporting the static
-        // `capabilities.hashrate_estimate` here would show 6.39 TH/s
-        // on the per-board UI during the ramp while the chain-wide
-        // hashrate is still 0 — see the matching change in
-        // `thread_hashrate_value` below.
-        let thread_hashrate = 0u64;
+        for selected in self.selected_hashboards.clone() {
+            let hb = &selected.config;
 
+            let data_stream = SerialStream::new(&hb.serial_path.to_string_lossy(), SERIAL_BAUD)
+                .map_err(|e| {
+                    BoardError::InitializationFailed(format!(
+                        "Failed to open data port {}: {e}",
+                        hb.serial_path.display()
+                    ))
+                })?;
+            let (data_reader, data_writer, data_control) = data_stream.split();
+
+            data_control.flush_input().map_err(|e| {
+                BoardError::InitializationFailed(format!("Failed to flush serial buffer: {e}"))
+            })?;
+
+            let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
+            let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
+
+            // Original SerialControl held alive in the adapter so the
+            // `/dev/ttyS*` fd never closes mid-init when the actor
+            // swaps writer/reader pairs across a baud bump. Per-
+            // hashboard adapter so each chain owns its own keepalive.
+            let chip_uart_baud = Arc::new(Mutex::new(SerialControlAdapter {
+                path: hb.serial_path.clone(),
+                staged_control: None,
+                _original_keepalive: Some(data_control),
+            }));
+
+            let config = ChainConfig {
+                name: format!("S19kProAmlogic-HB{}", hb.index),
+                topology: TopologySpec::uniform_domains(11, 7, false),
+                chip_config: chip_config::bm1366(),
+                peripherals: ChainPeripherals {
+                    asic_enable: Arc::new(Mutex::new(NativeResetControl {
+                        gpio: SysfsGpio::new(hb.reset_gpio),
+                        reset_release_ms: self.config.startup.reset_release_ms,
+                    })),
+                    voltage_regulator: Some(
+                        Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
+                    ),
+                    chip_uart_baud: Some(chip_uart_baud
+                        as Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>),
+                    ramp_coordinator: ramp_coordinator.clone(),
+                },
+                // 3.125 Mbaud post-broadcast switch — see commit
+                // history for the chip-side register / numeric-rate
+                // and fd-keepalive fixes that made this reliable.
+                post_broadcast_chip_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
+            };
+
+            let inner_thread =
+                thread_v2::BM13xxThread::new(chip_rx, chip_tx, config).map_err(|e| {
+                    BoardError::InitializationFailed(format!(
+                        "Failed to create hash thread for HB{}: {e}",
+                        hb.index
+                    ))
+                })?;
+
+            let thread_name = inner_thread.name().to_string();
+            thread_state_seed.push(crate::api_client::types::ThreadState {
+                name: thread_name.clone(),
+                hashrate: 0,
+                is_active: false,
+            });
+
+            let board_thread = BoardStateHashThread::new(
+                Box::new(inner_thread),
+                self.state_tx.clone(),
+                Arc::clone(&self.thread_states),
+                Arc::clone(&self.psu),
+                self.config.startup.psu_settle_ms,
+                hb.reset_gpio,
+                self.config.startup.reset_assert_ms,
+                self.config.startup.initial_voltage,
+                hb.eeprom_i2c_device.clone(),
+                hb.index,
+            );
+
+            threads.push(Box::new(board_thread));
+        }
+
+        // Seed both the BoardState.threads field (for the UI) and the
+        // shared `thread_states` cache (read by the consolidated
+        // telemetry task) with one slot per chain. Live hashrates
+        // arrive via `sync_thread_state` as each actor mines.
         self.state_tx.send_modify(|state| {
             state.serial = self
-                .board_serial
-                .clone()
+                .selected_hashboards
+                .iter()
+                .find_map(|s| s.board_serial.clone())
                 .or_else(|| Some(device_id(&self.config)));
-            state.threads = vec![crate::api_client::types::ThreadState {
-                name: thread_name.clone(),
-                hashrate: thread_hashrate,
-                is_active: false,
-            }];
+            state.threads = thread_state_seed.clone();
         });
-
         {
             let mut thread_states = self
                 .thread_states
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *thread_states = vec![crate::api_client::types::ThreadState {
-                name: thread_name.clone(),
-                hashrate: thread_hashrate,
-                is_active: false,
-            }];
+            *thread_states = thread_state_seed.clone();
         }
 
-        let thread = BoardStateHashThread::new(
-            Box::new(thread),
-            self.state_tx.clone(),
-            Arc::clone(&self.thread_states),
-            Arc::clone(&self.psu),
-            self.config.startup.psu_settle_ms,
-            self.selected_hashboard.reset_gpio,
-            self.config.startup.reset_assert_ms,
-            self.config.startup.initial_voltage,
-            self.selected_hashboard.eeprom_i2c_device.clone(),
-            self.selected_hashboard.index,
-        );
-
-        let config = self.config.clone();
-        let hashboard = self.selected_hashboard.clone();
+        // ONE telemetry task across all selected hashboards. It walks
+        // every present hashboard each tick, aggregates temperatures /
+        // fans / threads / PSU voltage into a single BoardState
+        // update, and acts as the overtemp gate (kills PSU if any
+        // sensor exceeds the cutoff). Spawning N independent tasks
+        // would have them race on `state_tx.send_modify` and clobber
+        // each other's temperatures.
+        let cfg_clone = self.config.clone();
+        let hbs_clone: Vec<AmlogicHashboardConfig> = self
+            .selected_hashboards
+            .iter()
+            .map(|s| s.config.clone())
+            .collect();
         let psu = Arc::clone(&self.psu);
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
         tokio::spawn(async move {
-            native_telemetry_task(config, hashboard, psu, state_tx, thread_states, shutdown).await;
+            native_telemetry_task(cfg_clone, hbs_clone, psu, state_tx, thread_states, shutdown)
+                .await;
         });
 
-        Ok(vec![Box::new(thread)])
+        Ok(threads)
     }
 }
 
@@ -1000,19 +1049,24 @@ impl VoltageRegulator for NativeAmlogicPsu {
     }
 }
 
-fn select_hashboard(
+/// Walk every configured hashboard slot; return every one whose detect
+/// GPIO reads "present". Missing required slots are fatal, missing
+/// optional slots are skipped. The order matches the config order
+/// (and therefore the slot index), so per-thread naming stays stable
+/// across runs.
+fn select_present_hashboards(
     config: &AmlogicControlBoardConfig,
-) -> Result<AmlogicHashboardConfig, BoardError> {
+) -> Result<Vec<AmlogicHashboardConfig>, BoardError> {
     if config.hashboards.is_empty() {
         return Err(BoardError::InitializationFailed(
             "Amlogic config has no configured hashboards".into(),
         ));
     }
 
-    let mut first_present = None;
+    let mut present = Vec::new();
     for hashboard in &config.hashboards {
-        let present = is_hashboard_present(hashboard)?;
-        if !present {
+        let is_present = is_hashboard_present(hashboard)?;
+        if !is_present {
             let missing_is_fatal = config
                 .startup
                 .health_gate
@@ -1026,15 +1080,15 @@ fn select_hashboard(
             }
             continue;
         }
-
-        if first_present.is_none() {
-            first_present = Some(hashboard.clone());
-        }
+        present.push(hashboard.clone());
     }
 
-    first_present.ok_or_else(|| {
-        BoardError::InitializationFailed("No configured hashboards are present".into())
-    })
+    if present.is_empty() {
+        return Err(BoardError::InitializationFailed(
+            "No configured hashboards are present".into(),
+        ));
+    }
+    Ok(present)
 }
 
 fn is_hashboard_present(hashboard: &AmlogicHashboardConfig) -> Result<bool, BoardError> {
@@ -1132,7 +1186,7 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
 
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
-    hashboard: AmlogicHashboardConfig,
+    hashboards: Vec<AmlogicHashboardConfig>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
@@ -1140,121 +1194,116 @@ async fn native_telemetry_task(
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 
-    // Open a dedicated PIC handle for the heartbeat path. LuxOS sends a
-    // PIC heartbeat (opcode 0x16) periodically while mining — captured at
-    // roughly every 1.5 s in our ftrace runs. Without heartbeats the PIC
-    // appears to disable DC-DC after a watchdog timeout (we observed chips
-    // dropping mid-ramp without it). The exact timeout isn't documented;
-    // LuxOS firmware never lets the gap grow large enough to find out.
-    //
-    // We piggy-back on the 2 s telemetry tick so heartbeat + temp reads
-    // share one PIC handle and the same i2c-0 transactions don't race.
-    // Failing to open just disables the heartbeat (board may still come up
-    // briefly).
-    // Probe for the PIC at the expected i2c address. The BHB56902
-    // (S19k Pro) is a noPIC variant — no chip ACKs at 0x21 / 0x22.
-    // Without a probe we'd spam a "PIC heartbeat failed" warning every
-    // ~2 s for the life of the process. Try one heartbeat; if it
-    // fails, disable the path entirely.
-    let pic_addr = pic_address_for_slot(hashboard.index);
-    let mut pic_for_heartbeat: Option<PicChain> = match PicChain::open(
-        &hashboard.eeprom_i2c_device,
-        pic_addr,
-    ) {
-        Ok(mut p) => match p.heartbeat() {
-            Ok(()) => Some(p),
+    // One PIC handle per present hashboard for the heartbeat path.
+    // LuxOS sends a PIC heartbeat (opcode 0x16) roughly every 1.5 s on
+    // PIC variants; without heartbeats the PIC disables DC-DC after a
+    // watchdog timeout (chips drop mid-ramp). Probe each slot once at
+    // task start; noPIC variants (BHB56902) silently disable the
+    // heartbeat for that slot to avoid spamming warnings.
+    let mut pics: Vec<(u16, AmlogicHashboardConfig, Option<PicChain>)> =
+        Vec::with_capacity(hashboards.len());
+    for hb in &hashboards {
+        let pic_addr = pic_address_for_slot(hb.index);
+        let pic = match PicChain::open(&hb.eeprom_i2c_device, pic_addr) {
+            Ok(mut p) => match p.heartbeat() {
+                Ok(()) => Some(p),
+                Err(e) => {
+                    info!(
+                        hashboard = hb.index,
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        error = %e,
+                        "PIC absent on this hashboard (likely a noPIC variant); \
+                         skipping heartbeat path"
+                    );
+                    None
+                }
+            },
             Err(e) => {
-                info!(
+                warn!(
+                    hashboard = hb.index,
                     addr = format_args!("0x{:02x}", pic_addr),
                     error = %e,
-                    "PIC absent on this hashboard (likely a noPIC variant like BHB56902); \
-                     skipping heartbeat path"
+                    "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
                 );
                 None
             }
-        },
-        Err(e) => {
-            warn!(
-                addr = format_args!("0x{:02x}", pic_addr),
-                error = %e,
-                "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
-            );
-            None
-        }
-    };
+        };
+        pics.push((pic_addr, hb.clone(), pic));
+    }
+
+    // Stock Bitmain firmware uses ~95 °C hard shutdown / ~85 °C throttle
+    // on this chip family. 75 °C is conservative for the bench setup;
+    // configurable threshold is future work.
+    const OVERTEMP_CUTOFF_C: f32 = 75.0;
 
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        // Heartbeat + read PIC-mediated temps using a single PIC handle to
-        // avoid racing with a separately-opened temp reader.
+        // Walk every present hashboard each tick: PIC heartbeat,
+        // PIC-mediated temps, TMP75 fallback. Accumulate into one
+        // sensor list keyed by `HB{index}-...` so the API surfaces
+        // per-hashboard sensors in the same BoardState.
         let mut temperatures: Vec<TemperatureSensor> = Vec::new();
-        if let Some(ref mut pic) = pic_for_heartbeat {
-            if let Err(e) = pic.heartbeat() {
-                warn!(
-                    addr = format_args!("0x{:02x}", pic_addr),
-                    error = %e,
-                    "PIC heartbeat failed"
-                );
-            }
-            match pic.read_temperatures_celsius() {
-                Ok(temps) => {
-                    for (i, t) in temps.iter().enumerate() {
-                        temperatures.push(TemperatureSensor {
-                            name: format!("HB{}-PIC{}", hashboard.index, i),
-                            temperature_c: Some(*t),
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!(
+        for (pic_addr, hb, pic_opt) in pics.iter_mut() {
+            let pic_addr = *pic_addr;
+            let mut got_pic_temps = false;
+            if let Some(pic) = pic_opt.as_mut() {
+                if let Err(e) = pic.heartbeat() {
+                    warn!(
+                        hashboard = hb.index,
                         addr = format_args!("0x{:02x}", pic_addr),
                         error = %e,
-                        "PIC temperature read failed"
+                        "PIC heartbeat failed"
                     );
                 }
+                match pic.read_temperatures_celsius() {
+                    Ok(temps) => {
+                        for (i, t) in temps.iter().enumerate() {
+                            temperatures.push(TemperatureSensor {
+                                name: format!("HB{}-PIC{}", hb.index, i),
+                                temperature_c: Some(*t),
+                            });
+                        }
+                        got_pic_temps = !temps.is_empty();
+                    }
+                    Err(e) => {
+                        debug!(
+                            hashboard = hb.index,
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            error = %e,
+                            "PIC temperature read failed"
+                        );
+                    }
+                }
             }
-        }
-        // Fallback to TMP75 path when no PIC-mediated temps were returned
-        // (e.g. noPIC variants). read_temperatures() handles the TMP75 case.
-        if temperatures.is_empty() {
-            match read_temperatures(&hashboard) {
-                Ok(t) => temperatures = t,
-                Err(error) => {
-                    debug!(board = %hashboard.index, error = %error, "Native telemetry temperature read failed");
+            if !got_pic_temps {
+                match read_temperatures(hb) {
+                    Ok(t) => temperatures.extend(t),
+                    Err(error) => {
+                        debug!(board = hb.index, error = %error, "TMP75 temperature read failed");
+                    }
                 }
             }
         }
 
-        // Overtemp protection: if any PIC sensor exceeds the cutoff,
-        // immediately disable DC-DC (cuts chip power but keeps PIC alive)
-        // and PSU output, then cancel telemetry so the daemon notices and
-        // shuts the board down.
-        //
-        // Stock Bitmain firmware uses ~95 °C for hard shutdown and ~85 °C
-        // for throttling on this chip family. We use 75 °C as a
-        // conservative fixed cutoff: this code path is exercised on the
-        // bench (limited cooling) much more than in chassis, and the
-        // failure mode of running a hashboard hot is severe (the original
-        // BHB56902 we used to bring this up arced its 12 V input plane).
-        // A configurable threshold is the right long-term answer; left as
-        // future work to keep this PR focused.
-        const OVERTEMP_CUTOFF_C: f32 = 75.0;
+        // Overtemp gate: ANY sensor on ANY hashboard above cutoff
+        // kills DC-DC on every PIC + cuts the shared PSU output.
         let hottest = temperatures
             .iter()
             .filter_map(|t| t.temperature_c)
             .fold(0f32, f32::max);
         if hottest >= OVERTEMP_CUTOFF_C {
             error!(
-                board = %hashboard.index,
                 hottest = hottest,
                 cutoff = OVERTEMP_CUTOFF_C,
-                "OVERTEMP — disabling PIC DC-DC and PSU output"
+                "OVERTEMP — disabling all PIC DC-DC outputs and PSU output"
             );
-            if let Some(ref mut pic) = pic_for_heartbeat {
-                let _ = pic.disable_dc_dc();
+            for (_, _, pic_opt) in pics.iter_mut() {
+                if let Some(pic) = pic_opt.as_mut() {
+                    let _ = pic.disable_dc_dc();
+                }
             }
             let _ = psu.lock().await.set_enabled(false);
             shutdown.cancel();
@@ -1513,11 +1562,11 @@ async fn create_amlogic_board()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let (selected_hashboard, board_serial, psu) = S19kProAmlogic::initialize(&config, &state_tx)
+    let (selected_hashboards, psu) = S19kProAmlogic::initialize(&config, &state_tx)
         .await
         .map_err(|e| Error::Hardware(format!("Failed to initialize native Amlogic board: {e}")))?;
 
-    let board = S19kProAmlogic::new(config, selected_hashboard, board_serial, psu, state_tx);
+    let board = S19kProAmlogic::new(config, selected_hashboards, psu, state_tx);
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
 }

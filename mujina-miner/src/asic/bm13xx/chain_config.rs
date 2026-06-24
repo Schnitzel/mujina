@@ -95,6 +95,69 @@ pub struct ChainPeripherals {
     /// switch to a higher rate after sending the chip-side
     /// [`UartBaud`](super::protocol::Register::UartBaud) broadcast.
     pub chip_uart_baud: Option<Arc<Mutex<dyn ChipUartBaudControl + Send>>>,
+
+    /// Optional cross-chain ramp coordinator. When multiple chains
+    /// share a single voltage rail (e.g. all three hashboards on an
+    /// S19k Pro share the APW12), independent per-actor voltage
+    /// commands would race on the shared mutex and cause the rail to
+    /// oscillate between chains' step values. Setting this on every
+    /// chain in the cohort makes them rendezvous at each ramp step
+    /// and elect one leader per step to drive the shared PSU.
+    /// `None` keeps the legacy single-chain behaviour where each
+    /// actor commands its own voltage every step.
+    pub ramp_coordinator: Option<Arc<ChainCoordinator>>,
+}
+
+/// Cross-chain coordinator for shared-rail boards.
+///
+/// All chains in the cohort call [`ChainCoordinator::sync_voltage_step`]
+/// at the top of every frequency-ramp step. The call rendezvous on a
+/// barrier (so the slowest chain holds the rest), the elected leader
+/// drives the shared voltage regulator on behalf of everyone, and all
+/// chains then wait the same `voltage_settle` before returning. After
+/// the call returns each chain sends its per-chain PLL command at the
+/// same effective voltage.
+pub struct ChainCoordinator {
+    barrier: tokio::sync::Barrier,
+}
+
+impl ChainCoordinator {
+    /// Create a coordinator for a cohort of `chain_count` chains.
+    pub fn new(chain_count: usize) -> Self {
+        Self {
+            barrier: tokio::sync::Barrier::new(chain_count),
+        }
+    }
+
+    /// Rendezvous all chains at this step, command the shared voltage
+    /// from the elected leader, then settle.
+    ///
+    /// `voltage_v`/`voltage_settle` are computed identically by every
+    /// chain (same step index, same chip target, same domain count),
+    /// so it's safe for only the leader to actually drive the rail.
+    /// Returns the wait result so callers can short-circuit logging
+    /// if only the leader should log.
+    pub async fn sync_voltage_step(
+        &self,
+        regulator: &Arc<Mutex<dyn VoltageRegulator + Send>>,
+        voltage_v: f32,
+        voltage_settle: std::time::Duration,
+    ) -> Result<bool, anyhow::Error> {
+        let result = self.barrier.wait().await;
+        let is_leader = result.is_leader();
+        if is_leader {
+            regulator
+                .lock()
+                .await
+                .set_voltage(voltage_v)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("ramp-coord leader set_voltage({voltage_v}V): {e}")
+                })?;
+        }
+        tokio::time::sleep(voltage_settle).await;
+        Ok(is_leader)
+    }
 }
 
 /// Boxed type for the chip → controller response stream.
@@ -193,6 +256,7 @@ mod tests {
             asic_enable: enable,
             voltage_regulator: None,
             chip_uart_baud: None,
+            ramp_coordinator: None,
         };
 
         // Hash thread enables
