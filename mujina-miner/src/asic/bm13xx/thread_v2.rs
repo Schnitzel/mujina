@@ -521,8 +521,27 @@ impl BM13xxActor {
                 new_task,
                 response_tx,
             } => {
-                let result = self.handle_work_assignment(new_task).await;
-                let _ = response_tx.send(result);
+                // ACK before running the (potentially slow) work
+                // assignment. Cold init + frequency ramp can take ~2
+                // minutes; the scheduler dispatches UpdateTask to each
+                // thread sequentially with `.await`, so without this
+                // early ACK chain 0's init blocks chains 1/2 from ever
+                // starting theirs — which deadlocks the lockstep ramp
+                // coordinator when multiple chains share an APW12.
+                //
+                // The Ok payload is the previous task (used for
+                // bookkeeping). On a chain that's mid-init there isn't
+                // a meaningful "previous" to return; the scheduler in
+                // `process_template_event` already discards the
+                // `Some(old)` value, so returning the cached
+                // `current_task` here is safe. Errors from
+                // `handle_work_assignment` are still logged below so
+                // cold-init failures don't get silently swallowed.
+                let old = self.current_task.clone();
+                let _ = response_tx.send(Ok(old));
+                if let Err(e) = self.handle_work_assignment(new_task).await {
+                    error!(error = %e, "Work assignment failed");
+                }
             }
             ThreadCommand::GoIdle { response_tx } => {
                 let result = self.handle_go_idle().await;
@@ -969,24 +988,33 @@ impl BM13xxActor {
             }
 
             if let Some(ref regulator) = self.peripherals.voltage_regulator {
-                regulator
-                    .lock()
-                    .await
-                    .set_voltage(
-                        applied_voltage.expect("applied voltage is present when regulator exists"),
-                    )
-                    .await
-                    .map_err(|e| {
+                let v = applied_voltage
+                    .expect("applied voltage is present when regulator exists");
+                if let Some(coord) = self.peripherals.ramp_coordinator.as_ref() {
+                    // Shared-rail board (e.g. 3 hashboards on one APW12).
+                    // Barrier on every step + leader-elected voltage write
+                    // so the rail doesn't oscillate between chains'
+                    // independently-commanded step values. All chains
+                    // compute the same `v` from `step_index` so it's safe
+                    // for only the leader to drive the regulator.
+                    coord
+                        .sync_voltage_step(regulator, v, VOLTAGE_SETTLE_DELAY)
+                        .await
+                        .map_err(|e| {
+                            HashThreadError::InitializationFailed(format!(
+                                "Ramp coordinator failed at step {step_index} (v={v:.2}V): {e}"
+                            ))
+                        })?;
+                } else {
+                    // Single-chain path: each actor drives its own
+                    // dedicated regulator independently.
+                    regulator.lock().await.set_voltage(v).await.map_err(|e| {
                         HashThreadError::InitializationFailed(format!(
-                            "Failed to set voltage to {:.2}V: {}",
-                            applied_voltage
-                                .expect("applied voltage is present when regulator exists"),
-                            e
+                            "Failed to set voltage to {v:.2}V: {e}"
                         ))
                     })?;
-
-                // Brief settle time for voltage regulator
-                time::sleep(VOLTAGE_SETTLE_DELAY).await;
+                    time::sleep(VOLTAGE_SETTLE_DELAY).await;
+                }
             }
 
             // 2. Set frequency
@@ -1473,6 +1501,7 @@ mod tests {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
                 chip_uart_baud: None,
+                ramp_coordinator: None,
             },
             post_broadcast_chip_baud: None,
         }
@@ -1514,6 +1543,7 @@ mod tests {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
                 chip_uart_baud: None,
+                ramp_coordinator: None,
             },
             post_broadcast_chip_baud: None,
             chain,

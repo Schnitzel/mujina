@@ -269,6 +269,7 @@ impl Board for S19jProBitcrane {
                 asic_enable: Arc::new(Mutex::new(S19jProBitcraneAsicEnable { reset_pin })),
                 voltage_regulator,
                 chip_uart_baud: None,
+                ramp_coordinator: None,
             },
             post_broadcast_chip_baud: None,
         };

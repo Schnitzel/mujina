@@ -384,6 +384,7 @@ impl Board for EmberOne {
                 })),
                 voltage_regulator,
                 chip_uart_baud: None,
+                ramp_coordinator: None,
             },
             post_broadcast_chip_baud: None,
         };

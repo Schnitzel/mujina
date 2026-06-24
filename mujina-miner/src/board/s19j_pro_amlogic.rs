@@ -228,6 +228,7 @@ impl Board for S19jProAmlogic {
                     Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
                 ),
                 chip_uart_baud: None,
+                ramp_coordinator: None,
             },
             post_broadcast_chip_baud: None,
         };
