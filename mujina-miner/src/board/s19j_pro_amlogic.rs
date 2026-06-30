@@ -512,6 +512,12 @@ impl HashThread for BoardStateHashThread {
         result
     }
 
+    async fn set_frequency(&mut self, mhz: f32) -> Result<(), HashThreadError> {
+        // Pure forward — runtime re-ramp is PLL-only at fixed voltage, so the
+        // board wrapper has nothing to coordinate (unlike pause / the PSU).
+        self.inner.set_frequency(mhz).await
+    }
+
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
         // See `s19k_pro_amlogic.rs::BoardStateHashThread::set_paused`
         // for the longer rationale — same hard-pause approach: zero

@@ -278,6 +278,19 @@ pub trait HashThread: Send {
         Ok(())
     }
 
+    /// Runtime chip-frequency change in MHz — the V1 power dial.
+    ///
+    /// Re-ramps the chain's PLL from its current frequency to `mhz` at the
+    /// existing voltage (the implementation clamps to a safe range). Lowering
+    /// frequency lowers power; this is how an external controller dials the
+    /// miner's draw without stopping it.
+    ///
+    /// Default impl is a no-op for backends without frequency control (e.g.
+    /// the CPU miner), so they ignore the dial rather than erroring.
+    async fn set_frequency(&mut self, _mhz: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
     /// Permanently shut down the thread, releasing hardware resources.
     ///
     /// This compensates for Rust's lack of async Drop. Callers must invoke

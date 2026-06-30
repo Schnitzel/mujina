@@ -13,6 +13,13 @@ pub enum SchedulerCommand {
 
     /// Resume job distribution after a pause.
     ResumeMining { reply: oneshot::Sender<Result<()>> },
+
+    /// Set the chip frequency (MHz) on every chain — the V1 power dial.
+    /// Each thread clamps to its safe runtime range and re-ramps its PLL.
+    SetFrequency {
+        mhz: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Commands from the API to board management.

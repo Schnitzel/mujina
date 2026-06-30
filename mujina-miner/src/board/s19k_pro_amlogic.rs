@@ -680,6 +680,13 @@ impl HashThread for BoardStateHashThread {
         result
     }
 
+    async fn set_frequency(&mut self, mhz: f32) -> Result<(), HashThreadError> {
+        // Pure forward — the runtime re-ramp is PLL-only at fixed voltage,
+        // so the board wrapper has nothing to coordinate (unlike pause, which
+        // also cycles the PSU rail).
+        self.inner.set_frequency(mhz).await
+    }
+
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
         // Hard pause: drop the chip power rail. The chain comes back
         // cold-booted on resume, which is the same path `start_async`

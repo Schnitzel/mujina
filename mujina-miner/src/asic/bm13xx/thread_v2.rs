@@ -151,6 +151,8 @@ impl BM13xxThread {
                 chip_state: ChipState::Disabled,
                 current_task: None,
                 chip_jobs: ChipJobs::new(),
+                current_freq_mhz: 0.0,
+                max_runtime_freq_mhz: 0.0,
             };
             actor.run().await;
         });
@@ -249,6 +251,18 @@ impl HashThread for BM13xxThread {
         Ok(())
     }
 
+    async fn set_frequency(&mut self, mhz: f32) -> Result<(), HashThreadError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::SetFrequency {
+                target_mhz: mhz,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ThreadOffline)?;
+        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+    }
+
     async fn shutdown(&mut self) -> Result<(), HashThreadError> {
         // Disable chips via go_idle - this awaits the actor's response,
         // ensuring GPIO writes complete before we return.
@@ -329,6 +343,15 @@ struct BM13xxActor {
     current_task: Option<HashTask>,
     /// Maps chip job IDs to tasks for nonce correlation.
     chip_jobs: ChipJobs,
+    /// Frequency (MHz) the chips were last ramped to. Set after the cold-init
+    /// ramp and updated by runtime `SetFrequency`. Used as the *start* point
+    /// of a runtime re-ramp so we step smoothly from where we are rather than
+    /// from the 56.25 MHz cold start. `0.0` until the first cold init.
+    current_freq_mhz: f32,
+    /// Upper bound for runtime frequency changes — the cold-init target. V1
+    /// only down-clocks from here (raising above would need more voltage than
+    /// the fixed cold-init setpoint provides). `0.0` until the first cold init.
+    max_runtime_freq_mhz: f32,
 }
 
 /// Commands sent from the facade ([`BM13xxThread`]) to the actor.
@@ -351,6 +374,13 @@ enum ThreadCommand {
     SetPaused {
         paused: bool,
         response_tx: oneshot::Sender<()>,
+    },
+    /// Runtime frequency change (the V1 power dial). Re-ramps the chain's PLL
+    /// from the current frequency to `target_mhz` at the existing voltage,
+    /// clamped to `[MIN_RUNTIME_FREQ_MHZ, max_runtime_freq_mhz]`.
+    SetFrequency {
+        target_mhz: f32,
+        response_tx: oneshot::Sender<Result<(), HashThreadError>>,
     },
 }
 
@@ -643,6 +673,13 @@ impl BM13xxActor {
                 }
                 let _ = response_tx.send(());
             }
+            ThreadCommand::SetFrequency {
+                target_mhz,
+                response_tx,
+            } => {
+                let result = self.handle_set_frequency(target_mhz).await;
+                let _ = response_tx.send(result);
+            }
         }
     }
 
@@ -824,6 +861,11 @@ impl BM13xxActor {
             .unwrap_or(500.0);
         self.execute_frequency_ramp(protocol::Frequency::from_mhz(target_mhz))
             .await?;
+        // Record where the cold ramp landed so a runtime SetFrequency can
+        // step smoothly from here, and bound runtime changes to this target
+        // (V1 only down-clocks from the cold-init point).
+        self.current_freq_mhz = target_mhz;
+        self.max_runtime_freq_mhz = target_mhz;
 
         self.chip_state = ChipState::Initialized;
         let status = self.update_status(|status| {
@@ -1165,6 +1207,80 @@ impl BM13xxActor {
             info!(target_mhz = target.mhz(), "Frequency ramp complete");
         }
 
+        Ok(())
+    }
+
+    /// Handle a runtime `SetFrequency` command: validate state, clamp to the
+    /// safe runtime range, and re-ramp.
+    async fn handle_set_frequency(&mut self, target_mhz: f32) -> Result<(), HashThreadError> {
+        /// Lower bound for runtime down-clocking (MHz). Below this the chain
+        /// comms get unreliable on BHB56902; refine empirically.
+        const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
+
+        if !matches!(self.chip_state, ChipState::Initialized) {
+            return Err(HashThreadError::InitializationFailed(
+                "set_frequency: chips not initialized".into(),
+            ));
+        }
+        if self.max_runtime_freq_mhz <= 0.0 {
+            return Err(HashThreadError::InitializationFailed(
+                "set_frequency: no cold-init target recorded".into(),
+            ));
+        }
+        let clamped = target_mhz.clamp(MIN_RUNTIME_FREQ_MHZ, self.max_runtime_freq_mhz);
+        if (clamped - target_mhz).abs() > f32::EPSILON {
+            warn!(
+                requested_mhz = target_mhz,
+                clamped_mhz = clamped,
+                min = MIN_RUNTIME_FREQ_MHZ,
+                max = self.max_runtime_freq_mhz,
+                "set_frequency request clamped to safe range"
+            );
+        }
+        self.execute_frequency_change(protocol::Frequency::from_mhz(clamped))
+            .await
+    }
+
+    /// Runtime frequency change: step the PLL from the current frequency to
+    /// `target` with **no voltage change**. Safe because voltage stays at the
+    /// cold-init setpoint and we only move within `[MIN, cold-init target]` —
+    /// a range the cold ramp already validated at this voltage. Verifies the
+    /// chain afterwards and records the new frequency.
+    async fn execute_frequency_change(
+        &mut self,
+        target: protocol::Frequency,
+    ) -> Result<(), HashThreadError> {
+        let start = protocol::Frequency::from_mhz(self.current_freq_mhz);
+        let steps = self.sequencer.build_frequency_ramp_between(start, target);
+        if steps.is_empty() {
+            return Ok(());
+        }
+        info!(
+            from_mhz = self.current_freq_mhz,
+            target_mhz = target.mhz(),
+            steps = steps.len(),
+            "Runtime frequency change (PLL only, fixed voltage)"
+        );
+        for (freq, step) in steps.iter() {
+            self.chip_tx.send(step.command.clone()).await.map_err(|e| {
+                HashThreadError::InitializationFailed(format!(
+                    "frequency change send failed: {e:?}"
+                ))
+            })?;
+            if let Some(delay) = step.wait_after {
+                time::sleep(delay).await;
+            }
+            self.current_freq_mhz = freq.mhz();
+        }
+        // Deliberately NO post-ramp `verify_chain()` here. The cold-init ramp
+        // verifies, but at runtime a broadcast read right after a PLL change
+        // hits the decoder-desync problem `verify_chain` documents (the first
+        // passes spuriously report chips missing), and the 3-pass poll across
+        // 77 chips × 3 chains blocks the scheduler for >100 s. A down-clock is
+        // gentler than cold init; if a chain did drop, its per-board hashrate
+        // falls to ~0 and surfaces that way.
+        self.current_freq_mhz = target.mhz();
+        info!(target_mhz = target.mhz(), "Runtime frequency change complete");
         Ok(())
     }
 
@@ -1774,6 +1890,8 @@ mod tests {
             chip_state: ChipState::Disabled,
             current_task: None,
             chip_jobs: ChipJobs::new(),
+            current_freq_mhz: 0.0,
+            max_runtime_freq_mhz: 0.0,
         }
     }
 

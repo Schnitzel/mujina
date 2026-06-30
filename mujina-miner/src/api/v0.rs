@@ -93,6 +93,20 @@ async fn patch_miner(
         };
     }
 
+    if let Some(mhz) = req.target_freq_mhz {
+        let (tx, rx) = oneshot::channel();
+        state
+            .scheduler_cmd_tx
+            .send(SchedulerCommand::SetFrequency { mhz, reply: tx })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // A per-chain re-ramp at fixed voltage is fast (~seconds even across a
+        // few-hundred-MHz move), but allow generous slack for verify retries.
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(120), rx).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+    }
+
     Ok(Json(state.miner_state()))
 }
 

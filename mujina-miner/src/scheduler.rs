@@ -833,6 +833,28 @@ impl Scheduler {
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(Ok(()));
             }
+            SchedulerCommand::SetFrequency { mhz, reply } => {
+                info!(
+                    mhz,
+                    thread_count = self.threads.len(),
+                    "Setting chip frequency on all chains (power dial)"
+                );
+                // Per-chain re-ramp at fixed voltage. Each thread clamps to
+                // its own safe range. Collect the last error (if any) so the
+                // HTTP caller learns it didn't fully apply.
+                let mut last_err: Option<String> = None;
+                for (id, entry) in self.threads.iter_mut() {
+                    if let Err(e) = entry.thread.set_frequency(mhz).await {
+                        warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_frequency failed");
+                        last_err = Some(e.to_string());
+                    }
+                }
+                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = reply.send(match last_err {
+                    Some(e) => Err(anyhow::anyhow!(e)),
+                    None => Ok(()),
+                });
+            }
         }
     }
 

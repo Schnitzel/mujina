@@ -259,6 +259,65 @@ impl Sequencer {
         steps
     }
 
+    /// Build a frequency ramp from an arbitrary *current* frequency to a
+    /// target, stepping ±6.25 MHz. Used for **runtime** frequency changes:
+    /// `build_frequency_ramp` always starts from the 56.25 MHz cold-init PLL,
+    /// but at runtime the chips are already at their operating frequency, so
+    /// we step smoothly from where we are (up or down).
+    ///
+    /// Steps are broadcast `PllDivider` writes, identical in shape to the cold
+    /// ramp. The target is clamped to the chip's max frequency. Returns a
+    /// single exact-target step if start and target are within half a step.
+    pub fn build_frequency_ramp_between(
+        &self,
+        start: Frequency,
+        target: Frequency,
+    ) -> Vec<(Frequency, Step)> {
+        const STEP_MHZ: f32 = 6.25;
+        const STEP_DELAY: Duration = Duration::from_millis(100);
+
+        let start_mhz = start.mhz();
+        let target_mhz = target.mhz().min(self.chip_config.max_freq.mhz());
+
+        let pll_step = |mhz: f32| {
+            let f = Frequency::from_mhz(mhz);
+            let pll = self.chip_config.calculate_pll(f);
+            (
+                f,
+                Step::with_delay(
+                    Command::WriteRegister {
+                        broadcast: true,
+                        chip_address: 0x00,
+                        register: Register::PllDivider(pll),
+                    },
+                    STEP_DELAY,
+                ),
+            )
+        };
+
+        // Already there (within half a step): emit the exact target once.
+        if (target_mhz - start_mhz).abs() < STEP_MHZ / 2.0 {
+            return vec![pll_step(target_mhz)];
+        }
+
+        let going_up = target_mhz > start_mhz;
+        let mut steps = vec![];
+        let mut cur = start_mhz;
+        loop {
+            cur = if going_up { cur + STEP_MHZ } else { cur - STEP_MHZ };
+            let reached = if going_up {
+                cur >= target_mhz
+            } else {
+                cur <= target_mhz
+            };
+            steps.push(pll_step(if reached { target_mhz } else { cur }));
+            if reached {
+                break;
+            }
+        }
+        steps
+    }
+
     // --- Default sequence implementations ---
 
     fn default_enumeration(&self, chain: &Chain) -> Vec<Step> {
