@@ -195,6 +195,43 @@ struct Scheduler {
 /// Factory cold-init chain voltage (V) — the rail's value after any cold init.
 const COLD_INIT_VOLTAGE_V: f32 = 13.9;
 
+/// Upper bound on how long a single thread's `set_frequency`/`set_voltage` may
+/// take before the scheduler gives up on it. A full-range PLL re-ramp is ~8 s
+/// per chain, so 30 s is generous headroom. The guard exists so a wedged chip
+/// bus (a chain that stops accepting UART mid-ramp and never replies) can never
+/// hang the scheduler — and therefore the whole HTTP/control plane — forever.
+/// On timeout we log, surface it as a per-op error, and move on; the stuck
+/// chain shows up as ~0 board hashrate rather than freezing every surface.
+const THREAD_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fold the outcome of a [`THREAD_OP_TIMEOUT`]-wrapped thread op into
+/// `last_err`, logging failures and timeouts uniformly. A timeout means the
+/// chain stopped replying (most likely a wedged chip bus mid-ramp); we record
+/// it and let the scheduler keep serving every other command and surface.
+fn guard_thread_op<K: std::fmt::Debug, E: std::fmt::Display>(
+    outcome: Result<Result<(), E>, tokio::time::error::Elapsed>,
+    id: K,
+    op: &str,
+    last_err: &mut Option<String>,
+) {
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(thread_id = ?id, op, error = %e, "thread op failed");
+            *last_err = Some(e.to_string());
+        }
+        Err(_) => {
+            warn!(
+                thread_id = ?id,
+                op,
+                timeout_s = THREAD_OP_TIMEOUT.as_secs(),
+                "thread op timed out — chain unresponsive, skipping"
+            );
+            *last_err = Some(format!("{op} timed out"));
+        }
+    }
+}
+
 impl Scheduler {
     fn new() -> Self {
         Self {
@@ -857,10 +894,10 @@ impl Scheduler {
                 // HTTP caller learns it didn't fully apply.
                 let mut last_err: Option<String> = None;
                 for (id, entry) in self.threads.iter_mut() {
-                    if let Err(e) = entry.thread.set_frequency(mhz).await {
-                        warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_frequency failed");
-                        last_err = Some(e.to_string());
-                    }
+                    guard_thread_op(
+                        tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                        id, "set_frequency", &mut last_err,
+                    );
                 }
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(match last_err {
@@ -887,29 +924,29 @@ impl Scheduler {
                 let mut last_err: Option<String> = None;
                 if lowering_voltage {
                     for (id, entry) in self.threads.iter_mut() {
-                        if let Err(e) = entry.thread.set_frequency(mhz).await {
-                            warn!(thread_id = ?id, error = %e, "set_frequency failed");
-                            last_err = Some(e.to_string());
-                        }
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                            id, "set_frequency", &mut last_err,
+                        );
                     }
                     for (id, entry) in self.threads.iter_mut() {
-                        if let Err(e) = entry.thread.set_voltage(volts).await {
-                            warn!(thread_id = ?id, error = %e, "set_voltage failed");
-                            last_err = Some(e.to_string());
-                        }
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_voltage(volts)).await,
+                            id, "set_voltage", &mut last_err,
+                        );
                     }
                 } else {
                     for (id, entry) in self.threads.iter_mut() {
-                        if let Err(e) = entry.thread.set_voltage(volts).await {
-                            warn!(thread_id = ?id, error = %e, "set_voltage failed");
-                            last_err = Some(e.to_string());
-                        }
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_voltage(volts)).await,
+                            id, "set_voltage", &mut last_err,
+                        );
                     }
                     for (id, entry) in self.threads.iter_mut() {
-                        if let Err(e) = entry.thread.set_frequency(mhz).await {
-                            warn!(thread_id = ?id, error = %e, "set_frequency failed");
-                            last_err = Some(e.to_string());
-                        }
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                            id, "set_frequency", &mut last_err,
+                        );
                     }
                 }
                 self.current_voltage_v = volts;
