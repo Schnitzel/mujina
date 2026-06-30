@@ -519,6 +519,10 @@ impl HashThread for BoardStateHashThread {
         self.inner.set_frequency(mhz).await
     }
 
+    async fn set_voltage(&mut self, volts: f32) -> Result<(), HashThreadError> {
+        self.inner.set_voltage(volts).await
+    }
+
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
         // See `s19k_pro_amlogic.rs::BoardStateHashThread::set_paused`
         // for the longer rationale — same hard-pause approach: zero

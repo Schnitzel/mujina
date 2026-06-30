@@ -185,7 +185,15 @@ struct Scheduler {
 
     /// Mining paused
     paused: bool,
+
+    /// Last commanded chain voltage (V), tracked so `SetOperatingPoint` can
+    /// pick the safe V/f ordering. Seeded to the factory cold-init setpoint and
+    /// reset there on resume (a cold-init returns the rail to factory voltage).
+    current_voltage_v: f32,
 }
+
+/// Factory cold-init chain voltage (V) — the rail's value after any cold init.
+const COLD_INIT_VOLTAGE_V: f32 = 13.9;
 
 impl Scheduler {
     fn new() -> Self {
@@ -196,6 +204,7 @@ impl Scheduler {
             stats: MiningStats::default(),
             last_thread_count: 0,
             paused: false,
+            current_voltage_v: COLD_INIT_VOLTAGE_V,
         }
     }
 
@@ -795,6 +804,10 @@ impl Scheduler {
             SchedulerCommand::ResumeMining { reply } => {
                 if self.paused {
                     self.paused = false;
+                    // A resume cold-inits the chains, returning the rail to the
+                    // factory voltage — re-seed the tracker so the next
+                    // SetOperatingPoint picks the right V/f ordering.
+                    self.current_voltage_v = COLD_INIT_VOLTAGE_V;
                     info!(
                         thread_count = self.threads.len(),
                         "Mining resumed — re-dispatching cached jobs"
@@ -849,6 +862,57 @@ impl Scheduler {
                         last_err = Some(e.to_string());
                     }
                 }
+                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = reply.send(match last_err {
+                    Some(e) => Err(anyhow::anyhow!(e)),
+                    None => Ok(()),
+                });
+            }
+            SchedulerCommand::SetOperatingPoint { mhz, volts, reply } => {
+                let lowering_voltage = volts < self.current_voltage_v;
+                info!(
+                    mhz,
+                    volts,
+                    from_volts = self.current_voltage_v,
+                    lowering_voltage,
+                    "Setting operating point (V/f) on all chains"
+                );
+
+                // V/f safety ordering. Frequency is per-chain; the voltage rail
+                // is shared, so setting it on any one chain moves the whole
+                // board (the rest are no-ops). The two sequential loops give
+                // the ordering: never a high frequency at a low voltage.
+                //   - lowering power: ALL chains drop frequency, THEN voltage.
+                //   - raising power:  voltage up, THEN ALL chains raise freq.
+                let mut last_err: Option<String> = None;
+                if lowering_voltage {
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_frequency(mhz).await {
+                            warn!(thread_id = ?id, error = %e, "set_frequency failed");
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_voltage(volts).await {
+                            warn!(thread_id = ?id, error = %e, "set_voltage failed");
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                } else {
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_voltage(volts).await {
+                            warn!(thread_id = ?id, error = %e, "set_voltage failed");
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_frequency(mhz).await {
+                            warn!(thread_id = ?id, error = %e, "set_frequency failed");
+                            last_err = Some(e.to_string());
+                        }
+                    }
+                }
+                self.current_voltage_v = volts;
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(match last_err {
                     Some(e) => Err(anyhow::anyhow!(e)),

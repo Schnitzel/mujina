@@ -93,7 +93,22 @@ async fn patch_miner(
         };
     }
 
-    if let Some(mhz) = req.target_freq_mhz {
+    if let Some(volts) = req.target_voltage_v {
+        // Operating-point change (M1.5): voltage + frequency, applied in the
+        // V/f-safe order by the scheduler. Frequency is required alongside it.
+        let Some(mhz) = req.target_freq_mhz else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        let (tx, rx) = oneshot::channel();
+        state
+            .scheduler_cmd_tx
+            .send(SchedulerCommand::SetOperatingPoint { mhz, volts, reply: tx })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(120), rx).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+    } else if let Some(mhz) = req.target_freq_mhz {
         let (tx, rx) = oneshot::channel();
         state
             .scheduler_cmd_tx

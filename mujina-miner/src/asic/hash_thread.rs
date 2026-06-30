@@ -291,6 +291,13 @@ pub trait HashThread: Send {
         Ok(())
     }
 
+    /// Runtime chain-voltage change in volts (M1.5). Sets the shared voltage
+    /// rail. The caller (scheduler) sequences this relative to `set_frequency`
+    /// for V/f safety. Default no-op for backends without a regulator.
+    async fn set_voltage(&mut self, _volts: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
     /// Permanently shut down the thread, releasing hardware resources.
     ///
     /// This compensates for Rust's lack of async Drop. Callers must invoke

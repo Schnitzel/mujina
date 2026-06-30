@@ -706,6 +706,12 @@ impl HashThread for BoardStateHashThread {
         self.inner.set_frequency(mhz).await
     }
 
+    async fn set_voltage(&mut self, volts: f32) -> Result<(), HashThreadError> {
+        // Pure forward — the rail is shared, so the inner actor sets the one
+        // APW12; the scheduler orders this relative to set_frequency.
+        self.inner.set_voltage(volts).await
+    }
+
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
         // Hard pause: drop the chip power rail. The chain comes back
         // cold-booted on resume, which is the same path `start_async`
@@ -989,7 +995,10 @@ impl Drop for NativeAmlogicPsu {
 #[async_trait]
 impl VoltageRegulator for NativeAmlogicPsu {
     async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()> {
-        let clamped = volts.clamp(12.0, 15.0);
+        // 11.7 V floor lets the runtime voltage bands (M1.5) reach the APW12's
+        // hardware minimum (~11.78 V, DAC=255). Cold-init voltages clamp higher
+        // upstream (voltage_range), so this only widens the *runtime* range.
+        let clamped = volts.clamp(11.7, 15.0);
         let dac = encode_voltage_to_dac(clamped);
 
         // The APW12 firmware on this control board (`get-fw` reports

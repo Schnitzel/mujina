@@ -51,6 +51,13 @@ const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
 /// avoids churning the chains on tiny thermal/dial deltas.
 const FREQ_APPLY_EPS_MHZ: f32 = 3.0;
 
+/// Runtime voltage band limits (V). Floor ≈ the APW12 hardware minimum
+/// (~11.78 V, DAC=255); ceiling is the factory operating max. The chip-safety
+/// ordering (lower frequency before lowering voltage, raise voltage before
+/// raising frequency) is enforced by the scheduler — see SetOperatingPoint.
+const RUNTIME_V_MIN: f32 = 11.8;
+const RUNTIME_V_MAX: f32 = 14.5;
+
 /// Minimum chip count required for initialization to succeed.
 ///
 /// Returns the minimum number of responding chips given an expected count.
@@ -273,6 +280,18 @@ impl HashThread for BM13xxThread {
         rx.await.map_err(|_| HashThreadError::ThreadOffline)?
     }
 
+    async fn set_voltage(&mut self, volts: f32) -> Result<(), HashThreadError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::SetVoltage {
+                volts,
+                response_tx: tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ThreadOffline)?;
+        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+    }
+
     async fn shutdown(&mut self) -> Result<(), HashThreadError> {
         // Disable chips via go_idle - this awaits the actor's response,
         // ensuring GPIO writes complete before we return.
@@ -395,6 +414,13 @@ enum ThreadCommand {
     /// clamped to `[MIN_RUNTIME_FREQ_MHZ, max_runtime_freq_mhz]`.
     SetFrequency {
         target_mhz: f32,
+        response_tx: oneshot::Sender<Result<(), HashThreadError>>,
+    },
+    /// Runtime voltage change (M1.5). Sets the shared chain-voltage rail,
+    /// clamped to `[RUNTIME_V_MIN, RUNTIME_V_MAX]`. The scheduler sequences this
+    /// relative to frequency for V/f safety; the actor just applies it.
+    SetVoltage {
+        volts: f32,
         response_tx: oneshot::Sender<Result<(), HashThreadError>>,
     },
 }
@@ -701,7 +727,34 @@ impl BM13xxActor {
                 let result = self.handle_set_frequency(target_mhz).await;
                 let _ = response_tx.send(result);
             }
+            ThreadCommand::SetVoltage { volts, response_tx } => {
+                let result = self.handle_set_voltage(volts).await;
+                let _ = response_tx.send(result);
+            }
         }
+    }
+
+    /// Set the shared chain-voltage rail (M1.5). Clamped to the runtime band
+    /// range. No frequency interaction here — the scheduler guarantees the safe
+    /// V/f ordering around this call.
+    async fn handle_set_voltage(&mut self, volts: f32) -> Result<(), HashThreadError> {
+        let Some(regulator) = self.peripherals.voltage_regulator.as_ref() else {
+            // No regulator on this chain (e.g. noRegulator variant) — nothing
+            // to do; treat as success so the scheduler loop continues.
+            return Ok(());
+        };
+        let clamped = volts.clamp(RUNTIME_V_MIN, RUNTIME_V_MAX);
+        regulator
+            .lock()
+            .await
+            .set_voltage(clamped)
+            .await
+            .map_err(|e| {
+                HashThreadError::InitializationFailed(format!("set_voltage({clamped:.2}V): {e}"))
+            })?;
+        time::sleep(VOLTAGE_SETTLE_DELAY).await;
+        info!(volts = clamped, "Applied chain voltage");
+        Ok(())
     }
 
     async fn handle_work_assignment(
