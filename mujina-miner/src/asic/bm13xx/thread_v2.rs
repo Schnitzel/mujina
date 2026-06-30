@@ -13,6 +13,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +42,14 @@ use crate::{
 /// `status.hashrate`. 5 minutes matches the scheduler-side estimator
 /// so the per-board and the chain-wide hashrate views agree.
 const ACTOR_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Lower bound for runtime down-clocking (MHz). Below this the chain comms get
+/// unreliable on BHB56902; refine empirically. Shared by the runtime dial and
+/// the thermal supervisor.
+const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
+/// Don't re-ramp for an effective-frequency change smaller than this (MHz) —
+/// avoids churning the chains on tiny thermal/dial deltas.
+const FREQ_APPLY_EPS_MHZ: f32 = 3.0;
 
 /// Minimum chip count required for initialization to succeed.
 ///
@@ -153,6 +162,7 @@ impl BM13xxThread {
                 chip_jobs: ChipJobs::new(),
                 current_freq_mhz: 0.0,
                 max_runtime_freq_mhz: 0.0,
+                requested_freq_mhz: 0.0,
             };
             actor.run().await;
         });
@@ -352,6 +362,11 @@ struct BM13xxActor {
     /// only down-clocks from here (raising above would need more voltage than
     /// the fixed cold-init setpoint provides). `0.0` until the first cold init.
     max_runtime_freq_mhz: f32,
+    /// Frequency (MHz) most recently *requested* (by the cold-init target or a
+    /// runtime `SetFrequency`). The *applied* frequency is
+    /// `min(requested, thermal_cap)` — the M4 thermal supervisor can hold the
+    /// chips below this, and they return to it when the board cools.
+    requested_freq_mhz: f32,
 }
 
 /// Commands sent from the facade ([`BM13xxThread`]) to the actor.
@@ -553,6 +568,12 @@ impl BM13xxActor {
                 }
                 _ = ntime_ticker.tick(), if self.current_task.is_some() => {
                     self.roll_ntime().await;
+                    // M4: enforce the thermal cap every second while mining, so
+                    // the board self-throttles (and recovers) without any
+                    // external controller.
+                    if let Err(e) = self.apply_effective_frequency().await {
+                        warn!(error = %e, "thermal frequency enforcement failed");
+                    }
                 }
             }
         }
@@ -866,6 +887,7 @@ impl BM13xxActor {
         // (V1 only down-clocks from the cold-init point).
         self.current_freq_mhz = target_mhz;
         self.max_runtime_freq_mhz = target_mhz;
+        self.requested_freq_mhz = target_mhz;
 
         self.chip_state = ChipState::Initialized;
         let status = self.update_status(|status| {
@@ -1211,12 +1233,9 @@ impl BM13xxActor {
     }
 
     /// Handle a runtime `SetFrequency` command: validate state, clamp to the
-    /// safe runtime range, and re-ramp.
+    /// safe runtime range, record it as the *requested* frequency, and apply
+    /// the effective frequency (which the thermal cap may hold lower).
     async fn handle_set_frequency(&mut self, target_mhz: f32) -> Result<(), HashThreadError> {
-        /// Lower bound for runtime down-clocking (MHz). Below this the chain
-        /// comms get unreliable on BHB56902; refine empirically.
-        const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
-
         if !matches!(self.chip_state, ChipState::Initialized) {
             return Err(HashThreadError::InitializationFailed(
                 "set_frequency: chips not initialized".into(),
@@ -1237,7 +1256,44 @@ impl BM13xxActor {
                 "set_frequency request clamped to safe range"
             );
         }
-        self.execute_frequency_change(protocol::Frequency::from_mhz(clamped))
+        self.requested_freq_mhz = clamped;
+        self.apply_effective_frequency().await
+    }
+
+    /// Current thermal cap (MHz) from the shared M4 supervisor, or +∞ if this
+    /// chain has no cap configured.
+    fn thermal_cap_mhz(&self) -> f32 {
+        self.peripherals
+            .thermal_cap_mhz
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed) as f32)
+            .unwrap_or(f32::INFINITY)
+    }
+
+    /// Re-ramp to the effective frequency = `min(requested, thermal_cap)`,
+    /// clamped to the safe runtime range. Called whenever the request changes
+    /// (`SetFrequency`) and on every mining tick so the M4 thermal supervisor
+    /// can hold the chips below the request when hot and let them recover when
+    /// the board cools. A no-op when the change is below `FREQ_APPLY_EPS_MHZ`.
+    async fn apply_effective_frequency(&mut self) -> Result<(), HashThreadError> {
+        if !matches!(self.chip_state, ChipState::Initialized) || self.requested_freq_mhz <= 0.0 {
+            return Ok(());
+        }
+        let effective = self
+            .requested_freq_mhz
+            .min(self.thermal_cap_mhz())
+            .clamp(MIN_RUNTIME_FREQ_MHZ, self.max_runtime_freq_mhz);
+        if (effective - self.current_freq_mhz).abs() < FREQ_APPLY_EPS_MHZ {
+            return Ok(());
+        }
+        if effective < self.requested_freq_mhz - FREQ_APPLY_EPS_MHZ {
+            warn!(
+                requested_mhz = self.requested_freq_mhz,
+                effective_mhz = effective,
+                "Thermal supervisor holding frequency below request"
+            );
+        }
+        self.execute_frequency_change(protocol::Frequency::from_mhz(effective))
             .await
     }
 
@@ -1839,6 +1895,7 @@ mod tests {
                 voltage_regulator: None,
                 chip_uart_baud: None,
                 ramp_coordinator: None,
+                thermal_cap_mhz: None,
             },
             post_broadcast_chip_baud: None,
         }
@@ -1883,6 +1940,7 @@ mod tests {
                 voltage_regulator: None,
                 chip_uart_baud: None,
                 ramp_coordinator: None,
+                thermal_cap_mhz: None,
             },
             post_broadcast_chip_baud: None,
             chain,
@@ -1892,6 +1950,7 @@ mod tests {
             chip_jobs: ChipJobs::new(),
             current_freq_mhz: 0.0,
             max_runtime_freq_mhz: 0.0,
+            requested_freq_mhz: 0.0,
         }
     }
 

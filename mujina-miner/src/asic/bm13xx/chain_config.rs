@@ -24,6 +24,7 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 use tokio::sync::Mutex;
 
@@ -106,6 +107,14 @@ pub struct ChainPeripherals {
     /// `None` keeps the legacy single-chain behaviour where each
     /// actor commands its own voltage every step.
     pub ramp_coordinator: Option<Arc<ChainCoordinator>>,
+
+    /// Local thermal frequency cap (MHz), written by the board's telemetry
+    /// task and enforced by every actor on its 1 s tick: the effective
+    /// frequency is `min(requested, cap)`. This is the M4 safety supervisor —
+    /// a graduated throttle that reduces frequency as the board heats toward
+    /// the hard cutoff, independent of any external controller. `None` (e.g.
+    /// CPU threads) means no thermal throttle.
+    pub thermal_cap_mhz: Option<Arc<AtomicU32>>,
 }
 
 /// Cross-chain coordinator for shared-rail boards.
@@ -257,6 +266,7 @@ mod tests {
             voltage_regulator: None,
             chip_uart_baud: None,
             ramp_coordinator: None,
+            thermal_cap_mhz: None,
         };
 
         // Hash thread enables

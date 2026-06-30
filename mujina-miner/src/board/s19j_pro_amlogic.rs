@@ -308,6 +308,7 @@ impl Board for S19jProAmlogic {
                 ),
                 chip_uart_baud: None,
                 ramp_coordinator: None,
+                thermal_cap_mhz: None,
             },
             post_broadcast_chip_baud: None,
         };

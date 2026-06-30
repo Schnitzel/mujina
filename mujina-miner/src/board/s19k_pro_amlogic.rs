@@ -7,6 +7,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -397,6 +398,14 @@ impl Board for S19kProAmlogic {
             None
         };
 
+        // M4 thermal supervisor: one frequency cap (MHz) shared by every chain
+        // and the telemetry task. The telemetry task lowers it as the hottest
+        // sensor climbs and raises it as the board cools; each actor enforces
+        // `min(requested, cap)` on its tick. Starts at the operating max
+        // (uncapped). Shared because the chains sit on one rail and one
+        // airflow path — throttling them together is correct.
+        let thermal_cap_mhz = Arc::new(AtomicU32::new(THERMAL_CAP_MAX_MHZ));
+
         let mut threads: Vec<Box<dyn HashThread>> = Vec::with_capacity(n_chains);
         let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
             Vec::with_capacity(n_chains);
@@ -445,6 +454,7 @@ impl Board for S19kProAmlogic {
                     chip_uart_baud: Some(chip_uart_baud
                         as Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>),
                     ramp_coordinator: ramp_coordinator.clone(),
+                    thermal_cap_mhz: Some(Arc::clone(&thermal_cap_mhz)),
                 },
                 // 3.125 Mbaud post-broadcast switch — see commit
                 // history for the chip-side register / numeric-rate
@@ -520,9 +530,18 @@ impl Board for S19kProAmlogic {
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
+        let thermal_cap = Arc::clone(&thermal_cap_mhz);
         tokio::spawn(async move {
-            native_telemetry_task(cfg_clone, hbs_clone, psu, state_tx, thread_states, shutdown)
-                .await;
+            native_telemetry_task(
+                cfg_clone,
+                hbs_clone,
+                psu,
+                state_tx,
+                thread_states,
+                Some(thermal_cap),
+                shutdown,
+            )
+            .await;
         });
 
         Ok(threads)
@@ -1191,12 +1210,30 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
         .collect()
 }
 
+// --- M4 thermal throttle (graduated frequency reduction below the hard cutoff) ---
+/// No throttle: the BM1366 operating max (MHz). The cap never exceeds this.
+const THERMAL_CAP_MAX_MHZ: u32 = 575;
+/// Frequency floor (MHz) the throttle won't go below — if the board is still
+/// too hot here, the 65 °C TMP75 hard cutoff takes over.
+const THERMAL_CAP_MIN_MHZ: u32 = 200;
+/// TMP75 °C at which to begin lowering the cap. The hard cutoff is 65 °C
+/// TMP75 (≈85 °C die); start shedding ~7 °C below it.
+const THERMAL_THROTTLE_START_C: f32 = 58.0;
+/// TMP75 °C at which to slam the cap to the floor (just below the 65 °C cutoff).
+const THERMAL_THROTTLE_HARD_C: f32 = 64.0;
+/// TMP75 °C below which to restore the cap toward max (hysteresis band 54–58).
+const THERMAL_THROTTLE_RELEASE_C: f32 = 54.0;
+/// Cap step per telemetry tick (~2 s): throttle down fast, restore slowly.
+const THERMAL_STEP_DOWN_MHZ: u32 = 25;
+const THERMAL_STEP_UP_MHZ: u32 = 6;
+
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
     hashboards: Vec<AmlogicHashboardConfig>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
+    thermal_cap_mhz: Option<Arc<AtomicU32>>,
     shutdown: CancellationToken,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -1363,6 +1400,50 @@ async fn native_telemetry_task(
         }
 
         let temp_stale = last_temp_at.elapsed() >= TEMP_STALE_AFTER;
+
+        // ----- M4 thermal throttle ------------------------------------
+        // Below the hard cutoff above, step the shared frequency cap down as
+        // the board heats toward it and back up as it cools. Each actor
+        // enforces min(requested, cap) on its 1 s tick, so the board sheds
+        // heat by slowing down — staying alive at lower power instead of
+        // tripping the full DC-DC/PSU cutoff. Runs with no dependency on Nova.
+        if let Some(thermal_cap_mhz) = &thermal_cap_mhz {
+            let cap = thermal_cap_mhz.load(Ordering::Relaxed);
+            let new_cap = if temp_stale {
+                // No temperature signal — be conservative (fans already 100 %).
+                THERMAL_CAP_MIN_MHZ
+            } else if let Some(t) = board_hottest {
+                if t >= THERMAL_THROTTLE_HARD_C {
+                    THERMAL_CAP_MIN_MHZ
+                } else if t >= THERMAL_THROTTLE_START_C {
+                    cap.saturating_sub(THERMAL_STEP_DOWN_MHZ)
+                        .max(THERMAL_CAP_MIN_MHZ)
+                } else if t <= THERMAL_THROTTLE_RELEASE_C {
+                    (cap + THERMAL_STEP_UP_MHZ).min(THERMAL_CAP_MAX_MHZ)
+                } else {
+                    cap // hysteresis band — hold
+                }
+            } else {
+                cap
+            };
+            if new_cap != cap {
+                if new_cap < cap {
+                    warn!(
+                        hottest_c = board_hottest,
+                        cap_mhz = new_cap,
+                        "Thermal throttle: lowering frequency cap"
+                    );
+                } else {
+                    info!(
+                        hottest_c = board_hottest,
+                        cap_mhz = new_cap,
+                        "Thermal throttle: raising frequency cap"
+                    );
+                }
+                thermal_cap_mhz.store(new_cap, Ordering::Relaxed);
+            }
+        }
+
         let target_fan_percent: u8 = if temp_stale {
             warn!(
                 "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
