@@ -475,6 +475,8 @@ impl Board for S19kProAmlogic {
                 name: thread_name.clone(),
                 hashrate: 0,
                 is_active: false,
+                active_chips: 0,
+                expected_chips: 0,
             });
 
             let board_thread = BoardStateHashThread::new(
@@ -626,6 +628,8 @@ impl BoardStateHashThread {
             name: name.clone(),
             hashrate,
             is_active,
+            active_chips: status.active_chips,
+            expected_chips: status.expected_chips,
         };
 
         {

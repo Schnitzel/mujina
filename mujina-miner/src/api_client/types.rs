@@ -71,6 +71,15 @@ pub struct ThreadState {
     /// Hashrate in hashes per second.
     pub hashrate: u64,
     pub is_active: bool,
+    /// Distinct chips that have produced a nonce within the recent census
+    /// window (passive, derived from the nonce stream). Pair with
+    /// `expected_chips` to distinguish "some chips gone silent" from a uniform
+    /// per-chip throughput drop.
+    #[serde(default)]
+    pub active_chips: u16,
+    /// Total chips expected on this chain.
+    #[serde(default)]
+    pub expected_chips: u16,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.

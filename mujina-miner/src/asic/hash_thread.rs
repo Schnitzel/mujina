@@ -72,6 +72,17 @@ pub struct HashThreadStatus {
 
     /// Whether thread is actively working
     pub is_active: bool,
+
+    /// Number of distinct chips that have produced a nonce within the recent
+    /// census window, derived passively from the nonce stream (each nonce
+    /// encodes its origin chip). Lets the API/UI show "chips producing" so a
+    /// degraded chain (some chips gone silent) is distinguishable from a
+    /// uniform per-chip throughput drop. 0 until enough nonces are sampled.
+    pub active_chips: u16,
+
+    /// Total chips expected on this chain (from the chain topology). Pair with
+    /// `active_chips` as "active/expected".
+    pub expected_chips: u16,
 }
 
 /// Events emitted by HashThreads back to the scheduler.

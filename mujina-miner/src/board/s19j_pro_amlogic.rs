@@ -333,6 +333,8 @@ impl Board for S19jProAmlogic {
                 name: thread_name.clone(),
                 hashrate: thread_hashrate,
                 is_active: false,
+                active_chips: 0,
+                expected_chips: 0,
             }];
         });
 
@@ -345,6 +347,8 @@ impl Board for S19jProAmlogic {
                 name: thread_name.clone(),
                 hashrate: thread_hashrate,
                 is_active: false,
+                active_chips: 0,
+                expected_chips: 0,
             }];
         }
 
@@ -440,6 +444,8 @@ impl BoardStateHashThread {
             name: name.clone(),
             hashrate,
             is_active,
+            active_chips: status.active_chips,
+            expected_chips: status.expected_chips,
         };
 
         {
