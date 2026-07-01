@@ -51,6 +51,16 @@ const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
 /// avoids churning the chains on tiny thermal/dial deltas.
 const FREQ_APPLY_EPS_MHZ: f32 = 3.0;
 
+/// After a runtime frequency change of at least this magnitude (MHz), re-assert
+/// the reception-critical broadcast config (Core, TicketMask, AnalogMux,
+/// IoDriverStrength, per-domain UartRelay — no PLL/baud writes). Deep PLL
+/// excursions degrade chip→chip relay timing: the chips keep running at full
+/// power but deliver only a fraction of their nonce frames, and the loss
+/// persists until that config is re-asserted (otherwise only a full cold init
+/// recovers it). The threshold keeps M4's small per-tick thermal nudges from
+/// re-broadcasting on every second.
+const RESYNC_MIN_DELTA_MHZ: f32 = 50.0;
+
 /// Runtime voltage band limits (V). Floor ≈ the APW12 hardware minimum
 /// (~11.78 V, DAC=255); ceiling is the factory operating max. The chip-safety
 /// ordering (lower frequency before lowering voltage, raise voltage before
@@ -1390,6 +1400,32 @@ impl BM13xxActor {
         // falls to ~0 and surfaces that way.
         self.current_freq_mhz = target.mhz();
         info!(target_mhz = target.mhz(), "Runtime frequency change complete");
+
+        // Re-sync reception after meaningful moves. A deep PLL excursion leaves
+        // the chips running at full power but delivering only a fraction of
+        // their nonce frames (degraded chip→chip relay timing); re-broadcasting
+        // the relay/IO/ticket config at the new frequency restores reception
+        // without a destructive power-cycle re-init. This sequence contains no
+        // PLL or baud writes, so it can't disturb the operating point.
+        let net_change_mhz = (target.mhz() - start.mhz()).abs();
+        if net_change_mhz >= RESYNC_MIN_DELTA_MHZ {
+            // Re-assert the broadcast relay/IO reception config (Core bcast,
+            // TicketMask, AnalogMux, IoDriverStrength, per-domain UartRelay —
+            // no PLL/baud writes) at the new frequency. A deep PLL excursion
+            // degrades relay timing so chips deliver only a fraction of their
+            // nonce frames; this recovers roughly half of that loss without any
+            // operating-point disturbance. (Re-asserting the *per-chip*
+            // Core/MiscControl config was tried and REGRESSED recovery — it
+            // resets cores mid-mining — so it is deliberately omitted; full
+            // recovery from a deep excursion needs a cold re-init.)
+            match self.execute_reg_config_broadcast().await {
+                Ok(()) => info!(
+                    net_change_mhz,
+                    "Re-asserted broadcast reception config after frequency change"
+                ),
+                Err(e) => warn!(error = %e, "Post-frequency-change reception re-sync failed"),
+            }
+        }
         Ok(())
     }
 
