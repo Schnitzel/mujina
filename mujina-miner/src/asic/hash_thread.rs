@@ -55,8 +55,13 @@ pub struct HashThreadCapabilities {
 /// Current runtime status of a HashThread.
 #[derive(Debug, Clone, Default)]
 pub struct HashThreadStatus {
-    /// Current hashrate estimate
+    /// Current hashrate estimate (5-minute window)
     pub hashrate: HashRate,
+
+    /// Responsive hashrate estimate over a 1-minute window. Reflects an
+    /// operating-point change (frequency dial, recovery) in ~1 min vs the
+    /// ~5 min the primary `hashrate` takes to catch up.
+    pub hashrate_1min: HashRate,
 
     /// Number of shares found (at chip target level, before pool filtering)
     pub chip_shares_found: u64,

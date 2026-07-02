@@ -42,6 +42,11 @@ use crate::{
 /// `status.hashrate`. 5 minutes matches the scheduler-side estimator
 /// so the per-board and the chain-wide hashrate views agree.
 const ACTOR_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Shorter window for the responsive `status.hashrate_1min` estimate. Tracks
+/// the same shares as the 5-minute one but reflects an operating-point change
+/// in ~1 minute instead of ~5, so a frequency dial or a recovery is visible
+/// quickly (the 5-minute view lags because old samples linger for its window).
+const ACTOR_HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
 
 /// Lower bound for runtime down-clocking (MHz). Below this the chain comms get
 /// unreliable on BHB56902; refine empirically. Shared by the runtime dial and
@@ -171,6 +176,7 @@ impl BM13xxThread {
                 status: status_clone,
                 nonce_origin_last_seen: [None; 128],
                 hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+                hashrate_estimator_1min: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN),
                 paused: false,
                 estimated_hashrate: initial_hashrate,
                 response_rx,
@@ -353,6 +359,9 @@ struct BM13xxActor {
     /// per-board UI matches the chain-wide hashrate the scheduler
     /// computes the same way.
     hashrate_estimator: HashrateEstimator,
+    /// Second estimator over a 1-minute window (fed the same shares), driving
+    /// the responsive `status.hashrate_1min`.
+    hashrate_estimator_1min: HashrateEstimator,
     /// Mirror of the scheduler's `paused` flag, set via
     /// `ThreadCommand::SetPaused`. When true, `handle_chip_response`
     /// drops accepted shares before they reach the hashrate estimator
@@ -737,6 +746,8 @@ impl BM13xxActor {
                     // which works reliably.
                     self.hashrate_estimator =
                         HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
+                    self.hashrate_estimator_1min =
+                        HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN);
                     self.estimated_hashrate = HashRate::default();
                     self.nonce_origin_last_seen = [None; 128];
                     self.current_task = None;
@@ -744,6 +755,7 @@ impl BM13xxActor {
                     let status = self.update_status(|status| {
                         status.is_active = false;
                         status.hashrate = HashRate::default();
+                        status.hashrate_1min = HashRate::default();
                         status.active_chips = 0;
                     });
                     let _ = self
@@ -1603,12 +1615,14 @@ impl BM13xxActor {
         // Drop the per-thread hashrate estimator so a subsequent
         // re-init starts from zero instead of carrying old samples.
         self.hashrate_estimator = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
+        self.hashrate_estimator_1min = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN);
         self.estimated_hashrate = HashRate::default();
 
         self.chip_state = ChipState::Disabled;
         let status = self.update_status(|status| {
             status.is_active = false;
             status.hashrate = HashRate::default();
+            status.hashrate_1min = HashRate::default();
         });
         let _ = self
             .evt_tx
@@ -1809,7 +1823,9 @@ impl BM13xxActor {
                     // chip-side proof-of-work and should count toward the
                     // per-board hashrate display.
                     self.hashrate_estimator.record(share.expected_work);
+                    self.hashrate_estimator_1min.record(share.expected_work);
                     self.estimated_hashrate = self.hashrate_estimator.hashrate();
+                    let hashrate_1min = self.hashrate_estimator_1min.hashrate();
 
                     // Send via task's dedicated channel
                     if task.share_tx.send(share).await.is_err() {
@@ -1820,6 +1836,7 @@ impl BM13xxActor {
                             status.chip_shares_found += 1;
                             status.is_active = true;
                             status.hashrate = self.estimated_hashrate;
+                            status.hashrate_1min = hashrate_1min;
                         });
                         let _ = self
                             .evt_tx
@@ -2067,6 +2084,7 @@ mod tests {
             evt_tx,
             status,
             hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
+            hashrate_estimator_1min: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN),
             paused: false,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             nonce_origin_last_seen: [None; 128],

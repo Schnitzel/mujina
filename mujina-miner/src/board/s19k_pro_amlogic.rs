@@ -474,6 +474,7 @@ impl Board for S19kProAmlogic {
             thread_state_seed.push(crate::api_client::types::ThreadState {
                 name: thread_name.clone(),
                 hashrate: 0,
+                hashrate_1min: 0,
                 is_active: false,
                 active_chips: 0,
                 expected_chips: 0,
@@ -627,6 +628,7 @@ impl BoardStateHashThread {
         let thread_state = crate::api_client::types::ThreadState {
             name: name.clone(),
             hashrate,
+            hashrate_1min: u64::from(status.hashrate_1min),
             is_active,
             active_chips: status.active_chips,
             expected_chips: status.expected_chips,

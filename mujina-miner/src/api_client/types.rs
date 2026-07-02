@@ -68,8 +68,12 @@ pub struct PowerMeasurement {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ThreadState {
     pub name: String,
-    /// Hashrate in hashes per second.
+    /// Hashrate in hashes per second (5-minute window).
     pub hashrate: u64,
+    /// Responsive hashrate over a 1-minute window (hashes per second). Reflects
+    /// an operating-point change ~5× faster than `hashrate`. 0 on older builds.
+    #[serde(default)]
+    pub hashrate_1min: u64,
     pub is_active: bool,
     /// Distinct chips that have produced a nonce within the recent census
     /// window (passive, derived from the nonce stream). Pair with

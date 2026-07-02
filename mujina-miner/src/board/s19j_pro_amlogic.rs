@@ -332,6 +332,7 @@ impl Board for S19jProAmlogic {
             state.threads = vec![crate::api_client::types::ThreadState {
                 name: thread_name.clone(),
                 hashrate: thread_hashrate,
+                hashrate_1min: thread_hashrate,
                 is_active: false,
                 active_chips: 0,
                 expected_chips: 0,
@@ -346,6 +347,7 @@ impl Board for S19jProAmlogic {
             *thread_states = vec![crate::api_client::types::ThreadState {
                 name: thread_name.clone(),
                 hashrate: thread_hashrate,
+                hashrate_1min: thread_hashrate,
                 is_active: false,
                 active_chips: 0,
                 expected_chips: 0,
@@ -443,6 +445,7 @@ impl BoardStateHashThread {
         let thread_state = crate::api_client::types::ThreadState {
             name: name.clone(),
             hashrate,
+            hashrate_1min: u64::from(status.hashrate_1min),
             is_active,
             active_chips: status.active_chips,
             expected_chips: status.expected_chips,
