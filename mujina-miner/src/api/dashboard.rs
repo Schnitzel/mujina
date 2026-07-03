@@ -564,8 +564,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 const threads = renderMiniList(
                     board.threads,
                     thread => thread.name || "thread",
-                    thread => formatHashrate(thread.hashrate) + " · 1m " + formatHashrate(thread.hashrate_1min),
-                    thread => thread.is_active ? "active" : "idle"
+                    // per-board hashrate: 1-min live, then 5-min in parens
+                    thread => formatHashrate(thread.hashrate_1min) + " (5m " + formatHashrate(thread.hashrate) + ")",
+                    thread => {
+                        const state = thread.is_active ? "active" : "idle";
+                        const chips = (thread.expected_chips > 0)
+                            ? `${thread.active_chips}/${thread.expected_chips} chips`
+                            : null;
+                        return [state, chips].filter(Boolean).join(" · ");
+                    }
                 );
 
                 return `
@@ -627,11 +634,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         }
 
         function applySnapshot(data) {
-            document.getElementById("hashrate").textContent = formatHashrate(data.hashrate);
             const hr1min = (data.boards || []).reduce(
                 (sum, b) => sum + (b.threads || []).reduce((t, th) => t + (th.hashrate_1min || 0), 0), 0);
+            // Big value = live 1-min (what you watch during a dial); subvalue
+            // carries the 5-min average so both are always visible.
+            document.getElementById("hashrate").textContent = formatHashrate(hr1min);
             document.getElementById("hashrate-detail").textContent =
-                data.paused ? "mining paused" : "1-min: " + formatHashrate(hr1min);
+                data.paused ? "mining paused" : "1-min live · 5-min avg " + formatHashrate(data.hashrate);
             document.getElementById("shares").textContent = Number(data.shares_submitted || 0).toLocaleString();
             document.getElementById("uptime").textContent = formatUptime(data.uptime_secs);
             document.getElementById("board-count").textContent = Number((data.boards || []).length).toString();
