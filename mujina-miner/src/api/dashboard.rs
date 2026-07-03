@@ -564,7 +564,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 const threads = renderMiniList(
                     board.threads,
                     thread => thread.name || "thread",
-                    thread => formatHashrate(thread.hashrate),
+                    thread => formatHashrate(thread.hashrate) + " · 1m " + formatHashrate(thread.hashrate_1min),
                     thread => thread.is_active ? "active" : "idle"
                 );
 
@@ -628,7 +628,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
         function applySnapshot(data) {
             document.getElementById("hashrate").textContent = formatHashrate(data.hashrate);
-            document.getElementById("hashrate-detail").textContent = data.paused ? "mining paused" : "aggregate miner output";
+            const hr1min = (data.boards || []).reduce(
+                (sum, b) => sum + (b.threads || []).reduce((t, th) => t + (th.hashrate_1min || 0), 0), 0);
+            document.getElementById("hashrate-detail").textContent =
+                data.paused ? "mining paused" : "1-min: " + formatHashrate(hr1min);
             document.getElementById("shares").textContent = Number(data.shares_submitted || 0).toLocaleString();
             document.getElementById("uptime").textContent = formatUptime(data.uptime_secs);
             document.getElementById("board-count").textContent = Number((data.boards || []).length).toString();
