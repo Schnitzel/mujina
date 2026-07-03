@@ -5,7 +5,6 @@
 //! require authentication for local access.
 
 pub mod commands;
-mod dashboard;
 pub(crate) mod registry;
 mod server;
 mod v0;

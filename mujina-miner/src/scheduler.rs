@@ -71,6 +71,8 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Shorter window for the responsive top-level `hashrate_1min`.
+const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
 
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).
@@ -160,6 +162,9 @@ enum AssignMode {
 struct ThreadEntry {
     thread: Box<dyn HashThread>,
     hashrate: HashrateEstimator,
+    /// Same shares over a 1-minute window, driving the responsive top-level
+    /// `hashrate_1min` (settles ~5× faster than `hashrate` after a power dial).
+    hashrate_1min: HashrateEstimator,
 }
 
 /// Core scheduler state.
@@ -255,6 +260,14 @@ impl Scheduler {
             .sum()
     }
 
+    /// Aggregate measured hashrate over the responsive 1-minute window.
+    fn measured_hashrate_1min(&mut self) -> HashRate {
+        self.threads
+            .values_mut()
+            .map(|entry| entry.hashrate_1min.hashrate())
+            .sum()
+    }
+
     /// Aggregate hashrate for operational decisions.
     ///
     /// Per thread, uses measured hashrate if the estimator has settled,
@@ -282,6 +295,7 @@ impl Scheduler {
         MinerState {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
+            hashrate_1min: u64::from(self.measured_hashrate_1min()),
             shares_submitted: self.stats.shares_submitted,
             best_difficulty: self.stats.best_difficulty,
             paused: self.paused,
@@ -568,6 +582,7 @@ impl Scheduler {
         // Feed share work to per-thread hashrate estimator
         if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
             entry.hashrate.record(share.expected_work);
+            entry.hashrate_1min.record(share.expected_work);
         }
 
         // Check if share meets source threshold
@@ -653,6 +668,7 @@ impl Scheduler {
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+            hashrate_1min: HashrateEstimator::new(HASHRATE_WINDOW_1MIN),
         });
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
@@ -824,6 +840,7 @@ impl Scheduler {
                         // API/UI stops showing the pre-pause hashrate
                         // while the window ages out.
                         entry.hashrate = HashrateEstimator::new(HASHRATE_WINDOW);
+                        entry.hashrate_1min = HashrateEstimator::new(HASHRATE_WINDOW_1MIN);
                         debug!(thread_id = ?id, thread = %entry.thread.name(), "Thread marked paused");
                     }
                     // Note: we intentionally do NOT call
