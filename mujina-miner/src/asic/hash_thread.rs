@@ -88,6 +88,10 @@ pub struct HashThreadStatus {
     /// Total chips expected on this chain (from the chain topology). Pair with
     /// `active_chips` as "active/expected".
     pub expected_chips: u16,
+
+    /// Current chip frequency (MHz) actually applied to this chain — the live
+    /// operating point of the power dial. 0 when idle/paused.
+    pub frequency_mhz: f32,
 }
 
 /// Events emitted by HashThreads back to the scheduler.

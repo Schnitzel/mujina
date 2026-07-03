@@ -620,6 +620,7 @@ impl BM13xxActor {
         let mut status = self.status.write();
         status.active_chips = active;
         status.expected_chips = expected;
+        status.frequency_mhz = self.current_freq_mhz;
     }
 
     /// Main actor loop. Runs until command channel closes.
@@ -757,6 +758,7 @@ impl BM13xxActor {
                         status.hashrate = HashRate::default();
                         status.hashrate_1min = HashRate::default();
                         status.active_chips = 0;
+                        status.frequency_mhz = 0.0;
                     });
                     let _ = self
                         .evt_tx
