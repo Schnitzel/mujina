@@ -336,6 +336,7 @@ impl Board for S19jProAmlogic {
                 is_active: false,
                 active_chips: 0,
                 expected_chips: 0,
+                frequency_mhz: 0.0,
             }];
         });
 
@@ -351,6 +352,7 @@ impl Board for S19jProAmlogic {
                 is_active: false,
                 active_chips: 0,
                 expected_chips: 0,
+                frequency_mhz: 0.0,
             }];
         }
 
@@ -449,6 +451,7 @@ impl BoardStateHashThread {
             is_active,
             active_chips: status.active_chips,
             expected_chips: status.expected_chips,
+            frequency_mhz: status.frequency_mhz,
         };
 
         {

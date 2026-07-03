@@ -88,6 +88,10 @@ pub struct ThreadState {
     /// Total chips expected on this chain.
     #[serde(default)]
     pub expected_chips: u16,
+    /// Current chip frequency (MHz) applied to this chain — the live operating
+    /// point of the power dial. 0 when idle/paused.
+    #[serde(default)]
+    pub frequency_mhz: f32,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.
