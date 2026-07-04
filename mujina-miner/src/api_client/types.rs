@@ -12,8 +12,12 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerState {
     pub uptime_secs: u64,
-    /// Aggregate hashrate in hashes per second.
+    /// Aggregate hashrate in hashes per second (5-minute window).
     pub hashrate: u64,
+    /// Aggregate hashrate over the responsive 1-minute window (hashes per
+    /// second) — settles ~5× faster than `hashrate` after a power dial.
+    #[serde(default)]
+    pub hashrate_1min: u64,
     pub shares_submitted: u64,
     /// Best share difficulty observed since startup, if any shares were found.
     #[serde(skip_serializing_if = "Option::is_none")]
