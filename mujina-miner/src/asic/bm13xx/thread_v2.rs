@@ -1427,6 +1427,16 @@ impl BM13xxActor {
             steps = steps.len(),
             "Runtime frequency change (PLL only, fixed voltage)"
         );
+        // Re-assert the reception config every ~RESYNC_MIN_DELTA_MHZ of PLL
+        // travel, not only once at the end. A PLL move degrades chip→chip relay
+        // timing so chips deliver only a fraction of their nonce frames; a
+        // single end-of-ramp re-sync recovers a *shallow* move but not a deep
+        // one (a big jump used to strand the chips until a cold re-init). By
+        // re-syncing each shallow segment as we travel, mujina can ramp *any*
+        // distance in one command and still self-heal — so callers just ask for
+        // the target frequency; the depth of the move is our concern, not
+        // theirs.
+        let mut last_resync_mhz = start.mhz();
         for (freq, step) in steps.iter() {
             self.chip_tx.send(step.command.clone()).await.map_err(|e| {
                 HashThreadError::InitializationFailed(format!(
@@ -1437,6 +1447,10 @@ impl BM13xxActor {
                 time::sleep(delay).await;
             }
             self.current_freq_mhz = freq.mhz();
+            if (freq.mhz() - last_resync_mhz).abs() >= RESYNC_MIN_DELTA_MHZ {
+                self.resync_reception().await;
+                last_resync_mhz = freq.mhz();
+            }
         }
         // Deliberately NO post-ramp `verify_chain()` here. The cold-init ramp
         // verifies, but at runtime a broadcast read right after a PLL change
@@ -1448,32 +1462,29 @@ impl BM13xxActor {
         self.current_freq_mhz = target.mhz();
         info!(target_mhz = target.mhz(), "Runtime frequency change complete");
 
-        // Re-sync reception after meaningful moves. A deep PLL excursion leaves
-        // the chips running at full power but delivering only a fraction of
-        // their nonce frames (degraded chip→chip relay timing); re-broadcasting
-        // the relay/IO/ticket config at the new frequency restores reception
-        // without a destructive power-cycle re-init. This sequence contains no
-        // PLL or baud writes, so it can't disturb the operating point.
+        // Final re-sync for the remainder past the last in-ramp one — covers a
+        // move shorter than one segment, and the tail of a longer ramp.
         let net_change_mhz = (target.mhz() - start.mhz()).abs();
-        if net_change_mhz >= RESYNC_MIN_DELTA_MHZ {
-            // Re-assert the broadcast relay/IO reception config (Core bcast,
-            // TicketMask, AnalogMux, IoDriverStrength, per-domain UartRelay —
-            // no PLL/baud writes) at the new frequency. A deep PLL excursion
-            // degrades relay timing so chips deliver only a fraction of their
-            // nonce frames; this recovers roughly half of that loss without any
-            // operating-point disturbance. (Re-asserting the *per-chip*
-            // Core/MiscControl config was tried and REGRESSED recovery — it
-            // resets cores mid-mining — so it is deliberately omitted; full
-            // recovery from a deep excursion needs a cold re-init.)
-            match self.execute_reg_config_broadcast().await {
-                Ok(()) => info!(
-                    net_change_mhz,
-                    "Re-asserted broadcast reception config after frequency change"
-                ),
-                Err(e) => warn!(error = %e, "Post-frequency-change reception re-sync failed"),
-            }
+        if net_change_mhz >= RESYNC_MIN_DELTA_MHZ
+            && (target.mhz() - last_resync_mhz).abs() > FREQ_APPLY_EPS_MHZ
+        {
+            self.resync_reception().await;
         }
         Ok(())
+    }
+
+    /// Re-assert the broadcast reception config (Core bcast, TicketMask,
+    /// AnalogMux, IoDriverStrength, per-domain UartRelay — no PLL/baud writes,
+    /// so it can't disturb the operating point) at the current frequency,
+    /// recovering the chip→chip relay-timing degradation a PLL move causes.
+    /// (Re-asserting the *per-chip* Core/MiscControl config was tried and
+    /// REGRESSED recovery — it resets cores mid-mining — so it is deliberately
+    /// omitted.) Non-fatal on error.
+    async fn resync_reception(&mut self) {
+        match self.execute_reg_config_broadcast().await {
+            Ok(()) => info!(mhz = self.current_freq_mhz, "Re-asserted broadcast reception config"),
+            Err(e) => warn!(error = %e, "Reception re-sync failed"),
+        }
     }
 
     /// Verify all chips respond by polling each one individually.
