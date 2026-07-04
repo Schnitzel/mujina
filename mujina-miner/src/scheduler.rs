@@ -71,8 +71,9 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// Shorter window for the responsive top-level `hashrate_1min`.
-const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
+/// Short "live" window for the responsive top-level `hashrate_1min` (5 s, to
+/// match LuxOS/Braiins' live hashrate; field name kept for API stability).
+const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(5);
 
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).

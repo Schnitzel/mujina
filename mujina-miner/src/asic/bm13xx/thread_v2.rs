@@ -42,11 +42,11 @@ use crate::{
 /// `status.hashrate`. 5 minutes matches the scheduler-side estimator
 /// so the per-board and the chain-wide hashrate views agree.
 const ACTOR_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// Shorter window for the responsive `status.hashrate_1min` estimate. Tracks
-/// the same shares as the 5-minute one but reflects an operating-point change
-/// in ~1 minute instead of ~5, so a frequency dial or a recovery is visible
-/// quickly (the 5-minute view lags because old samples linger for its window).
-const ACTOR_HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
+/// Short "live" window for the responsive `status.hashrate_1min` estimate — a
+/// frequency dial or recovery shows up almost immediately (vs the 5-minute view,
+/// whose old samples linger). 5 s matches the live hashrate LuxOS/Braiins
+/// expose. NOTE: the field is still named `hashrate_1min` for API/wire stability.
+const ACTOR_HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(5);
 
 /// Lower bound for runtime down-clocking (MHz). Below this the chain comms get
 /// unreliable on BHB56902; refine empirically. Shared by the runtime dial and
