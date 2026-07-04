@@ -28,6 +28,62 @@ pub struct HashrateEstimator {
     max_samples: usize,
     samples: VecDeque<(Instant, U256)>,
     total_work: U256,
+    /// When `Some`, the estimator uses a cgminer-style exponentially-weighted
+    /// moving average (the algorithm LuxOS/Braiins use for their short "5s"
+    /// window) instead of the hard sliding window — smooth yet responsive. The
+    /// `window` doubles as the EWMA time constant.
+    ewma: Option<Ewma>,
+}
+
+/// cgminer `decay_time` exponentially-weighted moving average of hashrate. On
+/// each advance it blends the accumulated work-rate into the running estimate
+/// with a weight `fprop` that grows with the elapsed fraction of the time
+/// constant, so a busy miner tracks quickly and a quiet one decays toward zero.
+struct Ewma {
+    /// Time constant (seconds) — the "5 s" / "1 m" / … window.
+    interval_secs: f64,
+    /// Current rolling hashrate estimate (hashes/sec).
+    rate_hs: f64,
+    /// Work (hashes) accumulated since the last advance.
+    pending_hashes: f64,
+    /// When the estimate was last advanced.
+    last: Option<Instant>,
+}
+
+impl Ewma {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval_secs: interval.as_secs_f64().max(1.0),
+            rate_hs: 0.0,
+            pending_hashes: 0.0,
+            last: None,
+        }
+    }
+
+    /// Accumulate a share's work (in hashes).
+    fn record(&mut self, at: Instant, hashes: f64) {
+        self.pending_hashes += hashes;
+        if self.last.is_none() {
+            self.last = Some(at);
+        }
+    }
+
+    /// Advance the average to `now`, folding in the accumulated work, and return
+    /// the current estimate (hashes/sec). Idempotent for `now == last`.
+    fn rate_at(&mut self, now: Instant) -> f64 {
+        if let Some(last) = self.last {
+            let fsecs = now.saturating_duration_since(last).as_secs_f64();
+            if fsecs > 0.0 {
+                let fprop = 1.0 - 1.0 / (fsecs / self.interval_secs).exp();
+                let ftotal = 1.0 + fprop;
+                self.rate_hs += (self.pending_hashes / fsecs) * fprop;
+                self.rate_hs /= ftotal;
+                self.pending_hashes = 0.0;
+                self.last = Some(now);
+            }
+        }
+        self.rate_hs.max(0.0)
+    }
 }
 
 impl HashrateEstimator {
@@ -49,7 +105,17 @@ impl HashrateEstimator {
             max_samples,
             samples: VecDeque::new(),
             total_work: U256::ZERO,
+            ewma: None,
         }
+    }
+
+    /// Create an estimator that uses a cgminer-style EWMA (the LuxOS/Braiins
+    /// "5 s"-style rolling average) with `window` as the time constant. Smoother
+    /// than the hard sliding window for short windows, while just as responsive.
+    pub fn new_ewma(window: Duration) -> Self {
+        let mut est = Self::with_limits(window, 5, window.as_secs() as usize * 10);
+        est.ewma = Some(Ewma::new(window));
+        est
     }
 
     /// Record work from a share at the current time.
@@ -59,6 +125,10 @@ impl HashrateEstimator {
 
     /// Record work from a share at the given timestamp.
     pub fn record_at(&mut self, at: Instant, work: Work) {
+        if let Some(e) = self.ewma.as_mut() {
+            e.record(at, U256::from(work).saturating_to_u64() as f64);
+            return;
+        }
         let work = U256::from(work);
         self.prune_before(at.checked_sub(self.window).unwrap_or(at));
         self.samples.push_back((at, work));
@@ -83,6 +153,9 @@ impl HashrateEstimator {
     /// This gives an accurate estimate as soon as samples exist rather
     /// than ramping up over the full window.
     pub fn hashrate_at(&mut self, now: Instant) -> HashRate {
+        if let Some(e) = self.ewma.as_mut() {
+            return HashRate::from(e.rate_at(now) as u64);
+        }
         self.prune_before(now.checked_sub(self.window).unwrap_or(now));
 
         let secs = match self.samples.front() {
@@ -98,6 +171,9 @@ impl HashrateEstimator {
 
     /// Whether any samples exist within the window.
     pub fn has_samples(&self) -> bool {
+        if let Some(e) = &self.ewma {
+            return e.last.is_some();
+        }
         !self.samples.is_empty()
     }
 
@@ -107,6 +183,9 @@ impl HashrateEstimator {
     /// in the current window. Before this point, callers should
     /// prefer a static estimate (e.g., from hardware capabilities).
     pub fn is_settled(&self) -> bool {
+        if let Some(e) = &self.ewma {
+            return e.last.is_some();
+        }
         self.samples.len() >= self.min_samples
     }
 
@@ -339,6 +418,50 @@ mod tests {
 
         est.record_at(base, work(500));
         assert!(est.settled_hashrate().is_none());
+    }
+
+    #[test]
+    fn ewma_converges_to_steady_rate() {
+        // Feed a steady 100 H/s (100 work each second) and read each second.
+        let mut est = HashrateEstimator::new_ewma(Duration::from_secs(5));
+        let base = Instant::now();
+        let mut rate = 0;
+        for i in 0..60 {
+            est.record_at(base + Duration::from_secs(i), work(100));
+            rate = u64::from(est.hashrate_at(base + Duration::from_secs(i)));
+        }
+        // Should settle very close to 100 H/s.
+        assert!((90..=110).contains(&rate), "ewma rate {rate} not near 100");
+        assert!(est.is_settled() && est.has_samples());
+    }
+
+    #[test]
+    fn ewma_is_smoother_than_window_on_a_burst() {
+        // A single big burst then silence: the EWMA absorbs it gradually where a
+        // hard window would spike. Read 3s after the burst.
+        let base = Instant::now();
+        let mut ewma = HashrateEstimator::new_ewma(Duration::from_secs(5));
+        let mut win = HashrateEstimator::new(Duration::from_secs(5));
+        ewma.record_at(base, work(100));
+        win.record_at(base, work(100));
+        ewma.record_at(base + Duration::from_millis(100), work(1_000_000));
+        win.record_at(base + Duration::from_millis(100), work(1_000_000));
+        let at = base + Duration::from_secs(3);
+        assert!(u64::from(ewma.hashrate_at(at)) < u64::from(win.hashrate_at(at)));
+    }
+
+    #[test]
+    fn ewma_decays_toward_zero_when_idle() {
+        let mut est = HashrateEstimator::new_ewma(Duration::from_secs(5));
+        let base = Instant::now();
+        for i in 0..20 {
+            est.record_at(base + Duration::from_secs(i), work(100));
+            let _ = est.hashrate_at(base + Duration::from_secs(i));
+        }
+        let busy = u64::from(est.hashrate_at(base + Duration::from_secs(20)));
+        // No more shares; 30s later (6 time-constants) it should be far lower.
+        let idle = u64::from(est.hashrate_at(base + Duration::from_secs(50)));
+        assert!(idle * 4 < busy, "idle {idle} did not decay from busy {busy}");
     }
 
     #[test]

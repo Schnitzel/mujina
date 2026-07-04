@@ -669,7 +669,7 @@ impl Scheduler {
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
-            hashrate_1min: HashrateEstimator::new(HASHRATE_WINDOW_1MIN),
+            hashrate_1min: HashrateEstimator::new_ewma(HASHRATE_WINDOW_1MIN),
         });
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
@@ -841,7 +841,7 @@ impl Scheduler {
                         // API/UI stops showing the pre-pause hashrate
                         // while the window ages out.
                         entry.hashrate = HashrateEstimator::new(HASHRATE_WINDOW);
-                        entry.hashrate_1min = HashrateEstimator::new(HASHRATE_WINDOW_1MIN);
+                        entry.hashrate_1min = HashrateEstimator::new_ewma(HASHRATE_WINDOW_1MIN);
                         debug!(thread_id = ?id, thread = %entry.thread.name(), "Thread marked paused");
                     }
                     // Note: we intentionally do NOT call

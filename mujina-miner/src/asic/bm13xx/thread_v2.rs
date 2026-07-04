@@ -176,7 +176,7 @@ impl BM13xxThread {
                 status: status_clone,
                 nonce_origin_last_seen: [None; 128],
                 hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
-                hashrate_estimator_1min: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN),
+                hashrate_estimator_1min: HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN),
                 paused: false,
                 estimated_hashrate: initial_hashrate,
                 response_rx,
@@ -748,7 +748,7 @@ impl BM13xxActor {
                     self.hashrate_estimator =
                         HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
                     self.hashrate_estimator_1min =
-                        HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN);
+                        HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN);
                     self.estimated_hashrate = HashRate::default();
                     self.nonce_origin_last_seen = [None; 128];
                     self.current_task = None;
@@ -1628,7 +1628,7 @@ impl BM13xxActor {
         // Drop the per-thread hashrate estimator so a subsequent
         // re-init starts from zero instead of carrying old samples.
         self.hashrate_estimator = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW);
-        self.hashrate_estimator_1min = HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN);
+        self.hashrate_estimator_1min = HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN);
         self.estimated_hashrate = HashRate::default();
 
         self.chip_state = ChipState::Disabled;
@@ -2097,7 +2097,7 @@ mod tests {
             evt_tx,
             status,
             hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
-            hashrate_estimator_1min: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW_1MIN),
+            hashrate_estimator_1min: HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN),
             paused: false,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
             nonce_origin_last_seen: [None; 128],
