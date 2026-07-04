@@ -1000,6 +1000,11 @@ impl Scheduler {
         hashrate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first_hashrate_tick = true;
 
+        // Publish the API/UI state snapshot frequently — decoupled from the 10 s
+        // pool hashrate broadcast — so the UI reflects changes within ~2 s.
+        let mut state_publish_interval = tokio::time::interval(Duration::from_secs(2));
+        state_publish_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         while !running.is_cancelled() {
             tokio::select! {
                 // Source registration
@@ -1078,7 +1083,7 @@ impl Scheduler {
                     self.handle_api_command(cmd, &miner_state_tx, &mut share_channels).await;
                 }
 
-                // Periodic state publishing and hashrate broadcast
+                // Periodic hashrate broadcast to pool sources (10 s).
                 _ = hashrate_interval.tick() => {
                     if first_hashrate_tick {
                         first_hashrate_tick = false;
@@ -1087,6 +1092,10 @@ impl Scheduler {
                         let senders = self.hashrate_senders();
                         broadcast_hashrate(senders, hashrate).await;
                     }
+                }
+
+                // Frequent API/UI state snapshot publish (~2 s).
+                _ = state_publish_interval.tick() => {
                     let _ = miner_state_tx.send(self.compute_miner_state());
                 }
 
