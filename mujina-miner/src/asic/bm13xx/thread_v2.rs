@@ -62,6 +62,11 @@ const FREQ_APPLY_EPS_MHZ: f32 = 3.0;
 /// silent within a couple census updates.
 const CHIP_CENSUS_WINDOW: Duration = Duration::from_secs(90);
 
+/// Upper bound on the frequency-scaled census window (see `census_window`).
+/// Caps how long a genuinely dead chip can linger in the count while the chain
+/// runs at a low frequency.
+const CHIP_CENSUS_WINDOW_MAX: Duration = Duration::from_secs(300);
+
 /// After a runtime frequency change of at least this magnitude (MHz), re-assert
 /// the reception-critical broadcast config (Core, TicketMask, AnalogMux,
 /// IoDriverStrength, per-domain UartRelay — no PLL/baud writes). Deep PLL
@@ -610,11 +615,31 @@ impl BM13xxActor {
     /// Recompute the passive per-chip census (chips that produced a nonce
     /// within `CHIP_CENSUS_WINDOW`) and publish it into the shared status.
     /// Cheap — a 128-entry scan — so it's fine to call on every mining tick.
+    /// Census window scaled for the current frequency. Chips emit nonces at a
+    /// rate proportional to hashrate (≈ ∝ frequency), so at a lower frequency
+    /// each chip needs proportionally longer to be sampled at least once.
+    /// Scaling the window by `cold_init_freq / current_freq` keeps the expected
+    /// nonces-per-chip-per-window roughly constant, so the census reflects true
+    /// liveness at any operating point instead of false-flagging alive-but-slow
+    /// chips (a genuinely dead chip emits nothing and still drops out). Clamped
+    /// to `[CHIP_CENSUS_WINDOW, CHIP_CENSUS_WINDOW_MAX]`.
+    fn census_window(&self) -> Duration {
+        let f = self.current_freq_mhz;
+        let reference = self.max_runtime_freq_mhz;
+        if f <= 0.0 || reference <= f {
+            return CHIP_CENSUS_WINDOW;
+        }
+        CHIP_CENSUS_WINDOW
+            .mul_f32(reference / f)
+            .min(CHIP_CENSUS_WINDOW_MAX)
+    }
+
     fn update_chip_census(&self) {
+        let window = self.census_window();
         let active = self
             .nonce_origin_last_seen
             .iter()
-            .filter(|seen| seen.map_or(false, |t| t.elapsed() < CHIP_CENSUS_WINDOW))
+            .filter(|seen| seen.map_or(false, |t| t.elapsed() < window))
             .count() as u16;
         let expected = self.chain.chip_count() as u16;
         let mut status = self.status.write();
