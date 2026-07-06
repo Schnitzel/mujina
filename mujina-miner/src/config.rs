@@ -194,6 +194,14 @@ pub struct AmlogicStartupConfig {
     /// Default fan duty cycle applied before ASIC bring-up.
     pub default_fan_percent: u8,
 
+    /// Minimum fan duty (%) the temperature curve floors at when the board is
+    /// cool (below the ramp-start temperature) — i.e. when mining at low power
+    /// or paused. Lower is quieter; the board layer clamps it to a safe range
+    /// above the fan's stall point. Defaults to 30 (the curve still ramps to
+    /// 100 % as the board heats, with a hard over-temp cutoff, regardless).
+    #[serde(default = "default_fan_floor_percent")]
+    pub fan_floor_percent: u8,
+
     /// Initial PSU output voltage used for first BM1362 enumeration.
     ///
     /// This should be a low bring-up voltage. The BM13xx thread ramps the PSU
@@ -212,6 +220,10 @@ pub struct AmlogicStartupConfig {
 
     /// Health-gate policy applied before mining starts.
     pub health_gate: AmlogicHealthGateConfig,
+}
+
+fn default_fan_floor_percent() -> u8 {
+    30
 }
 
 /// Pre-mining validation policy.

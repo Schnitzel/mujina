@@ -1385,7 +1385,10 @@ async fn native_telemetry_task(
         //      open-loop value that ran during the entire pre-mining
         //      window with no temp signal at all.
         const TMP75_OVERTEMP_C: f32 = 65.0;
-        const FAN_FLOOR_PERCENT: u8 = 60;
+        // Configurable floor (toml `startup.fan_floor_percent`, default 30),
+        // clamped above the fan's stall point. Governs noise at low power/paused;
+        // the curve still ramps to 100 % as the board heats.
+        let fan_floor_percent: u8 = config.startup.fan_floor_percent.clamp(20, 100);
         const FAN_RAMP_START_C: f32 = 40.0;
         const FAN_RAMP_FULL_C: f32 = 60.0;
         const TEMP_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -1468,20 +1471,20 @@ async fn native_telemetry_task(
             100
         } else if let Some(t) = board_hottest {
             if t <= FAN_RAMP_START_C {
-                FAN_FLOOR_PERCENT
+                fan_floor_percent
             } else if t >= FAN_RAMP_FULL_C {
                 100
             } else {
                 let span = FAN_RAMP_FULL_C - FAN_RAMP_START_C;
                 let into_ramp = t - FAN_RAMP_START_C;
-                let pct = FAN_FLOOR_PERCENT as f32
-                    + ((100.0 - FAN_FLOOR_PERCENT as f32) * (into_ramp / span));
-                pct.round().clamp(FAN_FLOOR_PERCENT as f32, 100.0) as u8
+                let pct = fan_floor_percent as f32
+                    + ((100.0 - fan_floor_percent as f32) * (into_ramp / span));
+                pct.round().clamp(fan_floor_percent as f32, 100.0) as u8
             }
         } else {
             // Pre-mining / first tick — sit at the boot value but
             // never below the floor.
-            config.startup.default_fan_percent.max(FAN_FLOOR_PERCENT)
+            config.startup.default_fan_percent.max(fan_floor_percent)
         };
 
         if Some(target_fan_percent) != applied_fan_percent {
