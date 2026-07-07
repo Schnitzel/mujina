@@ -2,9 +2,8 @@ pub(crate) mod bitaxe;
 pub mod cpu;
 pub(crate) mod emberone;
 pub mod pattern;
-pub(crate) mod s19j_pro_amlogic;
 pub(crate) mod s19j_pro_bitcrane;
-pub(crate) mod s19k_pro_amlogic;
+pub(crate) mod s19x_amlogic;
 
 use async_trait::async_trait;
 use std::{error::Error, fmt, future::Future, pin::Pin};

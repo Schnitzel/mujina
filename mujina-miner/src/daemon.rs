@@ -16,7 +16,7 @@ use crate::{
     api::{self, ApiConfig, BoardRegistry, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
-    board::{s19j_pro_amlogic, s19k_pro_amlogic},
+    board::s19x_amlogic,
     config::{Config, HashboardModel},
     cpu_miner::CpuMinerConfig,
     display::gt_touch,
@@ -85,30 +85,23 @@ impl Daemon {
                 .as_ref()
                 .and_then(Config::enabled_amlogic_control_board)
             {
-                // Dispatch to the right board driver based on the
-                // first configured hashboard's model. Both S19j Pro
-                // and S19k Pro use the same Amlogic A113D control
-                // board; only the chip family and hashboard topology
-                // differ, so they share the AmlogicControlBoardConfig
-                // schema.
+                // Both S19j Pro and S19k Pro run on the same Amlogic
+                // A113D control board and are handled by the single
+                // unified `s19x_amlogic` driver; only the chip family
+                // and hashboard topology differ (factored per-model
+                // inside the driver). They share the
+                // AmlogicControlBoardConfig schema. The model — taken
+                // from the first configured hashboard — is still carried
+                // on the transport event so downstream code can label
+                // the board correctly.
                 let model = config
                     .hashboards
                     .first()
                     .map(|hb| hb.model)
                     .unwrap_or(HashboardModel::S19jPro);
 
-                let device_id = match model {
-                    HashboardModel::S19jPro => {
-                        let id = s19j_pro_amlogic::device_id(config);
-                        s19j_pro_amlogic::install_config(config.clone())?;
-                        id
-                    }
-                    HashboardModel::S19kPro => {
-                        let id = s19k_pro_amlogic::device_id(config);
-                        s19k_pro_amlogic::install_config(config.clone())?;
-                        id
-                    }
-                };
+                let device_id = s19x_amlogic::device_id(config);
+                s19x_amlogic::install_config(config.clone())?;
 
                 info!(
                     board = %device_id,

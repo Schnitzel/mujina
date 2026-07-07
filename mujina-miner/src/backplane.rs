@@ -124,9 +124,12 @@ impl Backplane {
     async fn handle_amlogic_event(&mut self, event: AmlogicTransportEvent) -> Result<()> {
         match event {
             AmlogicTransportEvent::DeviceConnected(device_info) => {
+                // Both S19j Pro and S19k Pro are served by the single
+                // unified `s19x_amlogic` driver; the chip-family
+                // specifics are resolved per hashboard model inside it.
                 let descriptor_key = match device_info.model {
-                    crate::config::HashboardModel::S19jPro => "s19j_pro_amlogic",
-                    crate::config::HashboardModel::S19kPro => "s19k_pro_amlogic",
+                    crate::config::HashboardModel::S19jPro
+                    | crate::config::HashboardModel::S19kPro => "s19x_amlogic",
                 };
                 let Some(descriptor) = self.virtual_registry.find(descriptor_key) else {
                     error!(

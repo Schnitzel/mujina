@@ -1,7 +1,17 @@
-//! S19k Pro support on a native Antminer Amlogic control board.
+//! Antminer S19x Pro support on a native Amlogic (A113D) control board.
 //!
-//! This first implementation brings up one configured hashboard using the
-//! native Linux interfaces proven in `amlogic-cb-tools`.
+//! One unified driver for every Amlogic-controlbboard S19x hashboard. The
+//! S19j Pro (BM1362 / BHB42601·BHB42611) and S19k Pro (BM1366 / BHB56902)
+//! share the same control-board machinery — APW12 PSU, fans, LEDs, GPIO,
+//! reset sequencing, per-hashboard PIC handshake — and differ only in the
+//! *chip family* on the hashboard. That per-model divergence (chip config,
+//! chain topology, voltage envelope, thermal ceiling) is factored into
+//! [`HashboardSpec`] / [`hashboard_spec`]; everything else is shared.
+//!
+//! The board picks every slot whose detect GPIO reads "present"
+//! ([`select_present_hashboards`]) and spawns one hash thread per present
+//! board so each chain mines independently on the shared APW12, which is
+//! coordinated through a [`bm13xx::chain_config::ChainCoordinator`].
 
 use std::{
     collections::HashSet,
@@ -43,7 +53,7 @@ use crate::{
             HashThreadEvent, HashThreadStatus,
         },
     },
-    config::{AmlogicControlBoardConfig, AmlogicHashboardConfig},
+    config::{AmlogicControlBoardConfig, AmlogicHashboardConfig, HashboardModel},
     error::Error,
     tracing::prelude::*,
     transport::serial::SerialStream,
@@ -120,8 +130,10 @@ impl bm13xx::chain_config::ChipUartBaudControl for SerialControlAdapter {
     }
 }
 
-const BOARD_MODEL: &str = "S19k Pro (Amlogic control board)";
-const DEFAULT_BOARD_NAME: &str = "s19kpro-amlogic";
+/// Descriptor-level model label (the inventory `name` is `&'static str`,
+/// so it can't be per-instance). The *reported* board model surfaced in
+/// `BoardState` is resolved per-model via [`HashboardModel::board_model_label`].
+const UNIFIED_BOARD_MODEL: &str = "S19x Pro (Amlogic control board)";
 const FAN_PWM_PERIOD_NS: u32 = 10_000;
 const SERIAL_BAUD: u32 = 115_200;
 const PSU_RESPONSE_DELAY_MS: u64 = 500;
@@ -130,6 +142,156 @@ const EEPROM_LEN: usize = 256;
 const TMP75_TEMP_REG: u8 = 0x00;
 
 static AMLOGIC_BOARD_CONFIG: OnceLock<AmlogicControlBoardConfig> = OnceLock::new();
+
+/// Per-model (chip-family) hashboard specifics factored out of the
+/// otherwise-identical Amlogic control-board driver. Everything that
+/// differs between an S19j Pro (BM1362) and an S19k Pro (BM1366)
+/// hashboard lives here; the control-board machinery is shared.
+///
+/// The constants below are hardware-critical (they gate chip PLL-lock and
+/// stability) and are copied verbatim, per model, from the two original
+/// drivers — do NOT average or "tidy" them.
+#[derive(Clone)]
+struct HashboardSpec {
+    /// Thread-name prefix, kept per-model so existing S19j/S19k thread
+    /// names stay stable in the API/UI (`{label}-HB{index}`).
+    chain_label: &'static str,
+    /// BM13xx chip-family configuration for this hashboard.
+    chip_config: chip_config::ChipConfig,
+    /// Chain topology: voltage domains × chips-per-domain.
+    topology: TopologySpec,
+    /// Cold-init voltage clamp `(min, max)` reported by
+    /// [`VoltageRegulator::voltage_range`].
+    voltage_range: (f32, f32),
+    /// Factory/operating setpoint reported by
+    /// [`VoltageRegulator::target_voltage`].
+    target_voltage: f32,
+    /// Per-step voltage granularity ([`VoltageRegulator::voltage_step`]).
+    voltage_step: f32,
+    /// Runtime clamp `(min, max)` applied inside
+    /// [`NativeAmlogicPsu::set_voltage`]. Wider than `voltage_range`; it
+    /// only governs the *runtime* voltage bands, not cold init.
+    psu_clamp: (f32, f32),
+    /// Operating-frequency ceiling (MHz) for the M4 thermal cap — the
+    /// shared frequency cap never exceeds this.
+    thermal_cap_max_mhz: u32,
+    /// Post-broadcast chip-UART baud. `Some(Baud3M)` (BM1366/S19k) reopens the
+    /// chip UART at 3.125 Mbaud after the broadcast phase and needs the
+    /// fd-keepalive adapter. `None` (BM1362/S19j) keeps the fixed `SERIAL_BAUD`
+    /// the original single-board S19j driver used — no reopen, no keepalive.
+    /// Kept per-model on purpose: the S19j baud switch is untested on BM1362,
+    /// and the shipped S19j behaviour is the fixed-baud path.
+    post_broadcast_baud: Option<bm13xx::protocol::BaudRate>,
+}
+
+/// Resolve the [`HashboardSpec`] for a hashboard model. This is the single
+/// place chip-family constants live.
+fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
+    match model {
+        HashboardModel::S19kPro => HashboardSpec {
+            chain_label: "S19kProAmlogic",
+            chip_config: chip_config::bm1366(),
+            topology: TopologySpec::uniform_domains(11, 7, false),
+            // BHB56902 factory ATE setpoint is 13.90 V / 645 MHz (Braiins'
+            // `Detected hashboard #2: Voltage (Avg.) 13.90 V, Frequency
+            // (Avg.) 645 MHz, Hashrate 44400.51 GH/s`).
+            //
+            // The min is set to the factory chain voltage. The shared
+            // frequency-ramp voltage formula (`voltage_for_frequency_stacked`)
+            // was tuned for BM1362 and returns ~0.3 V/chip; with 11
+            // domains it would set 3.46 V across the chain, which is far
+            // below what BM1366 needs to PLL-lock at 645 MHz. With a
+            // 13.9 V floor the ramp clamps up to the factory setpoint
+            // immediately, matching what LuxOS and Braiins do (they set
+            // voltage to target *before* ramping frequency).
+            //
+            // verify_chain after ramp reports few chips alive at 13.9 V
+            // (e.g. 16/77), but observed hashrate (~27 TH/s on the dummy
+            // source vs ~14 TH/s at the 13.0 V floor with 67 reported)
+            // shows that more chips are actually mining than the polled
+            // verify can see at 3.125 Mbaud — the polled read is what's
+            // flaky, not the chips themselves.
+            voltage_range: (13.9, 14.5),
+            // Factory-equivalent operating point, matching Braiins's
+            // `Voltage(13.9)` for this hashboard. With 500 MHz frequency
+            // mujina was at ~21 TH/s; at 645 MHz + 13.9 V Braiins gets
+            // ~30 TH/s on the same chips.
+            target_voltage: 13.9,
+            voltage_step: 0.1,
+            // 11.7 V floor lets the runtime voltage bands (M1.5) reach the
+            // APW12's hardware minimum (~11.78 V, DAC=255). Cold-init
+            // voltages clamp higher upstream (voltage_range), so this only
+            // widens the *runtime* range.
+            psu_clamp: (11.7, 15.0),
+            // The BM1366 operating max (MHz). The cap never exceeds this;
+            // 575 MHz matches LuxOS's actual sustained operating point on
+            // BHB56902 (see chip_config::bm1366 target_frequency_mhz).
+            thermal_cap_max_mhz: 575,
+            // BM1366 switches the chip UART to 3.125 Mbaud after the broadcast
+            // phase (the deployed S19k behaviour).
+            post_broadcast_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
+        },
+        HashboardModel::S19jPro => HashboardSpec {
+            chain_label: "S19jProAmlogic",
+            chip_config: chip_config::bm1362(),
+            topology: TopologySpec::uniform_domains(42, 3, false),
+            // BHB42601 EEPROM specifies 13.20 V at 525 MHz (factory test
+            // setpoint, decoded from EEPROM `voltage_v` field). The generic
+            // `bm13xx::thread_v2::voltage_for_frequency_stacked()` formula is
+            // calibrated for emberone-style stacked regulators (per-chip
+            // 0.3 V at 500 MHz, multiplied by 12 chips = 3.6 V total) and
+            // returns ~12.6 V when applied to the 42-domain series chain on
+            // S19j Pro (0.3 V × 42). That's 0.6 V under spec and causes chips
+            // to fall off the chain mid-ramp under load.
+            //
+            // Clamping the min here (`applied.clamp(min_v, max_v)` in
+            // thread_v2) forces the ramp to program at least 13.2 V from the
+            // first step. Above-spec at low frequencies is harmless; the chips
+            // just have headroom they don't use.
+            //
+            // Long-term fix is per-chip-family voltage-frequency tables in
+            // chip_config.rs but that's a wider refactor.
+            voltage_range: (13.2, 15.0),
+            // Match EEPROM-specified operating voltage for BHB42601.
+            target_voltage: 13.2,
+            voltage_step: 0.1,
+            // 12.0 V runtime floor — the original S19j Pro driver's
+            // `set_voltage` clamp. Cold-init clamps higher via voltage_range.
+            psu_clamp: (12.0, 15.0),
+            // BM1362 operating max (MHz). The S19j Pro driver had no thermal
+            // cap before this unification; routing it through the shared
+            // multi-board path adds the protective throttle. The BM1362
+            // factory/operating point is 525 MHz (chip_config::bm1362
+            // max_freq), so a 525 MHz ceiling never bites under normal
+            // temps — it only sheds frequency as the board heats.
+            thermal_cap_max_mhz: 525,
+            // BM1362 keeps the fixed SERIAL_BAUD — the original single-board
+            // S19j driver left the 3.125 Mbaud switch OFF (`None`), and that's
+            // the path currently mining on real S19j hardware. Do not enable
+            // the switch here without validating it on a BM1362 board first.
+            post_broadcast_baud: None,
+        },
+    }
+}
+
+/// Board-level model, resolved from the first configured hashboard. A
+/// mixed-model chassis isn't supported; every hashboard shares one model.
+fn board_model(config: &AmlogicControlBoardConfig) -> HashboardModel {
+    config
+        .hashboards
+        .first()
+        .map(|hb| hb.model)
+        .unwrap_or(HashboardModel::S19kPro)
+}
+
+/// Per-model default board name used when the config leaves `board_name`
+/// unset. Kept per-model so existing device IDs stay stable.
+fn default_board_name(model: HashboardModel) -> &'static str {
+    match model {
+        HashboardModel::S19jPro => "s19jpro-amlogic",
+        HashboardModel::S19kPro => "s19kpro-amlogic",
+    }
+}
 
 /// Install the config used by the native Amlogic virtual board factory.
 pub fn install_config(config: AmlogicControlBoardConfig) -> crate::error::Result<()> {
@@ -143,7 +305,7 @@ pub fn device_id(config: &AmlogicControlBoardConfig) -> String {
     config
         .board_name
         .clone()
-        .unwrap_or_else(|| DEFAULT_BOARD_NAME.to_string())
+        .unwrap_or_else(|| default_board_name(board_model(config)).to_string())
 }
 
 /// One hashboard, after `select_present_hashboards` + `perform_health_gate`.
@@ -153,17 +315,22 @@ struct SelectedHashboard {
     board_serial: Option<String>,
 }
 
-/// Native Amlogic S19k Pro board.
+/// Native Amlogic S19x Pro board.
 ///
-/// Holds one or more `SelectedHashboard`s — the BHB56902 hardware
-/// supports up to three hashboards on the same APW12 / Amlogic SoC,
-/// and `select_present_hashboards` picks every slot whose detect GPIO
-/// reads "present". `create_hash_threads` then spawns one
-/// [`BoardStateHashThread`] per board so each chain mines
-/// independently; the shared APW12 is coordinated through a
+/// Holds one or more `SelectedHashboard`s — the Amlogic control board
+/// supports up to three hashboards on the same APW12 / A113D SoC, and
+/// `select_present_hashboards` picks every slot whose detect GPIO reads
+/// "present". `create_hash_threads` then spawns one
+/// [`BoardStateHashThread`] per board so each chain mines independently;
+/// the shared APW12 is coordinated through a
 /// [`bm13xx::chain_config::ChainCoordinator`] so the per-step voltage
 /// commands during the frequency ramp don't oscillate across chains.
-pub struct S19kProAmlogic {
+///
+/// Each present hashboard is configured from its own model's
+/// [`HashboardSpec`] (chip family + topology + voltage), so a homogeneous
+/// S19j *or* S19k chassis both run every present board through the same
+/// code path.
+pub struct S19xAmlogic {
     config: AmlogicControlBoardConfig,
     selected_hashboards: Vec<SelectedHashboard>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
@@ -172,7 +339,7 @@ pub struct S19kProAmlogic {
     telemetry_shutdown: CancellationToken,
 }
 
-impl S19kProAmlogic {
+impl S19xAmlogic {
     fn new(
         config: AmlogicControlBoardConfig,
         selected_hashboards: Vec<SelectedHashboard>,
@@ -194,16 +361,18 @@ impl S19kProAmlogic {
         state_tx: &watch::Sender<BoardState>,
     ) -> Result<(Vec<SelectedHashboard>, Arc<Mutex<NativeAmlogicPsu>>), BoardError> {
         let board_name = device_id(config);
+        let model = board_model(config);
         let present = select_present_hashboards(config)?;
 
         info!(
             board = %board_name,
+            model = %model.board_model_label(),
             slots = %present
                 .iter()
                 .map(|hb| hb.index.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            "Initializing native Amlogic S19k Pro board"
+            "Initializing native Amlogic S19x Pro board"
         );
 
         // Health-gate every present hashboard before energizing chips.
@@ -224,7 +393,7 @@ impl S19kProAmlogic {
         configure_fans(config, config.startup.default_fan_percent)?;
         assert_all_resets(config)?;
 
-        let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config)));
+        let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config, model)));
         let measured_voltage = {
             let mut psu_guard = psu.lock().await;
             psu_guard
@@ -325,7 +494,7 @@ impl S19kProAmlogic {
 
         state_tx.send_modify(|state| {
             state.name = board_name.clone();
-            state.model = BOARD_MODEL.into();
+            state.model = model.board_model_label().into();
             state.serial = primary_serial.clone();
             state.temperatures = all_temps.clone();
             state.fans = fan_states.clone();
@@ -337,10 +506,10 @@ impl S19kProAmlogic {
 }
 
 #[async_trait]
-impl Board for S19kProAmlogic {
+impl Board for S19xAmlogic {
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
-            model: BOARD_MODEL.into(),
+            model: board_model(&self.config).board_model_label().into(),
             firmware_version: None,
             serial_number: self
                 .selected_hashboards
@@ -402,9 +571,11 @@ impl Board for S19kProAmlogic {
         // and the telemetry task. The telemetry task lowers it as the hottest
         // sensor climbs and raises it as the board cools; each actor enforces
         // `min(requested, cap)` on its tick. Starts at the operating max
-        // (uncapped). Shared because the chains sit on one rail and one
-        // airflow path — throttling them together is correct.
-        let thermal_cap_mhz = Arc::new(AtomicU32::new(THERMAL_CAP_MAX_MHZ));
+        // (uncapped), resolved from the board's model. Shared because the
+        // chains sit on one rail and one airflow path — throttling them
+        // together is correct.
+        let thermal_cap_max_mhz = hashboard_spec(board_model(&self.config)).thermal_cap_max_mhz;
+        let thermal_cap_mhz = Arc::new(AtomicU32::new(thermal_cap_max_mhz));
 
         let mut threads: Vec<Box<dyn HashThread>> = Vec::with_capacity(n_chains);
         let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
@@ -412,6 +583,10 @@ impl Board for S19kProAmlogic {
 
         for selected in self.selected_hashboards.clone() {
             let hb = &selected.config;
+            // Per-hashboard chip-family spec. In practice a chassis is
+            // homogeneous, but resolving per-hashboard keeps each chain
+            // correct even if that ever changes.
+            let spec = hashboard_spec(hb.model);
 
             let data_stream = SerialStream::new(&hb.serial_path.to_string_lossy(), SERIAL_BAUD)
                 .map_err(|e| {
@@ -429,20 +604,31 @@ impl Board for S19kProAmlogic {
             let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
             let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
-            // Original SerialControl held alive in the adapter so the
-            // `/dev/ttyS*` fd never closes mid-init when the actor
-            // swaps writer/reader pairs across a baud bump. Per-
-            // hashboard adapter so each chain owns its own keepalive.
-            let chip_uart_baud = Arc::new(Mutex::new(SerialControlAdapter {
-                path: hb.serial_path.clone(),
-                staged_control: None,
-                _original_keepalive: Some(data_control),
-            }));
+            // Chip-UART baud is per-model (see `HashboardSpec.post_broadcast_baud`).
+            // BM1366 (S19k) switches to 3.125 Mbaud after the broadcast phase and
+            // needs the adapter to hold the original SerialControl alive so the
+            // `/dev/ttyS*` fd never closes mid-init when the actor swaps
+            // writer/reader pairs across the baud bump (per-hashboard so each
+            // chain owns its own keepalive). BM1362 (S19j) keeps the fixed
+            // SERIAL_BAUD — no reopen, so no adapter and `data_control` is just
+            // dropped after the flush above.
+            let chip_uart_baud: Option<
+                Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>,
+            > = if spec.post_broadcast_baud.is_some() {
+                Some(Arc::new(Mutex::new(SerialControlAdapter {
+                    path: hb.serial_path.clone(),
+                    staged_control: None,
+                    _original_keepalive: Some(data_control),
+                })))
+            } else {
+                drop(data_control);
+                None
+            };
 
             let config = ChainConfig {
-                name: format!("S19kProAmlogic-HB{}", hb.index),
-                topology: TopologySpec::uniform_domains(11, 7, false),
-                chip_config: chip_config::bm1366(),
+                name: format!("{}-HB{}", spec.chain_label, hb.index),
+                topology: spec.topology.clone(),
+                chip_config: spec.chip_config.clone(),
                 peripherals: ChainPeripherals {
                     asic_enable: Arc::new(Mutex::new(NativeResetControl {
                         gpio: SysfsGpio::new(hb.reset_gpio),
@@ -451,15 +637,14 @@ impl Board for S19kProAmlogic {
                     voltage_regulator: Some(
                         Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
                     ),
-                    chip_uart_baud: Some(chip_uart_baud
-                        as Arc<Mutex<dyn bm13xx::chain_config::ChipUartBaudControl + Send>>),
+                    chip_uart_baud,
                     ramp_coordinator: ramp_coordinator.clone(),
                     thermal_cap_mhz: Some(Arc::clone(&thermal_cap_mhz)),
                 },
-                // 3.125 Mbaud post-broadcast switch — see commit
-                // history for the chip-side register / numeric-rate
-                // and fd-keepalive fixes that made this reliable.
-                post_broadcast_chip_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
+                // Per-model post-broadcast baud (see `HashboardSpec`): BM1366
+                // switches to 3.125 Mbaud after the broadcast phase; BM1362
+                // stays at the fixed SERIAL_BAUD.
+                post_broadcast_chip_baud: spec.post_broadcast_baud,
             };
 
             let inner_thread =
@@ -543,6 +728,7 @@ impl Board for S19kProAmlogic {
                 state_tx,
                 thread_states,
                 Some(thermal_cap),
+                thermal_cap_max_mhz,
                 shutdown,
             )
             .await;
@@ -574,21 +760,21 @@ struct BoardStateHashThread {
     /// Hold time after asserting reset and before bringing the PSU
     /// back up. Without this, RST_N is asserted only nanoseconds
     /// before the rail comes alive and the daisy-chained signal does
-    /// not propagate to all 77 chips in time, leaving a random ~30/77
+    /// not propagate to all chips in time, leaving a random subset
     /// in indeterminate state. Mirrors the `reset_assert_ms` sleep
     /// inside cold-boot `assert_all_resets()`.
     reset_assert_ms: u64,
     /// Voltage to command on resume *before* PSU enable, so chips
     /// power up at the same level as a cold boot (12 V) rather than
-    /// the last operating voltage (13.9 V) which the APW12 retains
-    /// across enable cycles. The frequency ramp brings it back up.
+    /// the last operating voltage which the APW12 retains across
+    /// enable cycles. The frequency ramp brings it back up.
     initial_voltage_v: f32,
     /// i2c device path and PIC address used to re-handshake the on-
     /// hashboard PIC16F1704 on resume. The PIC's LDO is fed from the
     /// same 12 V rail we drop on pause, so it loses state and the
     /// per-domain DC-DCs come back disabled. Without re-running
     /// handshake → enable_dc_dc, only chips on domains that happen to
-    /// power up on their own respond on UART (scattered ~30/77).
+    /// power up on their own respond on UART.
     pic_i2c_device: PathBuf,
     pic_slot_index: u8,
 }
@@ -724,8 +910,8 @@ impl HashThread for BoardStateHashThread {
         // Hard pause: drop the chip power rail. The chain comes back
         // cold-booted on resume, which is the same path `start_async`
         // uses at process startup and is known to work — unlike the
-        // UART `disable_chips()` path that gets only ~37/77 chips
-        // back on BHB56902 after re-enumeration.
+        // UART `disable_chips()` path that gets only a subset of chips
+        // back after re-enumeration.
         //
         // Order matters:
         //   - on pause:  zero the inner thread first (so the per-board
@@ -743,8 +929,7 @@ impl HashThread for BoardStateHashThread {
             // they're still in a free-running state, internal logic
             // can land in indeterminate flip-flop states that survive
             // a brief power dip — exactly the failure mode the legacy
-            // disable_chips() path hit (~37/77 chips back, comment
-            // at thread_v2.rs:1255-1263). Driving reset low first puts
+            // disable_chips() path hit. Driving reset low first puts
             // chips into a known synchronous reset state before the
             // rail falls.
             if let Err(e) = SysfsGpio::new(self.reset_gpio).set_output_low() {
@@ -764,19 +949,19 @@ impl HashThread for BoardStateHashThread {
             result
         } else {
             // Hard resume — mirror the cold-boot sequence in
-            // `S19kProAmlogic::initialize`:
+            // `S19xAmlogic::initialize`:
             //
             //   1. Assert hashboard reset BEFORE the PSU comes on.
             //      Chips power up while held in reset. The previous
             //      version didn't do this; chips powered up with reset
             //      already released and ended up in indeterminate state.
-            //      Verify_chain then saw a random ~30/77 each pass.
+            //      Verify_chain then saw a random subset each pass.
             //   2. Drop the PSU voltage back to the cold-boot setpoint
             //      (12 V). The APW12 retains the last commanded
             //      voltage across an enable/disable cycle, so without
-            //      this re-enable comes back at 13.9 V — too hot a
-            //      start for cold chips, plus the frequency ramp
-            //      expects to begin at the low rail anyway.
+            //      this re-enable comes back at the operating voltage —
+            //      too hot a start for cold chips, plus the frequency
+            //      ramp expects to begin at the low rail anyway.
             //   3. Enable the PSU. Chips now have power, are at 12 V,
             //      and are held in reset by step 1.
             //   4. Sleep psu_settle_ms so the APW12 stabilizes.
@@ -789,8 +974,8 @@ impl HashThread for BoardStateHashThread {
             }
             // Hold reset asserted before PSU comes up. Without this
             // the RST_N edge happens microseconds before the rail
-            // appears and does not propagate to all 77 daisy-chained
-            // chips, leaving a random ~30/77 in indeterminate state.
+            // appears and does not propagate to all daisy-chained
+            // chips, leaving a random subset in indeterminate state.
             tokio::time::sleep(Duration::from_millis(self.reset_assert_ms)).await;
             {
                 let mut psu = self.psu.lock().await;
@@ -806,12 +991,12 @@ impl HashThread for BoardStateHashThread {
             }
             tokio::time::sleep(Duration::from_millis(self.psu_settle_ms)).await;
 
-            // PIC handshake — BHB56902 has a PIC16F1704 that gates the
-            // per-domain DC-DCs and is fed from the same 12 V rail we
-            // just dropped. Without re-running handshake →
+            // PIC handshake — PIC-variant hashboards have a PIC16F1704
+            // that gates the per-domain DC-DCs and is fed from the same
+            // 12 V rail we just dropped. Without re-running handshake →
             // enable_dc_dc, only chips on the handful of domains that
-            // happen to come up power-on survive (verified: scattered
-            // ~30/77). Mirror the cold-boot path in `initialize`.
+            // happen to come up power-on survive. Mirror the cold-boot
+            // path in `initialize`.
             //
             // Best-effort: any failure here gets a WARN like cold boot;
             // the next initialize_chips() will still try to enumerate
@@ -897,16 +1082,22 @@ struct NativeAmlogicPsu {
     write_register: u8,
     enable_gpio: u32,
     enabled: bool,
+    /// Board-level model. The APW12 is shared across all hashboards, so
+    /// its per-model voltage envelope (`voltage_range`, `target_voltage`,
+    /// `voltage_step`, runtime clamp) is resolved from the board's model
+    /// via [`hashboard_spec`]. In practice every hashboard shares one model.
+    model: HashboardModel,
 }
 
 impl NativeAmlogicPsu {
-    fn new(config: &AmlogicControlBoardConfig) -> Self {
+    fn new(config: &AmlogicControlBoardConfig, model: HashboardModel) -> Self {
         Self {
             i2c_device: config.psu.i2c_device.clone(),
             address: config.psu.address,
             write_register: config.psu.write_register,
             enable_gpio: config.psu.enable_gpio,
             enabled: false,
+            model,
         }
     }
 
@@ -1003,10 +1194,12 @@ impl Drop for NativeAmlogicPsu {
 #[async_trait]
 impl VoltageRegulator for NativeAmlogicPsu {
     async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()> {
-        // 11.7 V floor lets the runtime voltage bands (M1.5) reach the APW12's
-        // hardware minimum (~11.78 V, DAC=255). Cold-init voltages clamp higher
-        // upstream (voltage_range), so this only widens the *runtime* range.
-        let clamped = volts.clamp(11.7, 15.0);
+        // Runtime voltage clamp is per-model (see `HashboardSpec::psu_clamp`);
+        // it is wider than the cold-init `voltage_range` and only governs the
+        // runtime voltage bands. The min lets the bands reach the APW12's
+        // hardware floor; cold-init voltages clamp higher upstream.
+        let (clamp_min, clamp_max) = hashboard_spec(self.model).psu_clamp;
+        let clamped = volts.clamp(clamp_min, clamp_max);
         let dac = encode_voltage_to_dac(clamped);
 
         // The APW12 firmware on this control board (`get-fw` reports
@@ -1057,38 +1250,17 @@ impl VoltageRegulator for NativeAmlogicPsu {
     }
 
     fn voltage_range(&self) -> (f32, f32) {
-        // BHB56902 factory ATE setpoint is 13.90 V / 645 MHz (Braiins'
-        // `Detected hashboard #2: Voltage (Avg.) 13.90 V, Frequency
-        // (Avg.) 645 MHz, Hashrate 44400.51 GH/s`).
-        //
-        // The min is set to the factory chain voltage. The shared
-        // frequency-ramp voltage formula (`voltage_for_frequency_stacked`)
-        // was tuned for BM1362 and returns ~0.3 V/chip; with 11
-        // domains it would set 3.46 V across the chain, which is far
-        // below what BM1366 needs to PLL-lock at 645 MHz. With a
-        // 13.9 V floor the ramp clamps up to the factory setpoint
-        // immediately, matching what LuxOS and Braiins do (they set
-        // voltage to target *before* ramping frequency).
-        //
-        // verify_chain after ramp reports few chips alive at 13.9 V
-        // (e.g. 16/77), but observed hashrate (~27 TH/s on the dummy
-        // source vs ~14 TH/s at the 13.0 V floor with 67 reported)
-        // shows that more chips are actually mining than the polled
-        // verify can see at 3.125 Mbaud — the polled read is what's
-        // flaky, not the chips themselves.
-        (13.9, 14.5)
+        // Per-model cold-init voltage clamp — see `HashboardSpec::voltage_range`.
+        hashboard_spec(self.model).voltage_range
     }
 
     fn target_voltage(&self) -> f32 {
-        // Factory-equivalent operating point, matching Braiins's
-        // `Voltage(13.9)` for this hashboard. With 500 MHz frequency
-        // mujina was at ~21 TH/s; at 645 MHz + 13.9 V Braiins gets
-        // ~30 TH/s on the same chips.
-        13.9
+        // Per-model factory/operating setpoint — see `HashboardSpec::target_voltage`.
+        hashboard_spec(self.model).target_voltage
     }
 
     fn voltage_step(&self) -> f32 {
-        0.1
+        hashboard_spec(self.model).voltage_step
     }
 }
 
@@ -1228,8 +1400,8 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
 }
 
 // --- M4 thermal throttle (graduated frequency reduction below the hard cutoff) ---
-/// No throttle: the BM1366 operating max (MHz). The cap never exceeds this.
-const THERMAL_CAP_MAX_MHZ: u32 = 575;
+// The upper bound (no-throttle ceiling) is per-model
+// (`HashboardSpec::thermal_cap_max_mhz`) and passed into the telemetry task.
 /// Frequency floor (MHz) the throttle won't go below — if the board is still
 /// too hot here, the 65 °C TMP75 hard cutoff takes over.
 const THERMAL_CAP_MIN_MHZ: u32 = 200;
@@ -1244,6 +1416,7 @@ const THERMAL_THROTTLE_RELEASE_C: f32 = 54.0;
 const THERMAL_STEP_DOWN_MHZ: u32 = 25;
 const THERMAL_STEP_UP_MHZ: u32 = 6;
 
+#[allow(clippy::too_many_arguments)]
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
     hashboards: Vec<AmlogicHashboardConfig>,
@@ -1251,6 +1424,7 @@ async fn native_telemetry_task(
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     thermal_cap_mhz: Option<Arc<AtomicU32>>,
+    thermal_cap_max_mhz: u32,
     shutdown: CancellationToken,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -1356,7 +1530,7 @@ async fn native_telemetry_task(
 
         // ----- Fan + overtemp control --------------------------------
         //
-        // The BHB56902 doesn't expose the BM1366's on-die thermal
+        // The Amlogic hashboards don't expose the BM13xx on-die thermal
         // diode the way a Bitaxe does (which routes it to an EMC2101
         // fan controller, then reads it over i2c — see
         // `bitaxeorg/ESP-Miner::main/thermal/EMC2101.{c,h}` and
@@ -1439,7 +1613,7 @@ async fn native_telemetry_task(
                     cap.saturating_sub(THERMAL_STEP_DOWN_MHZ)
                         .max(THERMAL_CAP_MIN_MHZ)
                 } else if t <= THERMAL_THROTTLE_RELEASE_C {
-                    (cap + THERMAL_STEP_UP_MHZ).min(THERMAL_CAP_MAX_MHZ)
+                    (cap + THERMAL_STEP_UP_MHZ).min(thermal_cap_max_mhz)
                 } else {
                     cap // hysteresis band — hold
                 }
@@ -1760,25 +1934,25 @@ async fn create_amlogic_board()
     let name = device_id(&config);
     let initial_state = BoardState {
         name: name.clone(),
-        model: BOARD_MODEL.into(),
+        model: board_model(&config).board_model_label().into(),
         serial: Some(name),
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let (selected_hashboards, psu) = S19kProAmlogic::initialize(&config, &state_tx)
+    let (selected_hashboards, psu) = S19xAmlogic::initialize(&config, &state_tx)
         .await
         .map_err(|e| Error::Hardware(format!("Failed to initialize native Amlogic board: {e}")))?;
 
-    let board = S19kProAmlogic::new(config, selected_hashboards, psu, state_tx);
+    let board = S19xAmlogic::new(config, selected_hashboards, psu, state_tx);
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
 }
 
 inventory::submit! {
     VirtualBoardDescriptor {
-        device_type: "s19k_pro_amlogic",
-        name: BOARD_MODEL,
+        device_type: "s19x_amlogic",
+        name: UNIFIED_BOARD_MODEL,
         create_fn: || Box::pin(create_amlogic_board()),
     }
 }

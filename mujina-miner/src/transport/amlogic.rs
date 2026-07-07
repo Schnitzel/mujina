@@ -20,9 +20,9 @@ pub enum TransportEvent {
 pub struct AmlogicDeviceInfo {
     /// Unique identifier for this configured device.
     pub device_id: String,
-    /// Hashboard model selected at config time, used by the backplane
-    /// to dispatch to the right board factory (`s19j_pro_amlogic` vs
-    /// `s19k_pro_amlogic`). Both models share the AmlogicControlBoard
-    /// schema; they differ only in chip family + topology.
+    /// Hashboard model selected at config time. Both S19j Pro and S19k
+    /// Pro are handled by the single unified `s19x_amlogic` board
+    /// factory; the model is carried here so the board can resolve the
+    /// per-model chip-family spec (chip family + topology + voltage).
     pub model: HashboardModel,
 }
