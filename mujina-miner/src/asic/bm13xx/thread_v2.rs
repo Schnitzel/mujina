@@ -67,6 +67,15 @@ const CHIP_CENSUS_WINDOW: Duration = Duration::from_secs(90);
 /// runs at a low frequency.
 const CHIP_CENSUS_WINDOW_MAX: Duration = Duration::from_secs(300);
 
+/// Chip count the census window was calibrated against (S19k Pro = 11 domains
+/// × 7 = 77). The chain-wide nonce report rate is throttled roughly constant
+/// (ticket mask), so it's split across all chips: a chain with more chips
+/// samples each one proportionally less often within a fixed window.
+/// `census_window` scales up by `chip_count / this` so per-chip sampling stays
+/// constant across chip families — e.g. the S19j Pro's 42×3 = 126 chips get a
+/// ~1.6× longer window instead of being false-flagged as "missing".
+const CENSUS_REFERENCE_CHIPS: usize = 77;
+
 /// After a runtime frequency change of at least this magnitude (MHz), re-assert
 /// the reception-critical broadcast config (Core, TicketMask, AnalogMux,
 /// IoDriverStrength, per-domain UartRelay — no PLL/baud writes). Deep PLL
@@ -626,11 +635,22 @@ impl BM13xxActor {
     fn census_window(&self) -> Duration {
         let f = self.current_freq_mhz;
         let reference = self.max_runtime_freq_mhz;
-        if f <= 0.0 || reference <= f {
-            return CHIP_CENSUS_WINDOW;
-        }
+        // Frequency factor: each chip emits nonces at a rate ∝ frequency, so a
+        // lower frequency needs a proportionally longer window to sample it.
+        let freq_factor = if f > 0.0 && reference > f {
+            reference / f
+        } else {
+            1.0
+        };
+        // Chip-count factor: more chips share the same throttled chain-wide
+        // nonce budget, so each is sampled less often. Scale up (never down)
+        // relative to the S19k Pro calibration so a higher-chip-count chain
+        // (e.g. S19j Pro's 126) isn't undercounted. S19k (77 chips) → 1.0, so
+        // its census is unchanged.
+        let count_factor =
+            (self.chain.chip_count() as f32 / CENSUS_REFERENCE_CHIPS as f32).max(1.0);
         CHIP_CENSUS_WINDOW
-            .mul_f32(reference / f)
+            .mul_f32(freq_factor * count_factor)
             .min(CHIP_CENSUS_WINDOW_MAX)
     }
 
