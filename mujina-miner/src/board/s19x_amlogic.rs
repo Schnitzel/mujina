@@ -654,7 +654,7 @@ impl S19xAmlogic {
             psu_guard
                 .set_enabled(true)
                 .map_err(|e| BoardError::HardwareControl(format!("Failed to enable PSU: {e}")))?;
-            if let Err(e) = psu_guard.config_watchdog(0x00) {
+            if let Err(e) = psu_guard.config_watchdog(0x00).await {
                 warn!(
                     "PSU watchdog disable rejected (firmware variant?), continuing: {}",
                     e
@@ -668,7 +668,7 @@ impl S19xAmlogic {
                 })?;
 
             tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
-            psu_guard.measure_voltage().ok()
+            psu_guard.measure_voltage().await.ok()
         };
 
         // PIC handshake — best-effort per present hashboard. On
@@ -1384,21 +1384,21 @@ impl NativeAmlogicPsu {
         Ok(())
     }
 
-    fn config_watchdog(&mut self, value: u8) -> anyhow::Result<()> {
-        self.exchange(CMD_WATCHDOG, &[value, 0x00])?;
+    async fn config_watchdog(&self, value: u8) -> anyhow::Result<()> {
+        self.exchange(CMD_WATCHDOG, vec![value, 0x00]).await?;
         Ok(())
     }
 
-    fn measure_voltage(&mut self) -> anyhow::Result<f32> {
-        let frame = self.exchange(CMD_MEASURE_VOLTAGE, &[])?;
+    async fn measure_voltage(&self) -> anyhow::Result<f32> {
+        let frame = self.exchange(CMD_MEASURE_VOLTAGE, Vec::new()).await?;
         if frame.payload.len() < 2 {
             return Err(anyhow::anyhow!("missing ADC payload from PSU"));
         }
         Ok(decode_measured_voltage(frame.payload[0], frame.payload[1]))
     }
 
-    fn read_target_voltage(&mut self) -> anyhow::Result<f32> {
-        let frame = self.exchange(CMD_GET_VOLTAGE, &[])?;
+    async fn read_target_voltage(&self) -> anyhow::Result<f32> {
+        let frame = self.exchange(CMD_GET_VOLTAGE, Vec::new()).await?;
         let dac = *frame
             .payload
             .first()
@@ -1406,47 +1406,89 @@ impl NativeAmlogicPsu {
         Ok(decode_dac_to_voltage(dac))
     }
 
-    fn exchange(
-        &mut self,
+    /// Run a PSU protocol exchange on tokio's blocking-thread-pool.
+    ///
+    /// The underlying i2c-dev SMBUS ioctl (and the retry sleeps around it, in
+    /// [`exchange_blocking`]) are synchronous kernel calls with NO
+    /// userspace-enforced timeout: if the APW12 or the i2c-1 bus wedges, the
+    /// ioctl can block the calling OS thread forever. Running that inline on
+    /// a tokio async worker thread would starve the whole runtime — including
+    /// its own timer driver, which is what `tokio::time::timeout` needs to
+    /// fire — if every worker thread ends up parked in one of these blocking
+    /// calls. That is exactly what took mujina's scheduler task down on .222
+    /// after a burst of dial commands: GET requests (served by unaffected
+    /// worker threads) kept working, but the scheduler's own periodic tick
+    /// and every subsequent command stopped forever, recoverable only by a
+    /// PSU power-cycle + cold-init.
+    ///
+    /// `spawn_blocking` moves the exchange onto tokio's dedicated
+    /// blocking-thread-pool (grown on demand, separate from the async worker
+    /// pool), so a wedged bus can leak at most one blocking-pool thread —
+    /// never the reactor. `NativeAmlogicPsu` doesn't hold an open file handle
+    /// (each exchange opens its own `LinuxI2cDevice`), so cloning the small
+    /// set of fields the blocking body needs into a `move` closure is cheap
+    /// and doesn't require `Self: 'static` or any lock across the await.
+    async fn exchange(
+        &self,
         command: u8,
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> anyhow::Result<amlogic_cb_tools::protocol::Frame> {
-        let mut dev = LinuxI2cDevice::open(&self.i2c_device, self.address)?;
-        let frame = build_frame(command, payload);
-        for byte in frame {
-            dev.write_byte_transaction(self.write_register, byte)?;
+        let i2c_device = self.i2c_device.clone();
+        let address = self.address;
+        let write_register = self.write_register;
+        tokio::task::spawn_blocking(move || {
+            exchange_blocking(&i2c_device, address, write_register, command, &payload)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("PSU exchange task panicked: {e}"))?
+    }
+}
+
+/// Blocking body of [`NativeAmlogicPsu::exchange`]. MUST run via
+/// `spawn_blocking` — see the doc comment there for why calling this inline
+/// from async code is a real hang risk, not just a style nit.
+fn exchange_blocking(
+    i2c_device: &Path,
+    address: u16,
+    write_register: u8,
+    command: u8,
+    payload: &[u8],
+) -> anyhow::Result<amlogic_cb_tools::protocol::Frame> {
+    let mut dev = LinuxI2cDevice::open(i2c_device, address)?;
+    let frame = build_frame(command, payload);
+    for byte in frame {
+        dev.write_byte_transaction(write_register, byte)?;
+    }
+
+    std::thread::sleep(Duration::from_millis(PSU_RESPONSE_DELAY_MS));
+
+    let mut last_error = None;
+    for _ in 0..PSU_MAX_RESPONSE_ATTEMPTS {
+        match read_psu_response_frame(&mut dev) {
+            Ok(response) if response == [NAK_BYTE] => {
+                last_error = Some(anyhow::anyhow!("PSU returned NAK"));
+            }
+            Ok(response) => match parse_frame(&response) {
+                Ok(frame) if frame.command == command => return Ok(frame),
+                Ok(frame) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "unexpected PSU response command 0x{:02X} for request 0x{command:02X}",
+                        frame.command
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(anyhow::Error::new(err));
+                }
+            },
+            Err(err) => {
+                last_error = Some(err);
+            }
         }
 
         std::thread::sleep(Duration::from_millis(PSU_RESPONSE_DELAY_MS));
-
-        let mut last_error = None;
-        for _ in 0..PSU_MAX_RESPONSE_ATTEMPTS {
-            match read_psu_response_frame(&mut dev) {
-                Ok(response) if response == [NAK_BYTE] => {
-                    last_error = Some(anyhow::anyhow!("PSU returned NAK"));
-                }
-                Ok(response) => match parse_frame(&response) {
-                    Ok(frame) if frame.command == command => return Ok(frame),
-                    Ok(frame) => {
-                        last_error = Some(anyhow::anyhow!(
-                            "unexpected PSU response command 0x{:02X} for request 0x{command:02X}",
-                            frame.command
-                        ));
-                    }
-                    Err(err) => {
-                        last_error = Some(anyhow::Error::new(err));
-                    }
-                },
-                Err(err) => {
-                    last_error = Some(err);
-                }
-            }
-
-            std::thread::sleep(Duration::from_millis(PSU_RESPONSE_DELAY_MS));
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no valid PSU response received")))
     }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no valid PSU response received")))
 }
 
 impl Drop for NativeAmlogicPsu {
@@ -1487,7 +1529,7 @@ impl VoltageRegulator for NativeAmlogicPsu {
         // refuses to assign jobs.
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..4 {
-            match self.exchange(CMD_SET_VOLTAGE, &[dac, 0x00]) {
+            match self.exchange(CMD_SET_VOLTAGE, vec![dac, 0x00]).await {
                 Ok(_) => {
                     if attempt > 0 {
                         warn!(
@@ -1502,7 +1544,7 @@ impl VoltageRegulator for NativeAmlogicPsu {
                     // Try a readback; if that succeeds and matches, the
                     // earlier write probably did land. If readback itself
                     // NAKs, retry the whole thing.
-                    if let Ok(readback) = self.read_target_voltage() {
+                    if let Ok(readback) = self.read_target_voltage().await {
                         if (readback - clamped).abs() <= 0.15 {
                             warn!(
                                 requested = clamped,
@@ -1992,7 +2034,7 @@ async fn native_telemetry_task(
         }
 
         let fans = read_fan_states(&config, target_fan_percent).await;
-        let voltage_v = match psu.lock().await.measure_voltage() {
+        let voltage_v = match psu.lock().await.measure_voltage().await {
             Ok(voltage_v) => Some(voltage_v),
             Err(error) => {
                 debug!(error = %error, "Native telemetry PSU voltage read failed");
