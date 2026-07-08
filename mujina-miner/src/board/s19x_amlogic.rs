@@ -138,6 +138,14 @@ const FAN_PWM_PERIOD_NS: u32 = 10_000;
 const SERIAL_BAUD: u32 = 115_200;
 const PSU_RESPONSE_DELAY_MS: u64 = 500;
 const PSU_MAX_RESPONSE_ATTEMPTS: usize = 3;
+/// Resume-time PIC handshake retries. Covers a transient "No such device or
+/// address" on a *known* PIC-variant hashboard right after its 12 V rail
+/// comes back up on resume — observed on .222 (hashboard 1 failed once, then
+/// handshaked cleanly on the very next full cold-init with no hardware
+/// change). Bounded and short: this is a best-effort ride-over-a-blip, not a
+/// substitute for the chain's own health checks.
+const PIC_RESUME_HANDSHAKE_ATTEMPTS: usize = 3;
+const PIC_RESUME_RETRY_DELAY_MS: u64 = 250;
 const EEPROM_LEN: usize = 256;
 const TMP75_TEMP_REG: u8 = 0x00;
 
@@ -1268,39 +1276,36 @@ impl HashThread for BoardStateHashThread {
             // happen to come up power-on survive. Mirror the cold-boot
             // path in `initialize`.
             //
-            // Best-effort: any failure here gets a WARN like cold boot;
-            // the next initialize_chips() will still try to enumerate
-            // (and will likely fail visibly, which is the right signal).
+            // Retried a few times (PIC_RESUME_HANDSHAKE_ATTEMPTS): a
+            // present-but-unresponsive PIC right after the rail comes back
+            // up on resume is a real, observed transient (.222, hashboard 1
+            // failed once on resume, then handshaked cleanly on the very
+            // next full cold-init with no hardware change) — worth riding
+            // over rather than stranding the whole hashboard until a manual
+            // power-cycle. Still best-effort: exhausting retries only WARNs;
+            // the next initialize_chips() will still try to enumerate (and
+            // will likely fail visibly, which is the right signal).
             let pic_addr = pic_address_for_slot(self.pic_slot_index);
-            match PicChain::open(&self.pic_i2c_device, pic_addr) {
-                Ok(mut pic) => match pic.handshake() {
-                    Ok(version) => {
-                        info!(
-                            addr = format_args!("0x{:02x}", pic_addr),
-                            version = format_args!("0x{:02x}", version),
-                            "PIC handshake ok on resume"
-                        );
-                        if let Err(e) = pic.enable_dc_dc() {
-                            warn!(
-                                addr = format_args!("0x{:02x}", pic_addr),
-                                error = %e,
-                                "PIC enable_dc_dc failed on resume; chips may not power up"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            addr = format_args!("0x{:02x}", pic_addr),
-                            error = %e,
-                            "PIC handshake failed on resume; chain may not respond on UART"
-                        );
-                    }
-                },
-                Err(e) => {
+            match pic_handshake_and_enable_dc_dc(&self.pic_i2c_device, pic_addr).await {
+                Ok(Some(version)) => {
+                    info!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        version = format_args!("0x{:02x}", version),
+                        "PIC handshake ok on resume"
+                    );
+                }
+                Ok(None) => {
                     debug!(
                         addr = format_args!("0x{:02x}", pic_addr),
-                        error = %e,
                         "PIC absent on resume (noPIC variant?)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        attempts = PIC_RESUME_HANDSHAKE_ATTEMPTS,
+                        error = %e,
+                        "PIC handshake failed on resume after retries; chain may not respond on UART"
                     );
                 }
             }
@@ -1489,6 +1494,103 @@ fn exchange_blocking(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no valid PSU response received")))
+}
+
+/// Open the on-hashboard PIC, handshake, and enable its DC-DCs — one
+/// atomic blocking unit, retried as a whole by
+/// [`pic_handshake_and_enable_dc_dc`]. Distinct outcomes so the retry loop
+/// can tell "no PIC at this address" (don't bother retrying — likely a
+/// noPIC variant) from "PIC present but didn't answer this time" (worth
+/// retrying).
+///
+/// MUST run via `spawn_blocking` — `PicChain` opens the same kind of raw
+/// `LinuxI2cDevice` as [`exchange_blocking`], with the same no-userspace-
+/// timeout risk if called inline from async code.
+fn pic_handshake_and_enable_dc_dc_blocking(
+    pic_i2c_device: &Path,
+    pic_addr: u16,
+) -> Result<u8, PicHandshakeError> {
+    let mut pic =
+        PicChain::open(pic_i2c_device, pic_addr).map_err(PicHandshakeError::Absent)?;
+    let version = pic.handshake().map_err(PicHandshakeError::Handshake)?;
+    pic.enable_dc_dc().map_err(PicHandshakeError::EnableDcDc)?;
+    Ok(version)
+}
+
+/// Outcome of [`pic_handshake_and_enable_dc_dc_blocking`] — kept distinct
+/// (rather than collapsed into one `anyhow::Error`) so callers can decide
+/// whether a failure is worth retrying.
+enum PicHandshakeError {
+    /// Opening the i2c device itself failed (not a bus/protocol error) —
+    /// this hashboard likely has no PIC (noPIC variant); retrying won't help.
+    Absent(amlogic_cb_tools::pic::PicError),
+    /// The device opened but didn't complete the handshake — the
+    /// transient case worth retrying (e.g. the PIC's LDO hasn't finished
+    /// stabilizing yet right after the rail came back up on resume).
+    Handshake(amlogic_cb_tools::pic::PicError),
+    /// Handshake succeeded but enabling the per-domain DC-DCs failed.
+    /// Distinct from `Handshake` mainly for logging; retrying re-runs the
+    /// full open+handshake+enable sequence either way.
+    EnableDcDc(amlogic_cb_tools::pic::PicError),
+}
+
+impl std::fmt::Display for PicHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent(e) => write!(f, "PIC i2c open failed: {e}"),
+            Self::Handshake(e) => write!(f, "PIC handshake failed: {e}"),
+            Self::EnableDcDc(e) => write!(f, "PIC enable_dc_dc failed: {e}"),
+        }
+    }
+}
+
+/// Resume-time PIC handshake + DC-DC enable, retried up to
+/// [`PIC_RESUME_HANDSHAKE_ATTEMPTS`] times on the transient "present but
+/// didn't answer" case (see [`PicHandshakeError`]). Runs each attempt on
+/// `spawn_blocking` (never inline — see [`pic_handshake_and_enable_dc_dc_blocking`]).
+///
+/// Returns `Ok(Some(version))` on success, `Ok(None)` if the PIC is absent
+/// (no point retrying — likely a noPIC hashboard), or `Err` after
+/// exhausting retries on a present-but-unresponsive PIC.
+async fn pic_handshake_and_enable_dc_dc(
+    pic_i2c_device: &Path,
+    pic_addr: u16,
+) -> Result<Option<u8>, String> {
+    let mut last_err: Option<PicHandshakeError> = None;
+    for attempt in 0..PIC_RESUME_HANDSHAKE_ATTEMPTS {
+        let device = pic_i2c_device.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            pic_handshake_and_enable_dc_dc_blocking(&device, pic_addr)
+        })
+        .await
+        .map_err(|e| PicHandshakeError::Handshake(amlogic_cb_tools::pic::PicError::Io {
+            addr: pic_addr,
+            source: std::io::Error::other(format!("PIC task panicked: {e}")),
+        }));
+
+        match result {
+            Ok(Ok(version)) => {
+                if attempt > 0 {
+                    warn!(
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        attempt,
+                        "PIC handshake succeeded after retry"
+                    );
+                }
+                return Ok(Some(version));
+            }
+            Ok(Err(PicHandshakeError::Absent(_))) => return Ok(None),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(e) => last_err = Some(e),
+        }
+
+        if attempt + 1 < PIC_RESUME_HANDSHAKE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(PIC_RESUME_RETRY_DELAY_MS)).await;
+        }
+    }
+    Err(last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "PIC handshake retries exhausted".into()))
 }
 
 impl Drop for NativeAmlogicPsu {
