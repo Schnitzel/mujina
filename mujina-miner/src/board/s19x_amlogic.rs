@@ -22,7 +22,7 @@ use std::{
 };
 
 use amlogic_cb_tools::{
-    eeprom_antminer::decode_antminer_eeprom,
+    eeprom_antminer::{DecodedAntminerEeprom, decode_antminer_eeprom},
     gpio::SysfsGpio,
     linux_i2c::LinuxI2cDevice,
     pic::{PicChain, pic_address_for_slot},
@@ -274,6 +274,178 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
     }
 }
 
+/// Auto-detect a hashboard's chip family from its decoded EEPROM so the
+/// board self-identifies rather than trusting the configured `model`.
+///
+/// Matching is case-insensitive `contains`:
+///   - `board_name` "BHB42601" / "BHB42611" OR `chip_marking` "BM1362"
+///     → [`HashboardModel::S19jPro`]
+///   - `board_name` "BHB56902"             OR `chip_marking` "BM1366"
+///     → [`HashboardModel::S19kPro`]
+///   - neither → `None` (caller falls back to the configured model).
+fn detect_hashboard_model(decoded: &DecodedAntminerEeprom) -> Option<HashboardModel> {
+    let board_name = decoded.board_name.to_ascii_uppercase();
+    let chip_marking = decoded.chip_marking.to_ascii_uppercase();
+
+    if board_name.contains("BHB42601")
+        || board_name.contains("BHB42611")
+        || chip_marking.contains("BM1362")
+    {
+        Some(HashboardModel::S19jPro)
+    } else if board_name.contains("BHB56902") || chip_marking.contains("BM1366") {
+        Some(HashboardModel::S19kPro)
+    } else {
+        None
+    }
+}
+
+/// Effective PSU voltage envelope for the *set* of present hashboard
+/// families. The single APW12 powers every board, so one rail must suit
+/// EVERY present family at once. Safety-critical: the resolved envelope is
+/// never allowed to exceed any present board's max or drop below its min.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EffectiveVoltageSpec {
+    /// Cold-init clamp `(min, max)` — intersection `(max-of-mins, min-of-maxs)`
+    /// of every present model's [`HashboardSpec::voltage_range`].
+    voltage_range: (f32, f32),
+    /// Operating setpoint — MAX of every present model's
+    /// [`HashboardSpec::target_voltage`], clamped into the intersections
+    /// so it can never sit outside a present board's envelope.
+    target_voltage: f32,
+    /// Per-step granularity — MIN of every present model's
+    /// [`HashboardSpec::voltage_step`].
+    voltage_step: f32,
+    /// Runtime clamp `(min, max)` — intersection `(max-of-mins, min-of-maxs)`
+    /// of every present model's [`HashboardSpec::psu_clamp`].
+    psu_clamp: (f32, f32),
+}
+
+/// Compute the shared-rail voltage envelope from the present *detected*
+/// models.
+///
+/// Policy (all safety-driven — the shared APW12 must satisfy every board):
+///   - `target_voltage` = MAX of targets (the highest-voltage family sets
+///     the operating point; lower families get harmless headroom their
+///     config comments explicitly call out as safe).
+///   - `voltage_range` / `psu_clamp` = intersection `(MAX of mins, MIN of
+///     maxs)` — the band every present board tolerates.
+///   - `voltage_step` = MIN of steps (finest granularity any board needs).
+///   - The chosen `target_voltage` is clamped into both intersections so it
+///     never exceeds any board's max or drops below any board's min.
+///   - If either intersection is empty (`min >= max`), the mix is genuinely
+///     incompatible: FAIL rather than pick a voltage outside some board's
+///     range.
+///
+/// For a homogeneous chassis (all one model) the folds and clamps collapse
+/// to exactly that single model's spec — byte-for-byte identical to the
+/// pre-mixed-support behaviour.
+fn effective_voltage_spec(
+    models: &[HashboardModel],
+) -> Result<EffectiveVoltageSpec, BoardError> {
+    if models.is_empty() {
+        return Err(BoardError::InitializationFailed(
+            "no present hashboards to resolve an effective PSU voltage envelope".into(),
+        ));
+    }
+    let specs: Vec<HashboardSpec> = models.iter().map(|m| hashboard_spec(*m)).collect();
+
+    // MAX of targets; intersection (max-of-mins, min-of-maxs) of ranges and
+    // clamps; MIN of steps. Seeding the folds from ±infinity keeps a
+    // single-model chassis byte-identical (max(-inf, v) == v exactly).
+    let target_voltage = specs
+        .iter()
+        .map(|s| s.target_voltage)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let range_min = specs
+        .iter()
+        .map(|s| s.voltage_range.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let range_max = specs
+        .iter()
+        .map(|s| s.voltage_range.1)
+        .fold(f32::INFINITY, f32::min);
+
+    let clamp_min = specs
+        .iter()
+        .map(|s| s.psu_clamp.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let clamp_max = specs
+        .iter()
+        .map(|s| s.psu_clamp.1)
+        .fold(f32::INFINITY, f32::min);
+
+    let voltage_step = specs
+        .iter()
+        .map(|s| s.voltage_step)
+        .fold(f32::INFINITY, f32::min);
+
+    // Safety assertions: an empty intersection means no single voltage is
+    // safe for every present board. Refuse to power on rather than pick a
+    // voltage outside some board's tolerated band.
+    if !(range_min < range_max) {
+        return Err(BoardError::InitializationFailed(format!(
+            "incompatible hashboard mix: cold-init voltage ranges do not overlap \
+             (max-of-mins {range_min:.3} V >= min-of-maxs {range_max:.3} V) — refusing to power on"
+        )));
+    }
+    if !(clamp_min < clamp_max) {
+        return Err(BoardError::InitializationFailed(format!(
+            "incompatible hashboard mix: runtime voltage clamps do not overlap \
+             (max-of-mins {clamp_min:.3} V >= min-of-maxs {clamp_max:.3} V) — refusing to power on"
+        )));
+    }
+
+    // Clamp the chosen operating point into BOTH intersections. For the
+    // homogeneous case the target already sits inside its own range/clamp,
+    // so this is a no-op and preserves the exact original value.
+    let target_voltage = target_voltage
+        .clamp(range_min, range_max)
+        .clamp(clamp_min, clamp_max);
+
+    Ok(EffectiveVoltageSpec {
+        voltage_range: (range_min, range_max),
+        target_voltage,
+        voltage_step,
+        psu_clamp: (clamp_min, clamp_max),
+    })
+}
+
+/// Short family label used only inside the mixed-chassis summary
+/// (`board_model_label` carries the "(Amlogic control board)" suffix which
+/// reads badly in a count list).
+fn short_model_name(model: HashboardModel) -> &'static str {
+    match model {
+        HashboardModel::S19jPro => "S19j Pro",
+        HashboardModel::S19kPro => "S19k Pro",
+    }
+}
+
+/// Reported board-model label from the present *detected* models.
+///
+/// Homogeneous → that single model's `board_model_label()` (unchanged from
+/// the single-family behaviour). Mixed → a count summary, e.g.
+/// `"Mixed Amlogic (2x S19j Pro, 1x S19k Pro)"` (families listed in a
+/// stable S19j-then-S19k order).
+fn reported_model_label(models: &[HashboardModel]) -> String {
+    let Some(first) = models.first() else {
+        // No present boards — shouldn't happen (init guarantees >= 1); fall
+        // back to the board default label.
+        return HashboardModel::S19kPro.board_model_label().to_string();
+    };
+    if models.iter().all(|m| m == first) {
+        return first.board_model_label().to_string();
+    }
+    let mut parts = Vec::new();
+    for family in [HashboardModel::S19jPro, HashboardModel::S19kPro] {
+        let count = models.iter().filter(|m| **m == family).count();
+        if count > 0 {
+            parts.push(format!("{}x {}", count, short_model_name(family)));
+        }
+    }
+    format!("Mixed Amlogic ({})", parts.join(", "))
+}
+
 /// Board-level model, resolved from the first configured hashboard. A
 /// mixed-model chassis isn't supported; every hashboard shares one model.
 fn board_model(config: &AmlogicControlBoardConfig) -> HashboardModel {
@@ -313,6 +485,12 @@ pub fn device_id(config: &AmlogicControlBoardConfig) -> String {
 struct SelectedHashboard {
     config: AmlogicHashboardConfig,
     board_serial: Option<String>,
+    /// Chip family DETECTED from this board's EEPROM (falls back to the
+    /// configured `config.model` only when detection is unavailable). This
+    /// is the model that drives the chain — chip config, topology, chain
+    /// label, and this board's contribution to the shared-rail voltage
+    /// envelope and its per-chain thermal cap.
+    model: HashboardModel,
 }
 
 /// Native Amlogic S19x Pro board.
@@ -361,12 +539,16 @@ impl S19xAmlogic {
         state_tx: &watch::Sender<BoardState>,
     ) -> Result<(Vec<SelectedHashboard>, Arc<Mutex<NativeAmlogicPsu>>), BoardError> {
         let board_name = device_id(config);
-        let model = board_model(config);
+        // Configured/expected model — used only for the pre-detection log
+        // banner and as a per-slot fallback if EEPROM detection is
+        // unavailable. The DETECTED model (below) is what actually drives
+        // each chain and the shared PSU envelope.
+        let configured_model = board_model(config);
         let present = select_present_hashboards(config)?;
 
         info!(
             board = %board_name,
-            model = %model.board_model_label(),
+            configured_model = %configured_model.board_model_label(),
             slots = %present
                 .iter()
                 .map(|hb| hb.index.to_string())
@@ -378,22 +560,47 @@ impl S19xAmlogic {
         // Health-gate every present hashboard before energizing chips.
         // EEPROM + temperature reads can fail individually; a failure
         // here aborts board init for now (we don't want a "ghost"
-        // hashboard with bad EEPROM coming up with the others).
+        // hashboard with bad EEPROM coming up with the others). The
+        // health gate also self-identifies each board's chip family from
+        // its EEPROM (see `perform_health_gate`).
         let mut selected: Vec<SelectedHashboard> = Vec::with_capacity(present.len());
         let mut all_temps: Vec<TemperatureSensor> = Vec::new();
         for hb in &present {
-            let (board_serial, initial_temperatures) = perform_health_gate(config, hb)?;
+            let (board_serial, detected_model, initial_temperatures) =
+                perform_health_gate(config, hb)?;
             all_temps.extend(initial_temperatures);
+            // Fall back to the configured model only when detection was
+            // unavailable (EEPROM read disabled or unrecognized board —
+            // `perform_health_gate` has already warned in the latter case).
+            let model = detected_model.unwrap_or(hb.model);
             selected.push(SelectedHashboard {
                 config: hb.clone(),
                 board_serial,
+                model,
             });
         }
+
+        // Resolve the shared-rail voltage envelope and the reported label
+        // from the SET of present detected models. The single APW12 must
+        // suit every present family at once (see `effective_voltage_spec`).
+        let present_models: Vec<HashboardModel> =
+            selected.iter().map(|s| s.model).collect();
+        let effective_voltage = effective_voltage_spec(&present_models)?;
+        let reported_label = reported_model_label(&present_models);
+        info!(
+            board = %board_name,
+            reported_model = %reported_label,
+            target_v = effective_voltage.target_voltage,
+            cold_init_range = ?effective_voltage.voltage_range,
+            runtime_clamp = ?effective_voltage.psu_clamp,
+            step_v = effective_voltage.voltage_step,
+            "Resolved effective shared-PSU voltage envelope for present hashboard families"
+        );
 
         configure_fans(config, config.startup.default_fan_percent)?;
         assert_all_resets(config)?;
 
-        let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config, model)));
+        let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config, effective_voltage)));
         let measured_voltage = {
             let mut psu_guard = psu.lock().await;
             psu_guard
@@ -494,7 +701,7 @@ impl S19xAmlogic {
 
         state_tx.send_modify(|state| {
             state.name = board_name.clone();
-            state.model = model.board_model_label().into();
+            state.model = reported_label.clone();
             state.serial = primary_serial.clone();
             state.temperatures = all_temps.clone();
             state.fans = fan_states.clone();
@@ -508,8 +715,10 @@ impl S19xAmlogic {
 #[async_trait]
 impl Board for S19xAmlogic {
     fn board_info(&self) -> BoardInfo {
+        let present_models: Vec<HashboardModel> =
+            self.selected_hashboards.iter().map(|s| s.model).collect();
         BoardInfo {
-            model: board_model(&self.config).board_model_label().into(),
+            model: reported_model_label(&present_models),
             firmware_version: None,
             serial_number: self
                 .selected_hashboards
@@ -567,15 +776,15 @@ impl Board for S19xAmlogic {
             None
         };
 
-        // M4 thermal supervisor: one frequency cap (MHz) shared by every chain
-        // and the telemetry task. The telemetry task lowers it as the hottest
-        // sensor climbs and raises it as the board cools; each actor enforces
-        // `min(requested, cap)` on its tick. Starts at the operating max
-        // (uncapped), resolved from the board's model. Shared because the
-        // chains sit on one rail and one airflow path — throttling them
-        // together is correct.
-        let thermal_cap_max_mhz = hashboard_spec(board_model(&self.config)).thermal_cap_max_mhz;
-        let thermal_cap_mhz = Arc::new(AtomicU32::new(thermal_cap_max_mhz));
+        // M4 thermal supervisor: one frequency cap (MHz) PER CHAIN so a
+        // mixed chassis doesn't cap one family at the other's ceiling. Each
+        // cap starts at its own detected model's operating max (uncapped)
+        // and the telemetry task lowers/raises every cap off the hottest
+        // sensor (the chains share one rail and airflow path, so they
+        // throttle together — but each stays bounded by its own family's
+        // ceiling). Each actor enforces `min(requested, cap)` on its tick.
+        // Collected as `(cap, per-chain max)` pairs for the telemetry task.
+        let mut thermal_caps: Vec<(Arc<AtomicU32>, u32)> = Vec::with_capacity(n_chains);
 
         let mut threads: Vec<Box<dyn HashThread>> = Vec::with_capacity(n_chains);
         let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
@@ -583,10 +792,15 @@ impl Board for S19xAmlogic {
 
         for selected in self.selected_hashboards.clone() {
             let hb = &selected.config;
-            // Per-hashboard chip-family spec. In practice a chassis is
-            // homogeneous, but resolving per-hashboard keeps each chain
-            // correct even if that ever changes.
-            let spec = hashboard_spec(hb.model);
+            // Per-hashboard chip-family spec from the DETECTED model (the
+            // config's per-slot `model` is only a fallback). This drives the
+            // chip config, topology, chain label, baud policy, and this
+            // chain's thermal ceiling.
+            let spec = hashboard_spec(selected.model);
+
+            // Per-chain thermal cap seeded at this chain's own ceiling.
+            let chain_thermal_cap = Arc::new(AtomicU32::new(spec.thermal_cap_max_mhz));
+            thermal_caps.push((Arc::clone(&chain_thermal_cap), spec.thermal_cap_max_mhz));
 
             let data_stream = SerialStream::new(&hb.serial_path.to_string_lossy(), SERIAL_BAUD)
                 .map_err(|e| {
@@ -639,7 +853,10 @@ impl Board for S19xAmlogic {
                     ),
                     chip_uart_baud,
                     ramp_coordinator: ramp_coordinator.clone(),
-                    thermal_cap_mhz: Some(Arc::clone(&thermal_cap_mhz)),
+                    // Slot index keys this chain's request in the shared-rail
+                    // max-voltage aggregator (see `ChainCoordinator`).
+                    chain_index: hb.index as usize,
+                    thermal_cap_mhz: Some(Arc::clone(&chain_thermal_cap)),
                 },
                 // Per-model post-broadcast baud (see `HashboardSpec`): BM1366
                 // switches to 3.125 Mbaud after the broadcast phase; BM1362
@@ -719,7 +936,6 @@ impl Board for S19xAmlogic {
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
-        let thermal_cap = Arc::clone(&thermal_cap_mhz);
         tokio::spawn(async move {
             native_telemetry_task(
                 cfg_clone,
@@ -727,8 +943,7 @@ impl Board for S19xAmlogic {
                 psu,
                 state_tx,
                 thread_states,
-                Some(thermal_cap),
-                thermal_cap_max_mhz,
+                thermal_caps,
                 shutdown,
             )
             .await;
@@ -1082,22 +1297,24 @@ struct NativeAmlogicPsu {
     write_register: u8,
     enable_gpio: u32,
     enabled: bool,
-    /// Board-level model. The APW12 is shared across all hashboards, so
-    /// its per-model voltage envelope (`voltage_range`, `target_voltage`,
-    /// `voltage_step`, runtime clamp) is resolved from the board's model
-    /// via [`hashboard_spec`]. In practice every hashboard shares one model.
-    model: HashboardModel,
+    /// Effective shared-rail voltage envelope. The APW12 powers EVERY
+    /// hashboard, so its `voltage_range` / `target_voltage` / `voltage_step`
+    /// / runtime clamp are resolved from the SET of present detected models
+    /// (see [`effective_voltage_spec`]) — never from a single model — so the
+    /// one rail always suits every present family. For a homogeneous chassis
+    /// this equals that single model's spec exactly.
+    voltage: EffectiveVoltageSpec,
 }
 
 impl NativeAmlogicPsu {
-    fn new(config: &AmlogicControlBoardConfig, model: HashboardModel) -> Self {
+    fn new(config: &AmlogicControlBoardConfig, voltage: EffectiveVoltageSpec) -> Self {
         Self {
             i2c_device: config.psu.i2c_device.clone(),
             address: config.psu.address,
             write_register: config.psu.write_register,
             enable_gpio: config.psu.enable_gpio,
             enabled: false,
-            model,
+            voltage,
         }
     }
 
@@ -1194,11 +1411,12 @@ impl Drop for NativeAmlogicPsu {
 #[async_trait]
 impl VoltageRegulator for NativeAmlogicPsu {
     async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()> {
-        // Runtime voltage clamp is per-model (see `HashboardSpec::psu_clamp`);
-        // it is wider than the cold-init `voltage_range` and only governs the
-        // runtime voltage bands. The min lets the bands reach the APW12's
-        // hardware floor; cold-init voltages clamp higher upstream.
-        let (clamp_min, clamp_max) = hashboard_spec(self.model).psu_clamp;
+        // Runtime voltage clamp is the SHARED-rail intersection clamp (see
+        // `EffectiveVoltageSpec::psu_clamp`); it is wider than the cold-init
+        // `voltage_range` and only governs the runtime voltage bands. Resolved
+        // from the effective spec so the clamp always honours every present
+        // family's runtime floor/ceiling — never a single model's.
+        let (clamp_min, clamp_max) = self.voltage.psu_clamp;
         let clamped = volts.clamp(clamp_min, clamp_max);
         let dac = encode_voltage_to_dac(clamped);
 
@@ -1250,17 +1468,20 @@ impl VoltageRegulator for NativeAmlogicPsu {
     }
 
     fn voltage_range(&self) -> (f32, f32) {
-        // Per-model cold-init voltage clamp — see `HashboardSpec::voltage_range`.
-        hashboard_spec(self.model).voltage_range
+        // Shared-rail cold-init clamp — intersection of every present
+        // family's range (see `EffectiveVoltageSpec::voltage_range`).
+        self.voltage.voltage_range
     }
 
     fn target_voltage(&self) -> f32 {
-        // Per-model factory/operating setpoint — see `HashboardSpec::target_voltage`.
-        hashboard_spec(self.model).target_voltage
+        // Shared-rail operating setpoint — MAX of present targets, clamped
+        // into the intersections (see `EffectiveVoltageSpec::target_voltage`).
+        self.voltage.target_voltage
     }
 
     fn voltage_step(&self) -> f32 {
-        hashboard_spec(self.model).voltage_step
+        // MIN of present families' steps (see `EffectiveVoltageSpec::voltage_step`).
+        self.voltage.voltage_step
     }
 }
 
@@ -1320,8 +1541,12 @@ fn is_hashboard_present(hashboard: &AmlogicHashboardConfig) -> Result<bool, Boar
 fn perform_health_gate(
     config: &AmlogicControlBoardConfig,
     hashboard: &AmlogicHashboardConfig,
-) -> Result<(Option<String>, Vec<TemperatureSensor>), BoardError> {
+) -> Result<(Option<String>, Option<HashboardModel>, Vec<TemperatureSensor>), BoardError> {
     let mut board_serial = None;
+    // Chip family detected from the EEPROM. `None` when EEPROM reading is
+    // disabled or the board is unrecognized; the caller falls back to the
+    // configured model.
+    let mut detected_model = None;
 
     if config.startup.health_gate.read_eeprom_before_mining {
         let eeprom = read_eeprom(hashboard)?;
@@ -1331,6 +1556,28 @@ fn perform_health_gate(
                 hashboard.index
             ))
         })?;
+        match detect_hashboard_model(&decoded) {
+            Some(model) => {
+                info!(
+                    hashboard = hashboard.index,
+                    detected = %model.board_model_label(),
+                    board_name = %decoded.board_name,
+                    chip_marking = %decoded.chip_marking,
+                    "hashboard family detected from EEPROM"
+                );
+                detected_model = Some(model);
+            }
+            None => {
+                warn!(
+                    hashboard = hashboard.index,
+                    board_name = %decoded.board_name,
+                    chip_marking = %decoded.chip_marking,
+                    configured = %hashboard.model.board_model_label(),
+                    "hashboard family detection from EEPROM failed (unrecognized board_name/chip_marking); \
+                     falling back to configured model"
+                );
+            }
+        }
         board_serial = Some(decoded.board_serial);
     }
 
@@ -1351,7 +1598,7 @@ fn perform_health_gate(
         }
     }
 
-    Ok((board_serial, temperatures))
+    Ok((board_serial, detected_model, temperatures))
 }
 
 fn assert_all_resets(config: &AmlogicControlBoardConfig) -> Result<(), BoardError> {
@@ -1400,8 +1647,10 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
 }
 
 // --- M4 thermal throttle (graduated frequency reduction below the hard cutoff) ---
-// The upper bound (no-throttle ceiling) is per-model
-// (`HashboardSpec::thermal_cap_max_mhz`) and passed into the telemetry task.
+// The upper bound (no-throttle ceiling) is per-CHAIN (each chain's detected
+// `HashboardSpec::thermal_cap_max_mhz`) and passed into the telemetry task as
+// a `(cap, per-chain max)` list — a mixed chassis caps each family at its own
+// ceiling, not the other family's.
 /// Frequency floor (MHz) the throttle won't go below — if the board is still
 /// too hot here, the 65 °C TMP75 hard cutoff takes over.
 const THERMAL_CAP_MIN_MHZ: u32 = 200;
@@ -1423,8 +1672,9 @@ async fn native_telemetry_task(
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
-    thermal_cap_mhz: Option<Arc<AtomicU32>>,
-    thermal_cap_max_mhz: u32,
+    // Per-chain frequency caps as `(cap, per-chain max)`. Each is stepped off
+    // the board's hottest sensor but stays bounded by its own family ceiling.
+    thermal_caps: Vec<(Arc<AtomicU32>, u32)>,
     shutdown: CancellationToken,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -1596,12 +1846,18 @@ async fn native_telemetry_task(
         let temp_stale = last_temp_at.elapsed() >= TEMP_STALE_AFTER;
 
         // ----- M4 thermal throttle ------------------------------------
-        // Below the hard cutoff above, step the shared frequency cap down as
-        // the board heats toward it and back up as it cools. Each actor
-        // enforces min(requested, cap) on its 1 s tick, so the board sheds
-        // heat by slowing down — staying alive at lower power instead of
-        // tripping the full DC-DC/PSU cutoff. Runs with no dependency on Nova.
-        if let Some(thermal_cap_mhz) = &thermal_cap_mhz {
+        // Below the hard cutoff above, step each chain's frequency cap down
+        // as the board heats toward it and back up as it cools. Every chain
+        // reacts to the same hottest sensor (shared rail + airflow) but each
+        // stays bounded by its own family's ceiling, so a mixed chassis never
+        // caps one family at the other's max. Each actor enforces
+        // min(requested, cap) on its 1 s tick, so the board sheds heat by
+        // slowing down — staying alive at lower power instead of tripping the
+        // full DC-DC/PSU cutoff. Runs with no dependency on Nova.
+        for (chain_idx, (thermal_cap_mhz, thermal_cap_max_mhz)) in
+            thermal_caps.iter().enumerate()
+        {
+            let thermal_cap_max_mhz = *thermal_cap_max_mhz;
             let cap = thermal_cap_mhz.load(Ordering::Relaxed);
             let new_cap = if temp_stale {
                 // No temperature signal — be conservative (fans already 100 %).
@@ -1623,12 +1879,14 @@ async fn native_telemetry_task(
             if new_cap != cap {
                 if new_cap < cap {
                     warn!(
+                        chain = chain_idx,
                         hottest_c = board_hottest,
                         cap_mhz = new_cap,
                         "Thermal throttle: lowering frequency cap"
                     );
                 } else {
                     info!(
+                        chain = chain_idx,
                         hottest_c = board_hottest,
                         cap_mhz = new_cap,
                         "Thermal throttle: raising frequency cap"

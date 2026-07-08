@@ -99,14 +99,23 @@ pub struct ChainPeripherals {
 
     /// Optional cross-chain ramp coordinator. When multiple chains
     /// share a single voltage rail (e.g. all three hashboards on an
-    /// S19k Pro share the APW12), independent per-actor voltage
-    /// commands would race on the shared mutex and cause the rail to
-    /// oscillate between chains' step values. Setting this on every
-    /// chain in the cohort makes them rendezvous at each ramp step
-    /// and elect one leader per step to drive the shared PSU.
-    /// `None` keeps the legacy single-chain behaviour where each
-    /// actor commands its own voltage every step.
+    /// S19k Pro — or a mixed S19j+S19k chassis — share one APW12),
+    /// independent per-actor voltage commands would race on the shared
+    /// mutex and could drop the rail below what a chain at a higher
+    /// operating point needs. Setting this on every chain in the cohort
+    /// routes their per-step voltage requests through the coordinator,
+    /// which always drives the rail to the MAXIMUM any chain currently
+    /// requests — so a chain with a longer/faster ramp is never starved
+    /// by a chain that commanded less. `None` keeps the legacy
+    /// single-chain behaviour where each actor commands its own voltage.
     pub ramp_coordinator: Option<Arc<ChainCoordinator>>,
+
+    /// This chain's stable slot index within the shared-rail cohort
+    /// (0-based). Used only to key this chain's request in the
+    /// [`ChainCoordinator`] max-voltage aggregator; ignored on
+    /// single-chain boards (`ramp_coordinator == None`). Boards with one
+    /// chain, or that don't share a rail, may leave this `0`.
+    pub chain_index: usize,
 
     /// Local thermal frequency cap (MHz), written by the board's telemetry
     /// task and enforced by every actor on its 1 s tick: the effective
@@ -119,53 +128,66 @@ pub struct ChainPeripherals {
 
 /// Cross-chain coordinator for shared-rail boards.
 ///
-/// All chains in the cohort call [`ChainCoordinator::sync_voltage_step`]
-/// at the top of every frequency-ramp step. The call rendezvous on a
-/// barrier (so the slowest chain holds the rest), the elected leader
-/// drives the shared voltage regulator on behalf of everyone, and all
-/// chains then wait the same `voltage_settle` before returning. After
-/// the call returns each chain sends its per-chain PLL command at the
-/// same effective voltage.
+/// Every chain in the cohort calls [`ChainCoordinator::sync_voltage_step`]
+/// at the top of each frequency-ramp step, passing the voltage IT needs
+/// for the operating point it is about to command. The coordinator records
+/// that per-chain request and drives the shared regulator to the
+/// **maximum** voltage any chain currently requests, then settles. Because
+/// the rail is always at the max of every chain's need, no chain is ever
+/// under-volted by another chain's lower command.
+///
+/// Crucially there is **no barrier**: chains ramp fully independently. A
+/// mixed chassis (e.g. two S19j Pro at 500 MHz over 72 steps + one S19k
+/// Pro at 575 MHz over 84 steps) has chains with *different ramp lengths*;
+/// a fixed-party barrier would deadlock the moment the shorter ramps
+/// finished and stopped arriving. The max-aggregator sidesteps that
+/// entirely — a finished chain simply leaves its last request standing
+/// (it keeps mining at that voltage), and the still-ramping chains keep
+/// updating the max. Requests persist for the life of the cohort, so the
+/// rail never dips below any active chain's floor.
 pub struct ChainCoordinator {
-    barrier: tokio::sync::Barrier,
+    /// Latest rail voltage each chain (keyed by its `chain_index`) wants.
+    /// The commanded rail is the max over all entries.
+    requests: Mutex<std::collections::HashMap<usize, f32>>,
 }
 
 impl ChainCoordinator {
     /// Create a coordinator for a cohort of `chain_count` chains.
     pub fn new(chain_count: usize) -> Self {
         Self {
-            barrier: tokio::sync::Barrier::new(chain_count),
+            requests: Mutex::new(std::collections::HashMap::with_capacity(chain_count)),
         }
     }
 
-    /// Rendezvous all chains at this step, command the shared voltage
-    /// from the elected leader, then settle.
-    ///
-    /// `voltage_v`/`voltage_settle` are computed identically by every
-    /// chain (same step index, same chip target, same domain count),
-    /// so it's safe for only the leader to actually drive the rail.
-    /// Returns the wait result so callers can short-circuit logging
-    /// if only the leader should log.
+    /// Record `chain_index`'s requested rail voltage, drive the shared
+    /// regulator to the maximum requested across all chains, then wait
+    /// `voltage_settle`. Safe to call from every chain independently and
+    /// at any cadence — there is no cross-chain rendezvous.
     pub async fn sync_voltage_step(
         &self,
+        chain_index: usize,
         regulator: &Arc<Mutex<dyn VoltageRegulator + Send>>,
         voltage_v: f32,
         voltage_settle: std::time::Duration,
-    ) -> Result<bool, anyhow::Error> {
-        let result = self.barrier.wait().await;
-        let is_leader = result.is_leader();
-        if is_leader {
-            regulator
-                .lock()
-                .await
-                .set_voltage(voltage_v)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("ramp-coord leader set_voltage({voltage_v}V): {e}")
-                })?;
-        }
+    ) -> Result<(), anyhow::Error> {
+        // Record this chain's request and compute the cohort max while
+        // holding only the small requests lock (never the regulator's).
+        let target = {
+            let mut requests = self.requests.lock().await;
+            requests.insert(chain_index, voltage_v);
+            requests
+                .values()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+        };
+        regulator
+            .lock()
+            .await
+            .set_voltage(target)
+            .await
+            .map_err(|e| anyhow::anyhow!("ramp-coord set_voltage({target:.2}V): {e}"))?;
         tokio::time::sleep(voltage_settle).await;
-        Ok(is_leader)
+        Ok(())
     }
 }
 
@@ -266,6 +288,7 @@ mod tests {
             voltage_regulator: None,
             chip_uart_baud: None,
             ramp_coordinator: None,
+            chain_index: 0,
             thermal_cap_mhz: None,
         };
 

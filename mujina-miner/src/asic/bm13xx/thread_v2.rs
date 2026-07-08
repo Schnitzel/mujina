@@ -1307,6 +1307,7 @@ impl BM13xxActor {
         let chip_count = self.chain.chip_count();
         let domain_count = self.chain.domain_count();
         let has_regulator = self.peripherals.voltage_regulator.is_some();
+        let chain_index = self.peripherals.chain_index;
 
         // Get voltage calculation parameters from regulator
         let (min_v, max_v) = if let Some(ref regulator) = self.peripherals.voltage_regulator {
@@ -1351,14 +1352,15 @@ impl BM13xxActor {
                 let v = applied_voltage
                     .expect("applied voltage is present when regulator exists");
                 if let Some(coord) = self.peripherals.ramp_coordinator.as_ref() {
-                    // Shared-rail board (e.g. 3 hashboards on one APW12).
-                    // Barrier on every step + leader-elected voltage write
-                    // so the rail doesn't oscillate between chains'
-                    // independently-commanded step values. All chains
-                    // compute the same `v` from `step_index` so it's safe
-                    // for only the leader to drive the regulator.
+                    // Shared-rail board (e.g. 3 hashboards on one APW12,
+                    // possibly a mixed S19j+S19k chassis). Route this
+                    // chain's request through the coordinator, which drives
+                    // the rail to the MAX any chain currently needs. There
+                    // is no cross-chain barrier, so chains with different
+                    // ramp lengths (72 vs 84 steps) never deadlock waiting
+                    // on one another.
                     coord
-                        .sync_voltage_step(regulator, v, VOLTAGE_SETTLE_DELAY)
+                        .sync_voltage_step(chain_index, regulator, v, VOLTAGE_SETTLE_DELAY)
                         .await
                         .map_err(|e| {
                             HashThreadError::InitializationFailed(format!(
@@ -2132,6 +2134,7 @@ mod tests {
                 voltage_regulator: None,
                 chip_uart_baud: None,
                 ramp_coordinator: None,
+                chain_index: 0,
                 thermal_cap_mhz: None,
             },
             post_broadcast_chip_baud: None,
@@ -2180,6 +2183,7 @@ mod tests {
                 voltage_regulator: None,
                 chip_uart_baud: None,
                 ramp_coordinator: None,
+                chain_index: 0,
                 thermal_cap_mhz: None,
             },
             post_broadcast_chip_baud: None,
