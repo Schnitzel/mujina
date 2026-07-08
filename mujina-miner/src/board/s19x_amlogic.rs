@@ -175,6 +175,14 @@ struct HashboardSpec {
     /// Operating-frequency ceiling (MHz) for the M4 thermal cap — the
     /// shared frequency cap never exceeds this.
     thermal_cap_max_mhz: u32,
+    /// Useful runtime operating-frequency floor (MHz) reported to controllers
+    /// (Nova) as the low end of the dial band. Sits above the hard
+    /// `MIN_RUNTIME_FREQ_MHZ` safety clamp: below this, per-chip efficiency and
+    /// PLL stability degrade, so a power dial shouldn't operate here. The band
+    /// ceiling is the model's cold-init target
+    /// (`ChipConfig::target_frequency_mhz`, which is also the runtime clamp),
+    /// so it isn't duplicated on the spec.
+    min_operating_mhz: u32,
     /// Post-broadcast chip-UART baud. `Some(Baud3M)` (BM1366/S19k) reopens the
     /// chip UART at 3.125 Mbaud after the broadcast phase and needs the
     /// fd-keepalive adapter. `None` (BM1362/S19j) keeps the fixed `SERIAL_BAUD`
@@ -227,6 +235,10 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
             // 575 MHz matches LuxOS's actual sustained operating point on
             // BHB56902 (see chip_config::bm1366 target_frequency_mhz).
             thermal_cap_max_mhz: 575,
+            // Dial floor for the BM1366/S19k. Ceiling is 575 MHz
+            // (target_frequency_mhz). 150 MHz keeps the chain in its stable
+            // range while still giving the power dial a wide span to shed to.
+            min_operating_mhz: 150,
             // BM1366 switches the chip UART to 3.125 Mbaud after the broadcast
             // phase (the deployed S19k behaviour).
             post_broadcast_baud: Some(bm13xx::protocol::BaudRate::Baud3M),
@@ -265,6 +277,10 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
             // max_freq), so a 525 MHz ceiling never bites under normal
             // temps — it only sheds frequency as the board heats.
             thermal_cap_max_mhz: 525,
+            // Dial floor for the BM1362/S19j. Ceiling is 500 MHz
+            // (target_frequency_mhz = None → the unwrap_or(500) default in
+            // thread_v2, which is also the runtime clamp). 150 MHz floor.
+            min_operating_mhz: 150,
             // BM1362 keeps the fixed SERIAL_BAUD — the original single-board
             // S19j driver left the 3.125 Mbaud switch OFF (`None`), and that's
             // the path currently mining on real S19j hardware. Do not enable
@@ -409,6 +425,38 @@ fn effective_voltage_spec(
         voltage_step,
         psu_clamp: (clamp_min, clamp_max),
     })
+}
+
+/// Useful runtime operating-frequency band `(floor, ceiling)` in MHz for the
+/// set of present detected models — reported to a power controller (Nova) so
+/// it dials/calibrates inside the band every present board tolerates rather
+/// than guessing per model.
+///
+/// Shared rail → one operating point, so intersect:
+///   - floor  = MAX of per-model `min_operating_mhz` (the highest of the
+///     useful floors — safe for all).
+///   - ceiling = MIN of per-model operating maxima. The max is the model's
+///     cold-init target (`ChipConfig::target_frequency_mhz`, defaulting to
+///     500 MHz to match the `unwrap_or(500.0)` in `thread_v2`), which is
+///     exactly the runtime `SetFrequency` clamp — so a controller staying at
+///     or below `ceiling` is never clamped.
+///
+/// A homogeneous chassis collapses to that single model's band (e.g. all
+/// S19j → (150, 500); all S19k → (150, 575); mixed j+k → (150, 500)).
+fn effective_freq_band(models: &[HashboardModel]) -> (f32, f32) {
+    let mut floor = f32::NEG_INFINITY;
+    let mut ceiling = f32::INFINITY;
+    for model in models {
+        let spec = hashboard_spec(*model);
+        floor = floor.max(spec.min_operating_mhz as f32);
+        let model_max = spec.chip_config.target_frequency_mhz.unwrap_or(500.0);
+        ceiling = ceiling.min(model_max);
+    }
+    if !floor.is_finite() || !ceiling.is_finite() {
+        // No present models — shouldn't happen post-init; conservative default.
+        return (150.0, 500.0);
+    }
+    (floor, ceiling)
 }
 
 /// Short family label used only inside the mixed-chassis summary
@@ -699,6 +747,7 @@ impl S19xAmlogic {
             power_w: None,
         }];
 
+        let (freq_floor, freq_ceiling) = effective_freq_band(&present_models);
         state_tx.send_modify(|state| {
             state.name = board_name.clone();
             state.model = reported_label.clone();
@@ -706,6 +755,12 @@ impl S19xAmlogic {
             state.temperatures = all_temps.clone();
             state.fans = fan_states.clone();
             state.powers = power_states.clone();
+            // Report the useful operating band + rail voltage resolved from the
+            // present detected model(s) so a controller can dial/calibrate
+            // within it instead of hardcoding per-model bounds.
+            state.min_freq_mhz = Some(freq_floor);
+            state.max_freq_mhz = Some(freq_ceiling);
+            state.target_voltage_v = Some(effective_voltage.target_voltage);
         });
 
         Ok((selected, psu))

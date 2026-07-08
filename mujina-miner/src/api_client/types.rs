@@ -38,6 +38,25 @@ pub struct BoardState {
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadState>,
+    /// Useful runtime operating-frequency floor (MHz) for this board's present
+    /// hashboard model(s). A controller (e.g. Nova) should dial/calibrate no
+    /// lower than this — it's the efficient/stable floor, above the hard clamp.
+    /// `None` on boards/builds that don't report a band.
+    #[serde(default)]
+    pub min_freq_mhz: Option<f32>,
+    /// Useful runtime operating-frequency ceiling (MHz) — the shared-rail
+    /// intersection of every present model's operating max (each model's
+    /// cold-init target, matching the runtime `SetFrequency` clamp). A single
+    /// operating point commanded above this is clamped by the miner. `None` if
+    /// not reported.
+    #[serde(default)]
+    pub max_freq_mhz: Option<f32>,
+    /// Effective operating (rail) voltage (V) mujina holds for the present
+    /// model(s) — resolved from their shared-PSU envelope. A controller should
+    /// command this as the operating-point voltage rather than guessing a
+    /// per-frequency band. `None` if not reported.
+    #[serde(default)]
+    pub target_voltage_v: Option<f32>,
 }
 
 /// Fan status.
