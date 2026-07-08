@@ -56,25 +56,22 @@ const MIN_RUNTIME_FREQ_MHZ: f32 = 100.0;
 /// avoids churning the chains on tiny thermal/dial deltas.
 const FREQ_APPLY_EPS_MHZ: f32 = 3.0;
 
-/// A chip counts as "producing" if it has been the origin of a nonce within
-/// this window. Wide enough that at the throttled ~1–10 nonce/s chain-wide
-/// report rate every live chip gets sampled, tight enough to notice one going
-/// silent within a couple census updates.
-const CHIP_CENSUS_WINDOW: Duration = Duration::from_secs(90);
+/// Target period for one full interleaved active-census sweep. Over this span
+/// the actor sends an addressed `ReadRegister(ChipId)` to every chip (the reads
+/// are spread across the 1 s mining ticks so no single tick emits a large
+/// command burst). A chip that answers proves it is alive *right now*, so unlike
+/// the old nonce-rate census this count is exact rather than statistical.
+const CENSUS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Upper bound on the frequency-scaled census window (see `census_window`).
-/// Caps how long a genuinely dead chip can linger in the count while the chain
-/// runs at a low frequency.
-const CHIP_CENSUS_WINDOW_MAX: Duration = Duration::from_secs(300);
-
-/// Chip count the census window was calibrated against (S19k Pro = 11 domains
-/// × 7 = 77). The chain-wide nonce report rate is throttled roughly constant
-/// (ticket mask), so it's split across all chips: a chain with more chips
-/// samples each one proportionally less often within a fixed window.
-/// `census_window` scales up by `chip_count / this` so per-chip sampling stays
-/// constant across chip families — e.g. the S19j Pro's 42×3 = 126 chips get a
-/// ~1.6× longer window instead of being false-flagged as "missing".
-const CENSUS_REFERENCE_CHIPS: usize = 77;
+/// Liveness window (see `update_chip_census`): a chip counts as alive if it
+/// answered a ChipId poll within this long. Every chip is *actively* polled once
+/// per `CENSUS_POLL_INTERVAL`, so this spans ~12 sweeps — a chip only has to
+/// answer once out of those to count. Under a full nonce firehose a single
+/// poll-answer is chain-traffic-shadowed maybe half the time, but
+/// P(≥1 answer in 12 polls) ≈ 100%, so every alive chip lands in the count. A
+/// genuinely dead chip answers none and drops out after this window (its absence
+/// also shows immediately in hashrate). Wider window = later death detection.
+const CENSUS_LIVENESS_WINDOW: Duration = Duration::from_secs(180);
 
 /// After a runtime frequency change of at least this magnitude (MHz), re-assert
 /// the reception-critical broadcast config (Core, TicketMask, AnalogMux,
@@ -188,7 +185,8 @@ impl BM13xxThread {
                 cmd_rx,
                 evt_tx,
                 status: status_clone,
-                nonce_origin_last_seen: [None; 128],
+                active_census_last_seen: [None; 256],
+                census_cursor: 0,
                 hashrate_estimator: HashrateEstimator::new(ACTOR_HASHRATE_WINDOW),
                 hashrate_estimator_1min: HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN),
                 paused: false,
@@ -387,13 +385,20 @@ struct BM13xxActor {
     /// to record) read a meaningful number instead of falling back
     /// to the static `capabilities.hashrate_estimate`.
     estimated_hashrate: HashRate,
-    /// Passive per-chip liveness census. Indexed by the nonce-derived origin
-    /// `(nonce >> 25) & 0x7f` (0..128 — one bucket per chip on a ≤128-chip
-    /// chain); each entry is the last time a nonce from that origin arrived.
-    /// Counting entries fresher than `CHIP_CENSUS_WINDOW` gives "chips
-    /// currently producing nonces" with no active polling — so a chain that
-    /// lost some chips is distinguishable from one that merely slowed down.
-    nonce_origin_last_seen: [Option<std::time::Instant>; 128],
+    /// Active per-chip liveness census. Indexed by chip *address* (0, 2, 4, …
+    /// up to 0xFA=250 for a 126-chip chain, hence 256 slots to span the full
+    /// u8 address range — NOT 128, which would drop every chip past address
+    /// 127). Each entry is the last time that chip answered one of the
+    /// interleaved `ReadRegister(ChipId)` polls the actor fires while mining.
+    /// Counting entries fresher than `2 * CENSUS_POLL_INTERVAL` yields an exact
+    /// "chips alive right now": a chip only appears if it actively responded,
+    /// so a healthy chain reads 100 % instead of the nonce-rate census's
+    /// statistical undercount.
+    active_census_last_seen: [Option<std::time::Instant>; 256],
+    /// Wrapping cursor into the chip-address list for the interleaved census
+    /// sweep. Each mining tick polls the next batch starting here, so a full
+    /// sweep of every chip completes within `CENSUS_POLL_INTERVAL`.
+    census_cursor: usize,
     /// Responses from chips, forwarded by the reader task.
     response_rx: mpsc::Receiver<Result<protocol::Response, std::io::Error>>,
     chip_tx: Pin<Box<dyn Sink<protocol::Command, Error = std::io::Error> + Send + 'static>>,
@@ -621,43 +626,17 @@ impl BM13xxActor {
         status.clone()
     }
 
-    /// Recompute the passive per-chip census (chips that produced a nonce
-    /// within `CHIP_CENSUS_WINDOW`) and publish it into the shared status.
-    /// Cheap — a 128-entry scan — so it's fine to call on every mining tick.
-    /// Census window scaled for the current frequency. Chips emit nonces at a
-    /// rate proportional to hashrate (≈ ∝ frequency), so at a lower frequency
-    /// each chip needs proportionally longer to be sampled at least once.
-    /// Scaling the window by `cold_init_freq / current_freq` keeps the expected
-    /// nonces-per-chip-per-window roughly constant, so the census reflects true
-    /// liveness at any operating point instead of false-flagging alive-but-slow
-    /// chips (a genuinely dead chip emits nothing and still drops out). Clamped
-    /// to `[CHIP_CENSUS_WINDOW, CHIP_CENSUS_WINDOW_MAX]`.
-    fn census_window(&self) -> Duration {
-        let f = self.current_freq_mhz;
-        let reference = self.max_runtime_freq_mhz;
-        // Frequency factor: each chip emits nonces at a rate ∝ frequency, so a
-        // lower frequency needs a proportionally longer window to sample it.
-        let freq_factor = if f > 0.0 && reference > f {
-            reference / f
-        } else {
-            1.0
-        };
-        // Chip-count factor: more chips share the same throttled chain-wide
-        // nonce budget, so each is sampled less often. Scale up (never down)
-        // relative to the S19k Pro calibration so a higher-chip-count chain
-        // (e.g. S19j Pro's 126) isn't undercounted. S19k (77 chips) → 1.0, so
-        // its census is unchanged.
-        let count_factor =
-            (self.chain.chip_count() as f32 / CENSUS_REFERENCE_CHIPS as f32).max(1.0);
-        CHIP_CENSUS_WINDOW
-            .mul_f32(freq_factor * count_factor)
-            .min(CHIP_CENSUS_WINDOW_MAX)
-    }
-
+    /// Recompute the active per-chip census — the number of chips that answered
+    /// an interleaved `ReadRegister(ChipId)` poll within `CENSUS_LIVENESS_WINDOW`
+    /// — and publish it into the shared status. The window spans many sweeps, so
+    /// a chip repeatedly shadowed by chain traffic (the same effect `verify_chain`
+    /// retries around) still counts as long as it answered any recent sweep;
+    /// only a chip that answers none across the whole window drops out. Cheap —
+    /// a fixed 256-slot scan — so it's fine to call on every mining tick.
     fn update_chip_census(&self) {
-        let window = self.census_window();
+        let window = CENSUS_LIVENESS_WINDOW;
         let active = self
-            .nonce_origin_last_seen
+            .active_census_last_seen
             .iter()
             .filter(|seen| seen.map_or(false, |t| t.elapsed() < window))
             .count() as u16;
@@ -666,6 +645,49 @@ impl BM13xxActor {
         status.active_chips = active;
         status.expected_chips = expected;
         status.frequency_mhz = self.current_freq_mhz;
+    }
+
+    /// Send one batch of the interleaved active-census sweep.
+    ///
+    /// Fires an addressed `ReadRegister(ChipId)` to the next `batch` chip
+    /// addresses (advancing a wrapping cursor) so that, across
+    /// `CENSUS_POLL_INTERVAL` worth of 1 s mining ticks, every chip is polled
+    /// once. Crucially — unlike `verify_chain` — it NEVER drains or blocks on
+    /// `response_rx`: the reads are fired and forgotten, and each chip's answer
+    /// is matched later in `handle_chip_response`, so mining nonces/shares keep
+    /// flowing untouched. The batch is a small fraction of the chain, so a
+    /// sweep never bursts enough commands to back up the bounded response
+    /// channel (which would apply reader backpressure to the serial RX).
+    async fn send_census_batch(&mut self) {
+        // Snapshot the address list first so the `&self.chain` borrow is
+        // released before we take `&mut self.chip_tx` (mirrors `verify_chain`).
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
+        let n = addresses.len();
+        if n == 0 {
+            return;
+        }
+        // Spread a full sweep across `CENSUS_POLL_INTERVAL` one-second ticks.
+        let sweep_ticks = (CENSUS_POLL_INTERVAL.as_secs() as usize).max(1);
+        let batch = n.div_ceil(sweep_ticks);
+        let start = self.census_cursor % n;
+        self.census_cursor = (start + batch) % n;
+
+        for k in 0..batch {
+            let addr = addresses[(start + k) % n];
+            if let Err(e) = self
+                .chip_tx
+                .send(Command::ReadRegister {
+                    broadcast: false,
+                    chip_address: addr,
+                    register_address: RegisterAddress::ChipId,
+                })
+                .await
+            {
+                // Observability only — a send failure must not disturb mining.
+                warn!(error = ?e, "Failed to send census ChipId poll");
+                break;
+            }
+        }
     }
 
     /// Main actor loop. Runs until command channel closes.
@@ -694,7 +716,12 @@ impl BM13xxActor {
                     if let Err(e) = self.apply_effective_frequency().await {
                         warn!(error = %e, "thermal frequency enforcement failed");
                     }
-                    // Refresh the passive per-chip census for the API/UI.
+                    // Interleaved active census: poll the next batch of chips
+                    // (ChipId reads that chips answer while hashing — this never
+                    // drains or blocks on the nonce path), then refresh the
+                    // count for the API/UI. Gated by `current_task.is_some()`
+                    // above, so it never runs while paused or idle.
+                    self.send_census_batch().await;
                     self.update_chip_census();
                 }
             }
@@ -795,7 +822,8 @@ impl BM13xxActor {
                     self.hashrate_estimator_1min =
                         HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN);
                     self.estimated_hashrate = HashRate::default();
-                    self.nonce_origin_last_seen = [None; 128];
+                    self.active_census_last_seen = [None; 256];
+                    self.census_cursor = 0;
                     self.current_task = None;
                     self.chip_state = ChipState::Disabled;
                     let status = self.update_status(|status| {
@@ -1760,22 +1788,6 @@ impl BM13xxActor {
                 midstate_num,
                 subcore_id,
             }) => {
-                // Passive per-chip liveness census: every nonce encodes its
-                // origin chip in the top bits. Record it here, before any job
-                // lookup or share filtering, so a chip counts as "alive"
-                // whenever it produces a nonce — even nonces for stale jobs or
-                // that never become shares still prove the chip is hashing.
-                // The chain divides the 32-bit nonce space into `chip_count`
-                // equal contiguous slices (NonceRange config), so the slice a
-                // nonce falls in identifies the chip that found it:
-                // `chip = (nonce * chip_count) >> 32`. Verified empirically —
-                // this yields exactly one bucket per chip (0..chip_count),
-                // where the raw top bits saturate all 128 (they're core bits).
-                let chip = ((nonce as u64 * self.chain.chip_count() as u64) >> 32) as usize;
-                if let Some(slot) = self.nonce_origin_last_seen.get_mut(chip) {
-                    *slot = Some(std::time::Instant::now());
-                }
-
                 // HACK: BM1362 job_id fix - protocol.rs extracts job_id from bits 7-4,
                 // but BM1362 returns it in bits 6-3. Reconstruct result_header and re-extract.
                 // TODO: Move this to protocol.rs with chip-type-aware parsing.
@@ -1935,6 +1947,18 @@ impl BM13xxActor {
                 chip_address,
                 register,
             }) => {
+                // Active per-chip census: an addressed ChipId read answered by
+                // this chip proves it is alive right now. The interleaved
+                // census sweep (`send_census_batch`) issues these while mining;
+                // matching them here is the only census bookkeeping. Any other
+                // register read (e.g. the init-time `verify_chain`) just traces.
+                if matches!(register, Register::ChipId { .. }) {
+                    if let Some(slot) =
+                        self.active_census_last_seen.get_mut(chip_address as usize)
+                    {
+                        *slot = Some(std::time::Instant::now());
+                    }
+                }
                 trace!(
                     chip_address = format!("0x{:02x}", chip_address),
                     ?register,
@@ -2145,7 +2169,8 @@ mod tests {
             hashrate_estimator_1min: HashrateEstimator::new_ewma(ACTOR_HASHRATE_WINDOW_1MIN),
             paused: false,
             estimated_hashrate: HashRate::from_gigahashes(83.0 * chain.chip_count() as f64),
-            nonce_origin_last_seen: [None; 128],
+            active_census_last_seen: [None; 256],
+            census_cursor: 0,
             response_rx,
             chip_tx: Box::pin(chip_tx),
             reader_handle: None,
