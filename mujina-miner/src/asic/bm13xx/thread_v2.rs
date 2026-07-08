@@ -11,6 +11,7 @@
 //! are passed to the constructor separately from config. A future design might
 //! use a factory or allow stream replacement.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -498,6 +499,16 @@ enum ChipState {
 struct ChipJobs {
     tasks: [Option<HashTask>; 16],
     next_id: u8,
+    /// Nonces already reported for the task currently in each slot. BM13xx
+    /// chips are known to occasionally echo the same found nonce more than
+    /// once over the shared UART daisy-chain (bus noise, or just the chip's
+    /// own broadcast-without-ACK behavior); without a check here every echo
+    /// becomes a distinct `Share` — double-recorded into the per-thread
+    /// hashrate estimator (inflating/spiking the reported rate) and
+    /// resubmitted to the pool (which then rejects it as "Duplicate share").
+    /// Cleared per-slot on [`ChipJobs::insert`] so it never spans two
+    /// different jobs that happen to land in the same slot.
+    seen_nonces: [HashSet<u32>; 16],
 }
 
 impl ChipJobs {
@@ -505,6 +516,7 @@ impl ChipJobs {
         Self {
             tasks: Default::default(),
             next_id: 0,
+            seen_nonces: Default::default(),
         }
     }
 
@@ -512,6 +524,7 @@ impl ChipJobs {
     fn insert(&mut self, task: HashTask) -> u8 {
         let id = self.next_id;
         self.tasks[id as usize] = Some(task);
+        self.seen_nonces[id as usize].clear();
         self.next_id = (self.next_id + 1) % (self.tasks.len() as u8);
         id
     }
@@ -519,6 +532,16 @@ impl ChipJobs {
     /// Look up a task by chip job ID.
     fn get(&self, id: u8) -> Option<&HashTask> {
         self.tasks.get(id as usize).and_then(|t| t.as_ref())
+    }
+
+    /// Record that `nonce` was reported for the task in slot `id`. Returns
+    /// `true` the first time this exact nonce is seen for the job currently
+    /// occupying that slot, `false` on every subsequent echo of it.
+    fn mark_nonce_seen(&mut self, id: u8, nonce: u32) -> bool {
+        match self.seen_nonces.get_mut(id as usize) {
+            Some(seen) => seen.insert(nonce),
+            None => true,
+        }
     }
 }
 
@@ -1856,6 +1879,23 @@ impl BM13xxActor {
                 // BM1366 work.
                 let result_header = (job_id << 4) | subcore_id;
                 let job_id = (result_header >> 3) & 0x0f;
+
+                // BM13xx chips occasionally echo the same found nonce more
+                // than once over the shared UART daisy-chain. Drop exact
+                // repeats here, before the (relatively expensive) merkle
+                // root / header hash work below and before it can inflate
+                // the hashrate estimator or get resubmitted to the pool
+                // (which would reject it as "Duplicate share"). Checked
+                // before the job_id lookup so a duplicate costs only a
+                // hash-set probe, not a wasted hash computation.
+                if !self.chip_jobs.mark_nonce_seen(job_id, nonce) {
+                    trace!(
+                        job_id,
+                        nonce = format!("{:#x}", nonce),
+                        "Duplicate nonce from chip; dropping"
+                    );
+                    return;
+                }
 
                 // Look up the task for this job_id
                 let Some(task) = self.chip_jobs.get(job_id) else {
