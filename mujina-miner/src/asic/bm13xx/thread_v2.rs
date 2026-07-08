@@ -1327,55 +1327,71 @@ impl BM13xxActor {
             "Ramping frequency"
         );
 
+        // Per-step applied rail voltage (clamped to the regulator's range).
+        // "Voltage leads frequency", so each step commands the voltage its
+        // target frequency needs. Computed via domain_count for series
+        // voltage (stacked TPS546 = 12 domains; series APW12 = 42/11).
+        let step_voltages: Vec<Option<f32>> = steps
+            .iter()
+            .map(|(freq, _)| {
+                has_regulator.then(|| {
+                    voltage_for_frequency_stacked(*freq, domain_count, max_v).clamp(min_v, max_v)
+                })
+            })
+            .collect();
+
+        // If the rail never changes across the ramp, set it ONCE up front
+        // rather than paying a ~0.5-1 s BLOCKING i2c write on every step
+        // (72-84 steps/board, and once PER chain on a shared rail). This is
+        // the case for every series-domain APW12 board: the per-frequency
+        // voltage always lands below the range floor, so all steps clamp up
+        // to the same effective floor. Setting the (max, since monotonic)
+        // voltage before any PLL step still leads frequency correctly, and
+        // takes the ramp from minutes (i2c-bound) to seconds (PLL-bound).
+        // Boards whose voltage genuinely ramps step-to-step (EmberOne /
+        // TPS546) fail this check and keep the per-step path below.
+        let constant_rail = has_regulator && step_voltages.windows(2).all(|w| w[0] == w[1]);
+        if constant_rail {
+            let v = step_voltages[0].expect("has_regulator => step voltage present");
+            if let Some(regulator) = self.peripherals.voltage_regulator.as_ref() {
+                Self::apply_ramp_voltage(
+                    regulator,
+                    self.peripherals.ramp_coordinator.as_ref(),
+                    chain_index,
+                    v,
+                )
+                .await?;
+            }
+        }
+
         for (step_index, (freq, step)) in steps.iter().enumerate() {
-            // 1. Set voltage (lead the frequency change)
-            // Use domain_count for series voltage calculation:
-            //   - For stacked (TPS546): 12 domains, V = V_per_chip * 12
-            //   - For series (APW12): 42 domains, V = V_per_chip * 42
-            // The regulator's set_voltage() will clamp to its valid range.
-            let requested_voltage =
-                has_regulator.then(|| voltage_for_frequency_stacked(*freq, domain_count, max_v));
-            let applied_voltage = requested_voltage.map(|voltage| voltage.clamp(min_v, max_v));
+            let applied_voltage = step_voltages[step_index];
 
             if step_index == 0 || step_index + 1 == step_count || (step_index + 1) % 8 == 0 {
                 debug!(
                     step = step_index + 1,
                     total_steps = step_count,
                     frequency_mhz = freq.mhz(),
-                    requested_voltage_v = requested_voltage,
                     applied_voltage_v = applied_voltage,
+                    constant_rail,
                     "Executing frequency ramp step"
                 );
             }
 
-            if let Some(ref regulator) = self.peripherals.voltage_regulator {
-                let v = applied_voltage
-                    .expect("applied voltage is present when regulator exists");
-                if let Some(coord) = self.peripherals.ramp_coordinator.as_ref() {
-                    // Shared-rail board (e.g. 3 hashboards on one APW12,
-                    // possibly a mixed S19j+S19k chassis). Route this
-                    // chain's request through the coordinator, which drives
-                    // the rail to the MAX any chain currently needs. There
-                    // is no cross-chain barrier, so chains with different
-                    // ramp lengths (72 vs 84 steps) never deadlock waiting
-                    // on one another.
-                    coord
-                        .sync_voltage_step(chain_index, regulator, v, VOLTAGE_SETTLE_DELAY)
-                        .await
-                        .map_err(|e| {
-                            HashThreadError::InitializationFailed(format!(
-                                "Ramp coordinator failed at step {step_index} (v={v:.2}V): {e}"
-                            ))
-                        })?;
-                } else {
-                    // Single-chain path: each actor drives its own
-                    // dedicated regulator independently.
-                    regulator.lock().await.set_voltage(v).await.map_err(|e| {
-                        HashThreadError::InitializationFailed(format!(
-                            "Failed to set voltage to {v:.2}V: {e}"
-                        ))
-                    })?;
-                    time::sleep(VOLTAGE_SETTLE_DELAY).await;
+            // 1. Set voltage (lead the frequency change) — only when the
+            //    rail actually varies step-to-step; a constant rail was set
+            //    once above.
+            if !constant_rail {
+                if let (Some(v), Some(regulator)) =
+                    (applied_voltage, self.peripherals.voltage_regulator.as_ref())
+                {
+                    Self::apply_ramp_voltage(
+                        regulator,
+                        self.peripherals.ramp_coordinator.as_ref(),
+                        chain_index,
+                        v,
+                    )
+                    .await?;
                 }
             }
 
@@ -1402,9 +1418,9 @@ impl BM13xxActor {
             );
         }
 
-        if has_regulator {
-            let final_v =
-                voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
+        if let Some(Some(final_v)) = step_voltages.last() {
+            // Actual applied rail voltage (clamped), not the raw
+            // per-frequency estimate — so the log matches the real rail.
             info!(
                 target_mhz = target.mhz(),
                 voltage = format!("{:.2}V", final_v),
@@ -1414,6 +1430,42 @@ impl BM13xxActor {
             info!(target_mhz = target.mhz(), "Frequency ramp complete");
         }
 
+        Ok(())
+    }
+
+    /// Drive a chain's ramp voltage onto the (possibly shared) rail.
+    /// On a shared-rail cohort this routes through the [`ChainCoordinator`]
+    /// max-aggregator (keyed by `chain_index`) so the rail always sits at the
+    /// max any chain needs; otherwise the chain drives its own regulator
+    /// directly. Either way it waits [`VOLTAGE_SETTLE_DELAY`] so the rail
+    /// settles before the caller steps frequency.
+    ///
+    /// Takes the `Arc` handles rather than `&self`: `&self` would make the
+    /// returned future require `Self: Sync`, which it isn't (`chip_tx` is a
+    /// `Send`-only `Sink`).
+    async fn apply_ramp_voltage(
+        regulator: &Arc<tokio::sync::Mutex<dyn crate::asic::hash_thread::VoltageRegulator + Send>>,
+        coordinator: Option<&Arc<super::chain_config::ChainCoordinator>>,
+        chain_index: usize,
+        v: f32,
+    ) -> Result<(), HashThreadError> {
+        if let Some(coord) = coordinator {
+            coord
+                .sync_voltage_step(chain_index, regulator, v, VOLTAGE_SETTLE_DELAY)
+                .await
+                .map_err(|e| {
+                    HashThreadError::InitializationFailed(format!(
+                        "Ramp coordinator set_voltage (v={v:.2}V): {e}"
+                    ))
+                })?;
+        } else {
+            regulator.lock().await.set_voltage(v).await.map_err(|e| {
+                HashThreadError::InitializationFailed(format!(
+                    "Failed to set voltage to {v:.2}V: {e}"
+                ))
+            })?;
+            time::sleep(VOLTAGE_SETTLE_DELAY).await;
+        }
         Ok(())
     }
 
