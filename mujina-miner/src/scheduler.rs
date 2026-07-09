@@ -35,6 +35,8 @@ use slotmap::SlotMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::future::join_all;
 use tokio::sync::{mpsc, watch};
 
 use tokio_stream::wrappers::ReceiverStream;
@@ -249,6 +251,31 @@ fn guard_thread_op<K: std::fmt::Debug, E: std::fmt::Display>(
 }
 
 impl Scheduler {
+    /// Send `SetFrequency` to every chain CONCURRENTLY rather than one at a
+    /// time. Safe because a pure frequency change never touches the shared
+    /// PSU (`execute_frequency_change`'s own doc comment: "no voltage
+    /// change") -- each chain rides its own dedicated UART, so there's no
+    /// shared-resource race to serialize against, only wall-clock time to
+    /// save. For 3 chains with similar-length ramps this turns their SUM
+    /// (sequential) into roughly their MAX (concurrent) -- e.g. ~3x fewer
+    /// seconds spent waiting on this phase of a dial move.
+    ///
+    /// Voltage-set calls deliberately stay sequential wherever they're
+    /// still used: they DO share one PSU behind an async Mutex
+    /// (`Arc<Mutex<NativeAmlogicPsu>>`), so issuing them concurrently
+    /// wouldn't save real time -- the underlying i2c exchanges would just
+    /// queue on that same mutex in whatever order they happen to arrive.
+    async fn set_frequency_all_chains(&mut self, mhz: f32, last_err: &mut Option<String>) {
+        let results = join_all(self.threads.iter_mut().map(|(id, entry)| {
+            let fut = tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz));
+            async move { (id, fut.await) }
+        }))
+        .await;
+        for (id, result) in results {
+            guard_thread_op(result, id, "set_frequency", last_err);
+        }
+    }
+
     fn new() -> Self {
         Self {
             sources: SlotMap::new(),
@@ -917,16 +944,12 @@ impl Scheduler {
                     thread_count = self.threads.len(),
                     "Setting chip frequency on all chains (power dial)"
                 );
-                // Per-chain re-ramp at fixed voltage. Each thread clamps to
-                // its own safe range. Collect the last error (if any) so the
-                // HTTP caller learns it didn't fully apply.
+                // Per-chain re-ramp at fixed voltage, run concurrently
+                // across chains (see `set_frequency_all_chains`'s doc
+                // comment for why that's safe here). Collect the last error
+                // (if any) so the HTTP caller learns it didn't fully apply.
                 let mut last_err: Option<String> = None;
-                for (id, entry) in self.threads.iter_mut() {
-                    guard_thread_op(
-                        tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
-                        id, "set_frequency", &mut last_err,
-                    );
-                }
+                self.set_frequency_all_chains(mhz, &mut last_err).await;
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(match last_err {
                     Some(e) => Err(anyhow::anyhow!(e)),
@@ -967,19 +990,9 @@ impl Scheduler {
                 // guard against, so skip straight to frequency-only.
                 let mut last_err: Option<String> = None;
                 if voltage_unchanged {
-                    for (id, entry) in self.threads.iter_mut() {
-                        guard_thread_op(
-                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
-                            id, "set_frequency", &mut last_err,
-                        );
-                    }
+                    self.set_frequency_all_chains(mhz, &mut last_err).await;
                 } else if lowering_voltage {
-                    for (id, entry) in self.threads.iter_mut() {
-                        guard_thread_op(
-                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
-                            id, "set_frequency", &mut last_err,
-                        );
-                    }
+                    self.set_frequency_all_chains(mhz, &mut last_err).await;
                     for (id, entry) in self.threads.iter_mut() {
                         guard_thread_op(
                             tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_voltage(volts)).await,
@@ -993,12 +1006,7 @@ impl Scheduler {
                             id, "set_voltage", &mut last_err,
                         );
                     }
-                    for (id, entry) in self.threads.iter_mut() {
-                        guard_thread_op(
-                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
-                            id, "set_frequency", &mut last_err,
-                        );
-                    }
+                    self.set_frequency_all_chains(mhz, &mut last_err).await;
                 }
                 self.current_voltage_v = volts;
                 let _ = miner_state_tx.send(self.compute_miner_state());
