@@ -1934,48 +1934,75 @@ async fn native_telemetry_task(
         // PIC-mediated temps, TMP75 fallback. Accumulate into one
         // sensor list keyed by `HB{index}-...` so the API surfaces
         // per-hashboard sensors in the same BoardState.
-        let mut temperatures: Vec<TemperatureSensor> = Vec::new();
-        for (pic_addr, hb, pic_opt) in pics.iter_mut() {
-            let pic_addr = *pic_addr;
-            let mut got_pic_temps = false;
-            if let Some(pic) = pic_opt.as_mut() {
-                if let Err(e) = pic.heartbeat() {
-                    warn!(
-                        hashboard = hb.index,
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        error = %e,
-                        "PIC heartbeat failed"
-                    );
-                }
-                match pic.read_temperatures_celsius() {
-                    Ok(temps) => {
-                        for (i, t) in temps.iter().enumerate() {
-                            temperatures.push(TemperatureSensor {
-                                name: format!("HB{}-PIC{}", hb.index, i),
-                                temperature_c: Some(*t),
-                            });
-                        }
-                        got_pic_temps = !temps.is_empty();
-                    }
-                    Err(e) => {
-                        debug!(
+        //
+        // Runs on spawn_blocking: `pic.heartbeat()` / `read_temperatures_celsius()`
+        // / `read_temperatures()` are all synchronous i2c calls (the same raw,
+        // timeout-less `LinuxI2cDevice` ioctl path as `NativeAmlogicPsu::exchange` --
+        // see its doc comment for why running these inline on the async runtime is
+        // a real hang/starvation risk, not just a style nit). This loop, run inline,
+        // was confirmed as the source of a real, periodic ~5-6s GET-latency spike on
+        // .222 recurring roughly every telemetry tick: 3 boards x (heartbeat + up to
+        // 4 temperature reads), all blocking with no yield point in between, was
+        // enough to intermittently starve the axum GET handler's worker thread --
+        // Nova reported the miner "unreachable" / flapping even though it was
+        // mining fine the whole time. `pics` (holding the open per-board `PicChain`
+        // handles) moves into the closure and back out; the individual `PicChain`
+        // objects don't need to survive a panic in this closure (astronomically
+        // unlikely, since none of these calls panic on ordinary I/O failure --
+        // they return `Result`), so on that edge case telemetry for this board set
+        // is simply lost rather than the process crashing.
+        let (returned_pics, blocking_temperatures) = tokio::task::spawn_blocking(move || {
+            let mut temperatures: Vec<TemperatureSensor> = Vec::new();
+            for (pic_addr, hb, pic_opt) in pics.iter_mut() {
+                let pic_addr = *pic_addr;
+                let mut got_pic_temps = false;
+                if let Some(pic) = pic_opt.as_mut() {
+                    if let Err(e) = pic.heartbeat() {
+                        warn!(
                             hashboard = hb.index,
                             addr = format_args!("0x{:02x}", pic_addr),
                             error = %e,
-                            "PIC temperature read failed"
+                            "PIC heartbeat failed"
                         );
                     }
+                    match pic.read_temperatures_celsius() {
+                        Ok(temps) => {
+                            for (i, t) in temps.iter().enumerate() {
+                                temperatures.push(TemperatureSensor {
+                                    name: format!("HB{}-PIC{}", hb.index, i),
+                                    temperature_c: Some(*t),
+                                });
+                            }
+                            got_pic_temps = !temps.is_empty();
+                        }
+                        Err(e) => {
+                            debug!(
+                                hashboard = hb.index,
+                                addr = format_args!("0x{:02x}", pic_addr),
+                                error = %e,
+                                "PIC temperature read failed"
+                            );
+                        }
+                    }
                 }
-            }
-            if !got_pic_temps {
-                match read_temperatures(hb) {
-                    Ok(t) => temperatures.extend(t),
-                    Err(error) => {
-                        debug!(board = hb.index, error = %error, "TMP75 temperature read failed");
+                if !got_pic_temps {
+                    match read_temperatures(hb) {
+                        Ok(t) => temperatures.extend(t),
+                        Err(error) => {
+                            debug!(board = hb.index, error = %error, "TMP75 temperature read failed");
+                        }
                     }
                 }
             }
-        }
+            (pics, temperatures)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, "Telemetry PIC/temperature blocking task panicked");
+            (Vec::new(), Vec::new())
+        });
+        pics = returned_pics;
+        let temperatures = blocking_temperatures;
 
         // ----- Fan + overtemp control --------------------------------
         //
