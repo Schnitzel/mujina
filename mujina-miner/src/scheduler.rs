@@ -71,12 +71,12 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// Window for the responsive top-level `hashrate_1min`. Genuinely 1 minute —
-/// see the matching constant/comment in `asic::bm13xx::thread_v2` for why
-/// this was corrected from 5 s (which produced visibly noisy swings in the
-/// displayed hashrate — a 5 s EWMA time constant is dominated by Poisson
-/// share-arrival noise at typical poll intervals).
-const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
+/// Short "live" window for the responsive top-level `hashrate_1min` (5 s, to
+/// match LuxOS/Braiins' live hashrate; field name kept for API stability).
+/// See `ACTOR_HASHRATE_WINDOW_1MIN` in `asic::bm13xx::thread_v2` — the real
+/// fix for this window's swinginess was more samples (BM1362's TicketMask
+/// override), not a longer time constant.
+const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(5);
 
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).

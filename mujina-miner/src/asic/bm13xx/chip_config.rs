@@ -316,8 +316,26 @@ pub fn bm1362() -> ChipConfig {
             // Reg 0x3C per-chip: enable hashing cores
             core_perchip: [0x8000_8540, 0x8000_8008, 0x8000_82AA],
         },
-        // BM1362 boards keep the dynamically-scaled TicketMask from the
-        // broadcast phase; no capture-derived override yet.
+        // TRIED `Some(2)` (BM1366's already-validated low-difficulty
+        // override, see below) to fix hashrate_1min's swinginess by giving
+        // the estimator more samples -- REVERTED. On .222 (3x S19j Pro,
+        // 126 chips/chain) it roughly HALVED effective hashrate and active
+        // chip census (126 -> ~67 per board), with no explicit error logged
+        // (silent UART frame loss reads as "fewer successful responses,"
+        // not a detected fault). Working theory: BM1366's 77-chip chain
+        // tolerates this reporting rate fine, but BM1362's 126-chip chain
+        // pushes materially more aggregate nonce-report traffic across the
+        // SAME shared UART link at the same per-chip rate, congesting it
+        // enough to drown out both the active-census ReadRegister polls and
+        // real nonce responses. (My reasoning for trying it -- "more chips
+        // means the per-chip rate is proportionally safer" -- had this
+        // backwards: more chips at the same per-chip report rate means MORE
+        // aggregate bus traffic, not less.) BM1362 boards keep the
+        // dynamically-scaled TicketMask from the broadcast phase; no
+        // capture-derived override yet. A safe fix likely needs a milder
+        // BM1362-specific value (e.g. zero_bits=1, roughly half the extra
+        // volume) validated incrementally against real chip-count/hashrate
+        // held steady, not reused wholesale from a smaller chain.
         post_perchip_ticket_zero_bits: None,
         target_frequency_mhz: None,
     }

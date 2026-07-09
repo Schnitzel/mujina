@@ -43,21 +43,21 @@ use crate::{
 /// `status.hashrate`. 5 minutes matches the scheduler-side estimator
 /// so the per-board and the chain-wide hashrate views agree.
 const ACTOR_HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// Window for the responsive `status.hashrate_1min` estimate — a frequency
-/// dial or recovery shows up much sooner than in the 5-minute view (whose old
-/// samples linger). Genuinely 1 minute, matching the field name and the API
-/// doc's "settles ~5x faster [than the 5-minute hashrate]" (300s / 5 = 60s).
+/// Short "live" window for the responsive `status.hashrate_1min` estimate — a
+/// frequency dial or recovery shows up almost immediately (vs the 5-minute
+/// view, whose old samples linger). 5 s matches the live hashrate LuxOS/
+/// Braiins expose. NOTE: the field is still named `hashrate_1min` for
+/// API/wire stability, not because the window is a minute.
 ///
-/// This was previously 5 s (to mirror the raw "live" hashrate LuxOS/Braiins
-/// display), which is a full order of magnitude off from what the name/API
-/// doc promise. At a ~2s poll interval a 5s EWMA time constant gives
-/// fprop = 1-exp(-2/5) ≈ 33% weight per poll on whatever landed in just that
-/// one interval — for a Poisson share-arrival process that's enough sampling
-/// noise to visibly swing the displayed number (e.g. 40-80 TH/s on a
-/// ~90 TH/s chassis) every couple of polls, reported as "crazy" swinging on
-/// .222. 60 s drops that per-poll weight to ~3.3%, damping the same noise by
-/// ~10x while still settling noticeably faster than the 5-minute figure.
-const ACTOR_HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
+/// A 5 s EWMA time constant needs a genuinely high sample rate to average
+/// well (low variance needs many samples, not a longer memory) — the actual
+/// fix for "5 s hashrate swings wildly" was giving it more samples to work
+/// with (see BM1362's `post_perchip_ticket_zero_bits` in chip_config.rs),
+/// not lengthening this window, which was tried first and reverted: it
+/// masked the swinging by averaging over more real time, at the cost of
+/// the window no longer matching its own name or the LuxOS/Braiins-style
+/// "live" reading it's meant to be.
+const ACTOR_HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(5);
 
 /// Lower bound for runtime down-clocking (MHz). Below this the chain comms get
 /// unreliable on BHB56902; refine empirically. Shared by the runtime dial and
