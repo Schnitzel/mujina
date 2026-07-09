@@ -78,6 +78,13 @@ const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// override), not a longer time constant.
 const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(5);
 
+/// `SetOperatingPoint`'s voltage is considered unchanged (and its whole
+/// per-chain PSU write phase skipped) when the requested volts are within
+/// this of `current_voltage_v`. Comfortably tighter than the DAC's own
+/// ~0.1 V step, so this only catches genuinely-repeated requests, never a
+/// real (if small) voltage move.
+const VOLTAGE_APPLY_EPS_V: f32 = 0.01;
+
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).
 ///
@@ -927,12 +934,26 @@ impl Scheduler {
                 });
             }
             SchedulerCommand::SetOperatingPoint { mhz, volts, reply } => {
+                // Skip the voltage phase entirely when the requested rail is
+                // already where it is (within DAC-quantization noise). Every
+                // set_voltage call is a real, several-hundred-ms-plus i2c PSU
+                // exchange PER CHAIN (see NativeAmlogicPsu::exchange) -- for
+                // chassis whose effective rail is a constant regardless of
+                // frequency (e.g. this S19j/S19k Amlogic driver -- see
+                // `effective_voltage_spec`), Nova's dial sends the SAME
+                // voltage on essentially every operating-point change, so
+                // without this check every dial move paid ~3 chains worth of
+                // no-op PSU writes -- measured on .222 as a flat ~2-3s+ delay
+                // before the commanded frequency (and so the real wattage)
+                // even started moving, well before the ramp itself begins.
+                let voltage_unchanged = (volts - self.current_voltage_v).abs() < VOLTAGE_APPLY_EPS_V;
                 let lowering_voltage = volts < self.current_voltage_v;
                 info!(
                     mhz,
                     volts,
                     from_volts = self.current_voltage_v,
                     lowering_voltage,
+                    voltage_unchanged,
                     "Setting operating point (V/f) on all chains"
                 );
 
@@ -942,8 +963,17 @@ impl Scheduler {
                 // the ordering: never a high frequency at a low voltage.
                 //   - lowering power: ALL chains drop frequency, THEN voltage.
                 //   - raising power:  voltage up, THEN ALL chains raise freq.
+                // When voltage isn't actually moving there's no V/f race to
+                // guard against, so skip straight to frequency-only.
                 let mut last_err: Option<String> = None;
-                if lowering_voltage {
+                if voltage_unchanged {
+                    for (id, entry) in self.threads.iter_mut() {
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                            id, "set_frequency", &mut last_err,
+                        );
+                    }
+                } else if lowering_voltage {
                     for (id, entry) in self.threads.iter_mut() {
                         guard_thread_op(
                             tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
