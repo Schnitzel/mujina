@@ -237,6 +237,19 @@ pub struct AmlogicHealthGateConfig {
 
     /// Whether a configured-but-missing hashboard is fatal.
     pub fail_on_missing_expected_hashboard: bool,
+
+    /// When a *present* hashboard cannot be started — e.g. a PIC-variant board
+    /// (S19j Pro) whose on-hashboard PIC won't handshake or enable its DC-DC,
+    /// so its chips can never power up — whether to skip it and mine on the
+    /// remaining boards.
+    ///
+    /// Defaults to `false`: an unstartable hashboard is NOT silently ignored.
+    /// Board init fails with a clear error naming the bad slot, so the operator
+    /// notices and fixes the hardware instead of the miner quietly running at
+    /// reduced capacity. Set to `true` to drop the unstartable board(s) and
+    /// bring the rest of the chassis up in a degraded mode.
+    #[serde(default)]
+    pub skip_unstartable_hashboards: bool,
 }
 
 /// Configured fan endpoint.

@@ -749,49 +749,73 @@ impl S19xAmlogic {
         // the decompiled S21 single_board_test in
         //   https://github.com/HashSource/bitmain_antminer_binaries
         // and confirmed against LuxOS ftrace captures on BHB42601.
+        // Bring up each PIC-variant board's DC-DC (retried), and note any that
+        // can't be started. On PIC variants (S19j Pro) the DC-DC is gated by
+        // the on-hashboard PIC: if it won't handshake / enable (after retries)
+        // the chips can never power, so the board cannot start. noPIC variants
+        // (S19k Pro) bring their DC-DC up directly — no PIC gate.
+        let mut unstartable: Vec<u8> = Vec::new();
         for sel in &selected {
+            if !sel.model.expects_pic() {
+                continue; // noPIC board — DC-DC comes up directly.
+            }
             let pic_addr = pic_address_for_slot(sel.config.index);
-            match PicChain::open(&sel.config.eeprom_i2c_device, pic_addr) {
-                Ok(mut pic) => match pic.handshake() {
-                    Ok(version) => {
-                        info!(
-                            hashboard = sel.config.index,
-                            addr = format_args!("0x{:02x}", pic_addr),
-                            version = format_args!("0x{:02x}", version),
-                            "PIC handshake ok"
-                        );
-                        if let Err(e) = pic.enable_dc_dc() {
-                            warn!(
-                                hashboard = sel.config.index,
-                                addr = format_args!("0x{:02x}", pic_addr),
-                                error = %e,
-                                "PIC enable_dc_dc failed; chips may not power up"
-                            );
-                        } else {
-                            info!(
-                                hashboard = sel.config.index,
-                                addr = format_args!("0x{:02x}", pic_addr),
-                                "PIC DC-DC enabled; chips powering up"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            hashboard = sel.config.index,
-                            addr = format_args!("0x{:02x}", pic_addr),
-                            error = %e,
-                            "PIC handshake failed (noPIC variant?); continuing"
-                        );
-                    }
-                },
+            match pic_handshake_and_enable_dc_dc(&sel.config.eeprom_i2c_device, pic_addr).await {
+                Ok(Some(version)) => info!(
+                    hashboard = sel.config.index,
+                    addr = format_args!("0x{:02x}", pic_addr),
+                    version = format_args!("0x{:02x}", version),
+                    "PIC handshake ok; DC-DC enabled, chips powering up"
+                ),
+                Ok(None) => {
+                    warn!(
+                        hashboard = sel.config.index,
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        "PIC-variant board: no PIC responded at its address; cannot enable DC-DC"
+                    );
+                    unstartable.push(sel.config.index);
+                }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         hashboard = sel.config.index,
                         addr = format_args!("0x{:02x}", pic_addr),
                         error = %e,
-                        "PIC i2c open failed (noPIC variant?); continuing"
+                        "PIC handshake / DC-DC enable failed; hashboard cannot be started"
                     );
+                    unstartable.push(sel.config.index);
                 }
+            }
+        }
+
+        // Startability policy. By default an unstartable hashboard is NOT
+        // silently ignored: fail loudly so the operator fixes it, instead of
+        // quietly mining at reduced capacity — and, crucially, without leaving
+        // a dead chain wired into the shared-rail ramp coordinator, which would
+        // wedge the whole cold-init. Set `skip_unstartable_hashboards = true`
+        // to drop the bad board(s) and bring the rest of the chassis up.
+        // (The resolved PSU envelope covers every present family, so it stays
+        // safe for the remaining boards after a skip.)
+        if !unstartable.is_empty() {
+            if config.startup.health_gate.skip_unstartable_hashboards {
+                warn!(
+                    board = %board_name,
+                    unstartable = ?unstartable,
+                    "Skipping hashboard(s) that could not be started; mining on the remaining \
+                     boards (skip_unstartable_hashboards = true)"
+                );
+                selected.retain(|s| !unstartable.contains(&s.config.index));
+                if selected.is_empty() {
+                    return Err(BoardError::InitializationFailed(
+                        "no present hashboards could be started".into(),
+                    ));
+                }
+            } else {
+                return Err(BoardError::InitializationFailed(format!(
+                    "hashboard(s) {unstartable:?} could not be started (PIC handshake / DC-DC \
+                     enable failed) — check the PIC / i2c wiring on those boards. To mine on the \
+                     remaining boards, set skip_unstartable_hashboards = true under \
+                     [hardware.amlogic_control_board]."
+                )));
             }
         }
 
