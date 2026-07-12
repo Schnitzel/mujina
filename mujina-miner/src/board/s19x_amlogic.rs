@@ -153,6 +153,14 @@ const PIC_RESUME_RETRY_DELAY_MS: u64 = 250;
 /// hand back a single noisy frame (observed on .222: `[0x56; 6]`) that must
 /// not be mistaken for a noPIC board.
 const PIC_HEARTBEAT_PROBE_ATTEMPTS: usize = 3;
+
+/// Per-op timeout for the APW12 i2c calls during board bring-up. The exchange
+/// runs on a raw, timeout-less `LinuxI2cDevice` ioctl (on `spawn_blocking`),
+/// so a dead/unpowered PSU makes the syscall block forever with no error — the
+/// board just stalls silently. Bounding each bring-up op turns that hang into
+/// a clear error. The blocked `spawn_blocking` thread leaks, but the caller
+/// (and the daemon) recover.
+const PSU_BRINGUP_OP_TIMEOUT: Duration = Duration::from_secs(5);
 const EEPROM_LEN: usize = 256;
 const TMP75_TEMP_REG: u8 = 0x00;
 
@@ -669,21 +677,62 @@ impl S19xAmlogic {
             psu_guard
                 .set_enabled(true)
                 .map_err(|e| BoardError::HardwareControl(format!("Failed to enable PSU: {e}")))?;
-            if let Err(e) = psu_guard.config_watchdog(0x00).await {
-                warn!(
-                    "PSU watchdog disable rejected (firmware variant?), continuing: {}",
-                    e
-                );
+
+            // Each APW12 op below is a raw, timeout-less i2c ioctl (on
+            // spawn_blocking). If the PSU is unpowered or the bus is
+            // disconnected the ioctl blocks forever with no error, so the
+            // board used to stall here SILENTLY (no log line, never inits).
+            // Bound each op so a dead PSU surfaces a clear error instead.
+            // `config_watchdog` is best-effort (some APW12 firmware NAKs it),
+            // so a returned error is only a warning — but a TIMEOUT means the
+            // PSU isn't answering at all, which is fatal to bring-up.
+            match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.config_watchdog(0x00)).await
+            {
+                Err(_elapsed) => {
+                    return Err(BoardError::HardwareControl(format!(
+                        "APW12 did not respond on i2c-1 within {PSU_BRINGUP_OP_TIMEOUT:?} during \
+                         bring-up (config_watchdog) — the PSU is likely unpowered or its i2c bus \
+                         is disconnected; check the APW12 power and i2c connections"
+                    )));
+                }
+                Ok(Err(e)) => {
+                    warn!("PSU watchdog disable rejected (firmware variant?), continuing: {e}");
+                }
+                Ok(Ok(())) => {}
             }
-            psu_guard
-                .set_voltage(config.startup.initial_voltage)
-                .await
-                .map_err(|e| {
-                    BoardError::HardwareControl(format!("Failed to set PSU voltage: {e}"))
-                })?;
+
+            match tokio::time::timeout(
+                PSU_BRINGUP_OP_TIMEOUT,
+                psu_guard.set_voltage(config.startup.initial_voltage),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    return Err(BoardError::HardwareControl(format!(
+                        "APW12 did not respond on i2c-1 within {PSU_BRINGUP_OP_TIMEOUT:?} during \
+                         bring-up (set_voltage) — the PSU is likely unpowered or its i2c bus is \
+                         disconnected; check the APW12 power and i2c connections"
+                    )));
+                }
+                Ok(Err(e)) => {
+                    return Err(BoardError::HardwareControl(format!(
+                        "Failed to set PSU voltage: {e}"
+                    )));
+                }
+                Ok(Ok(())) => {}
+            }
 
             tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
-            psu_guard.measure_voltage().await.ok()
+            match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.measure_voltage()).await {
+                Err(_elapsed) => {
+                    warn!(
+                        "APW12 measure_voltage timed out after {PSU_BRINGUP_OP_TIMEOUT:?} \
+                         (i2c-1 unresponsive); continuing without a measured voltage"
+                    );
+                    None
+                }
+                Ok(result) => result.ok(),
+            }
         };
 
         // PIC handshake — best-effort per present hashboard. On
