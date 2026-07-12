@@ -346,6 +346,16 @@ impl HashboardModel {
             HashboardModel::S19kPro => "BM1366",
         }
     }
+
+    /// Whether this board family carries an on-hashboard PIC microcontroller
+    /// gating the per-domain DC-DCs. PIC variants (S19j Pro — BHB42601 /
+    /// BHB42611) must be handshaked and heartbeated; noPIC variants (S19k Pro
+    /// — BHB56902) bring their DC-DCs up directly. Used so a PIC-variant board
+    /// is never mistaken for a noPIC one just because its PIC returned a noisy
+    /// i2c frame on a single probe.
+    pub fn expects_pic(self) -> bool {
+        matches!(self, HashboardModel::S19jPro)
+    }
 }
 
 /// API server configuration.

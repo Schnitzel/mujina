@@ -146,6 +146,13 @@ const PSU_MAX_RESPONSE_ATTEMPTS: usize = 3;
 /// substitute for the chain's own health checks.
 const PIC_RESUME_HANDSHAKE_ATTEMPTS: usize = 3;
 const PIC_RESUME_RETRY_DELAY_MS: u64 = 250;
+
+/// How many times the telemetry task probes a hashboard's PIC heartbeat at
+/// startup before giving up. `PicChain::open` only opens the i2c bus (no
+/// device probe), so the heartbeat IS the presence test — and the bus can
+/// hand back a single noisy frame (observed on .222: `[0x56; 6]`) that must
+/// not be mistaken for a noPIC board.
+const PIC_HEARTBEAT_PROBE_ATTEMPTS: usize = 3;
 const EEPROM_LEN: usize = 256;
 const TMP75_TEMP_REG: u8 = 0x00;
 
@@ -1864,6 +1871,84 @@ const THERMAL_THROTTLE_RELEASE_C: f32 = 54.0;
 const THERMAL_STEP_DOWN_MHZ: u32 = 25;
 const THERMAL_STEP_UP_MHZ: u32 = 6;
 
+/// Probe one hashboard's PIC for the heartbeat path and return the handle to
+/// keep (or `None` for a genuine noPIC board). Logs its own outcome.
+///
+/// `PicChain::open` only opens the i2c bus — it does NOT probe the device — so
+/// the heartbeat is the real presence test. That means a single noisy read
+/// (observed on .222: `[0x56; 6]`, i.e. `resp[1] != 0x16`) must not be taken
+/// as "no PIC": retry first. A genuine noPIC board (BHB56902) fails every
+/// attempt; a present PIC that glitched once recovers on a retry. If every
+/// attempt fails but the board is a known PIC variant, KEEP the handle anyway
+/// — dropping it leaves the PIC's DC-DC watchdog unfed and the chips fall off
+/// the chain a few seconds later (exactly the failure this guards against).
+///
+/// MUST run via `spawn_blocking` — `PicChain` uses the same raw, timeout-less
+/// `LinuxI2cDevice` ioctl path as [`exchange_blocking`].
+fn probe_pic_for_heartbeat_blocking(
+    pic_i2c_device: &Path,
+    pic_addr: u16,
+    hb_index: u8,
+    expects_pic: bool,
+) -> Option<PicChain> {
+    let mut pic = match PicChain::open(pic_i2c_device, pic_addr) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                hashboard = hb_index,
+                addr = format_args!("0x{:02x}", pic_addr),
+                error = %e,
+                "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
+            );
+            return None;
+        }
+    };
+
+    let mut last_err: Option<amlogic_cb_tools::pic::PicError> = None;
+    for attempt in 0..PIC_HEARTBEAT_PROBE_ATTEMPTS {
+        match pic.heartbeat() {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!(
+                        hashboard = hb_index,
+                        addr = format_args!("0x{:02x}", pic_addr),
+                        attempt = attempt + 1,
+                        "PIC heartbeat probe recovered after a retry (initial read was noise)"
+                    );
+                }
+                return Some(pic);
+            }
+            Err(e) => last_err = Some(e),
+        }
+        if attempt + 1 < PIC_HEARTBEAT_PROBE_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(PIC_RESUME_RETRY_DELAY_MS));
+        }
+    }
+
+    let err = last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "no response".into());
+    if expects_pic {
+        warn!(
+            hashboard = hb_index,
+            addr = format_args!("0x{:02x}", pic_addr),
+            error = %err,
+            attempts = PIC_HEARTBEAT_PROBE_ATTEMPTS,
+            "PIC-variant board did not answer the heartbeat probe; keeping the handle \
+             and retrying each tick so the DC-DC watchdog stays fed"
+        );
+        Some(pic)
+    } else {
+        info!(
+            hashboard = hb_index,
+            addr = format_args!("0x{:02x}", pic_addr),
+            error = %err,
+            "PIC absent (noPIC variant); skipping heartbeat path"
+        );
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
@@ -1881,39 +1966,33 @@ async fn native_telemetry_task(
     // One PIC handle per present hashboard for the heartbeat path.
     // LuxOS sends a PIC heartbeat (opcode 0x16) roughly every 1.5 s on
     // PIC variants; without heartbeats the PIC disables DC-DC after a
-    // watchdog timeout (chips drop mid-ramp). Probe each slot once at
-    // task start; noPIC variants (BHB56902) silently disable the
-    // heartbeat for that slot to avoid spamming warnings.
+    // watchdog timeout (chips drop mid-ramp). Probe each slot once at task
+    // start on the blocking pool (raw i2c). `probe_pic_for_heartbeat_blocking`
+    // retries so a single noisy i2c frame can't misclassify a PIC-variant
+    // board as "noPIC", and only genuine noPIC variants (BHB56902) end up with
+    // the heartbeat disabled.
+    let probe_hbs = hashboards.clone();
     let mut pics: Vec<(u16, AmlogicHashboardConfig, Option<PicChain>)> =
-        Vec::with_capacity(hashboards.len());
-    for hb in &hashboards {
-        let pic_addr = pic_address_for_slot(hb.index);
-        let pic = match PicChain::open(&hb.eeprom_i2c_device, pic_addr) {
-            Ok(mut p) => match p.heartbeat() {
-                Ok(()) => Some(p),
-                Err(e) => {
-                    info!(
-                        hashboard = hb.index,
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        error = %e,
-                        "PIC absent on this hashboard (likely a noPIC variant); \
-                         skipping heartbeat path"
+        tokio::task::spawn_blocking(move || {
+            probe_hbs
+                .iter()
+                .map(|hb| {
+                    let pic_addr = pic_address_for_slot(hb.index);
+                    let pic = probe_pic_for_heartbeat_blocking(
+                        &hb.eeprom_i2c_device,
+                        pic_addr,
+                        hb.index,
+                        hb.model.expects_pic(),
                     );
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(
-                    hashboard = hb.index,
-                    addr = format_args!("0x{:02x}", pic_addr),
-                    error = %e,
-                    "could not open PIC for heartbeat task; chips may drop after watchdog timeout"
-                );
-                None
-            }
-        };
-        pics.push((pic_addr, hb.clone(), pic));
-    }
+                    (pic_addr, hb.clone(), pic)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, "PIC heartbeat probe task panicked");
+            Vec::new()
+        });
 
     // Tracks the last duty applied to the fans by the dynamic curve so we
     // only call configure_fans on actual changes. None means "never set
