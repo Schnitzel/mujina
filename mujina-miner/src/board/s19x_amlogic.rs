@@ -1070,10 +1070,24 @@ impl Board for S19xAmlogic {
         // would have them race on `state_tx.send_modify` and clobber
         // each other's temperatures.
         let cfg_clone = self.config.clone();
+        // Carry the EEPROM-DETECTED chip family into the telemetry task, not
+        // the configured one. The task decides whether to run the PIC
+        // heartbeat from `hb.model.expects_pic()`; on a mixed chassis a slot
+        // configured `s19j_pro` may actually hold a noPIC S19k board
+        // (`SelectedHashboard.model` already reflects the detected family and
+        // drives the chain, voltage, and thermal everywhere else). Without
+        // this override the heartbeat path keeps poking an absent PIC on every
+        // detected-S19k slot and spams "PIC heartbeat failed / os error 6"
+        // each tick. Overriding `model` with the detected family makes the
+        // heartbeat decision consistent with the rest of the board.
         let hbs_clone: Vec<AmlogicHashboardConfig> = self
             .selected_hashboards
             .iter()
-            .map(|s| s.config.clone())
+            .map(|s| {
+                let mut cfg = s.config.clone();
+                cfg.model = s.model;
+                cfg
+            })
             .collect();
         let psu = Arc::clone(&self.psu);
         let state_tx = self.state_tx.clone();
