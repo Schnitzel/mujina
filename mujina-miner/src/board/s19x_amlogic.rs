@@ -582,6 +582,11 @@ struct SelectedHashboard {
 pub struct S19xAmlogic {
     config: AmlogicControlBoardConfig,
     selected_hashboards: Vec<SelectedHashboard>,
+    /// False when the APW12 never answered on i2c during bring-up (almost
+    /// always: its AC feed is cut). The board still runs fans/telemetry, but
+    /// the chains are skipped — the chips have no rail. Nothing polls for the
+    /// PSU coming back; mining requires a restart, by design.
+    psu_present: bool,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
@@ -593,11 +598,13 @@ impl S19xAmlogic {
         config: AmlogicControlBoardConfig,
         selected_hashboards: Vec<SelectedHashboard>,
         psu: Arc<Mutex<NativeAmlogicPsu>>,
+        psu_present: bool,
         state_tx: watch::Sender<BoardState>,
     ) -> Self {
         Self {
             config,
             selected_hashboards,
+            psu_present,
             psu,
             state_tx,
             thread_states: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -608,7 +615,7 @@ impl S19xAmlogic {
     async fn initialize(
         config: &AmlogicControlBoardConfig,
         state_tx: &watch::Sender<BoardState>,
-    ) -> Result<(Vec<SelectedHashboard>, Arc<Mutex<NativeAmlogicPsu>>), BoardError> {
+    ) -> Result<(Vec<SelectedHashboard>, Arc<Mutex<NativeAmlogicPsu>>, bool), BoardError> {
         let board_name = device_id(config);
         // Configured/expected model — used only for the pre-detection log
         // banner and as a per-slot fallback if EEPROM detection is
@@ -669,9 +676,48 @@ impl S19xAmlogic {
         );
 
         configure_fans(config, config.startup.default_fan_percent)?;
-        assert_all_resets(config)?;
 
         let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config, effective_voltage)));
+
+        // Force a genuine power-on-reset of the chips before touching them.
+        //
+        // `set_enabled` is a pure GPIO write on the active-low enable line — no
+        // i2c — so this works even when the APW12 is unpowered or its bus is
+        // dead. That matters: mujina is SIGKILLed on stop (see the init
+        // script), which leaves the enable line ASSERTED. So on a restart the
+        // rail is still up and the chips are still clocked from the previous
+        // run, and `assert_all_resets()` alone does not recover them — the
+        // chips have to come up *into* reset from an unpowered rail, which is
+        // exactly the sequence the resume path already relies on. Cutting AC
+        // upstream (a Shelly relay) doesn't help either: restoring it just
+        // brings the rail back with the enable line still asserted, so the
+        // chips free-run before mujina ever asserts reset.
+        //
+        // Dropping the rail unconditionally makes cold-init idempotent whatever
+        // state we inherited (fresh boot, restart into hot clocked chips, or a
+        // half-configured chain).
+        {
+            let mut psu_guard = psu.lock().await;
+            psu_guard.set_enabled(false).map_err(|e| {
+                BoardError::HardwareControl(format!(
+                    "Failed to disable PSU for the cold-init reset cycle: {e}"
+                ))
+            })?;
+        }
+        info!(
+            board = %board_name,
+            off_ms = config.startup.psu_off_settle_ms,
+            "Dropping the PSU rail to force a chip power-on-reset"
+        );
+        tokio::time::sleep(Duration::from_millis(config.startup.psu_off_settle_ms)).await;
+
+        // Hold every chain in reset BEFORE the rail comes back, so the chips
+        // power up already held in reset instead of free-running.
+        assert_all_resets(config)?;
+
+        // Whether the APW12 answered on i2c. When it didn't, the board still
+        // comes up — see the comment on the timeout arms below.
+        let mut psu_present = true;
         let measured_voltage = {
             let mut psu_guard = psu.lock().await;
             psu_guard
@@ -682,18 +728,32 @@ impl S19xAmlogic {
             // spawn_blocking). If the PSU is unpowered or the bus is
             // disconnected the ioctl blocks forever with no error, so the
             // board used to stall here SILENTLY (no log line, never inits).
-            // Bound each op so a dead PSU surfaces a clear error instead.
+            // Bound each op so a dead PSU surfaces a clear message instead.
+            //
+            // A TIMEOUT means the APW12 isn't answering at all — usually its AC
+            // feed is simply cut (a Shelly relay), not a fault. That must NOT
+            // fail the whole board: the APW12 only powers the ASICs, while the
+            // EEPROMs, temperature sensors and fans all run off the
+            // control-board rail and are already up (enumeration happened
+            // above). So carry on in telemetry-only mode — fans and temps keep
+            // working and only the chains are skipped. Mining then requires a
+            // restart once the PSU is back, which is deliberate: nothing here
+            // polls for its return.
+            //
             // `config_watchdog` is best-effort (some APW12 firmware NAKs it),
-            // so a returned error is only a warning — but a TIMEOUT means the
-            // PSU isn't answering at all, which is fatal to bring-up.
+            // so a returned error is only a warning.
             match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.config_watchdog(0x00)).await
             {
                 Err(_elapsed) => {
-                    return Err(BoardError::HardwareControl(format!(
-                        "APW12 did not respond on i2c-1 within {PSU_BRINGUP_OP_TIMEOUT:?} during \
-                         bring-up (config_watchdog) — the PSU is likely unpowered or its i2c bus \
-                         is disconnected; check the APW12 power and i2c connections"
-                    )));
+                    warn!(
+                        board = %board_name,
+                        timeout = ?PSU_BRINGUP_OP_TIMEOUT,
+                        "APW12 did not respond on i2c-1 during bring-up (config_watchdog) — the \
+                         PSU is unpowered or its i2c bus is disconnected. Coming up WITHOUT the \
+                         chains: fans, temperatures and EEPROM still work. Restore PSU power and \
+                         restart mujina to mine."
+                    );
+                    psu_present = false;
                 }
                 Ok(Err(e)) => {
                     warn!("PSU watchdog disable rejected (firmware variant?), continuing: {e}");
@@ -701,37 +761,50 @@ impl S19xAmlogic {
                 Ok(Ok(())) => {}
             }
 
-            match tokio::time::timeout(
-                PSU_BRINGUP_OP_TIMEOUT,
-                psu_guard.set_voltage(config.startup.initial_voltage),
-            )
-            .await
-            {
-                Err(_elapsed) => {
-                    return Err(BoardError::HardwareControl(format!(
-                        "APW12 did not respond on i2c-1 within {PSU_BRINGUP_OP_TIMEOUT:?} during \
-                         bring-up (set_voltage) — the PSU is likely unpowered or its i2c bus is \
-                         disconnected; check the APW12 power and i2c connections"
-                    )));
+            if psu_present {
+                match tokio::time::timeout(
+                    PSU_BRINGUP_OP_TIMEOUT,
+                    psu_guard.set_voltage(config.startup.initial_voltage),
+                )
+                .await
+                {
+                    Err(_elapsed) => {
+                        warn!(
+                            board = %board_name,
+                            timeout = ?PSU_BRINGUP_OP_TIMEOUT,
+                            "APW12 did not respond on i2c-1 during bring-up (set_voltage) — \
+                             coming up WITHOUT the chains; restore PSU power and restart to mine."
+                        );
+                        psu_present = false;
+                    }
+                    Ok(Err(e)) => {
+                        // The PSU *is* answering but rejected the voltage —
+                        // a real fault, not a missing rail. Keep that fatal.
+                        return Err(BoardError::HardwareControl(format!(
+                            "Failed to set PSU voltage: {e}"
+                        )));
+                    }
+                    Ok(Ok(())) => {}
                 }
-                Ok(Err(e)) => {
-                    return Err(BoardError::HardwareControl(format!(
-                        "Failed to set PSU voltage: {e}"
-                    )));
-                }
-                Ok(Ok(())) => {}
             }
 
-            tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
-            match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.measure_voltage()).await {
-                Err(_elapsed) => {
-                    warn!(
-                        "APW12 measure_voltage timed out after {PSU_BRINGUP_OP_TIMEOUT:?} \
-                         (i2c-1 unresponsive); continuing without a measured voltage"
-                    );
-                    None
+            if psu_present {
+                tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
+                match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.measure_voltage()).await
+                {
+                    Err(_elapsed) => {
+                        warn!(
+                            "APW12 measure_voltage timed out after {PSU_BRINGUP_OP_TIMEOUT:?} \
+                             (i2c-1 unresponsive); continuing without a measured voltage"
+                        );
+                        None
+                    }
+                    Ok(result) => result.ok(),
                 }
-                Ok(result) => result.ok(),
+            } else {
+                // Leave the enable line asserted but the rail is dead anyway;
+                // nothing to measure.
+                None
             }
         };
 
@@ -754,8 +827,15 @@ impl S19xAmlogic {
         // the on-hashboard PIC: if it won't handshake / enable (after retries)
         // the chips can never power, so the board cannot start. noPIC variants
         // (S19k Pro) bring their DC-DC up directly — no PIC gate.
+        // Skipped entirely without a rail: the PIC's LDO is fed from the same
+        // 12 V the APW12 supplies, so with the PSU down every handshake would
+        // fail and mark every PIC-variant board "unstartable" — turning a
+        // simply-unpowered chassis into a hard init failure.
         let mut unstartable: Vec<u8> = Vec::new();
         for sel in &selected {
+            if !psu_present {
+                break;
+            }
             if !sel.model.expects_pic() {
                 continue; // noPIC board — DC-DC comes up directly.
             }
@@ -851,7 +931,17 @@ impl S19xAmlogic {
             state.target_voltage_v = Some(effective_voltage.target_voltage);
         });
 
-        Ok((selected, psu))
+        if !psu_present {
+            warn!(
+                board = %board_name,
+                hashboards = selected.len(),
+                "Board is up in TELEMETRY-ONLY mode (no PSU on i2c): fans, temperatures and \
+                 EEPROM are live, but no chains were started and the miner will not hash. \
+                 Restore PSU power and restart mujina to mine."
+            );
+        }
+
+        Ok((selected, psu, psu_present))
     }
 }
 
@@ -933,7 +1023,25 @@ impl Board for S19xAmlogic {
         let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
             Vec::with_capacity(n_chains);
 
-        for selected in self.selected_hashboards.clone() {
+        // With no rail the chips are unpowered, so opening their UARTs and
+        // running enumerate/ramp would only fail or hang. Skip chain creation
+        // and come up telemetry-only: the task spawned at the end of this
+        // function still drives the fans and reads temperatures, which is the
+        // entire point of staying up without a PSU. Leaves `thermal_caps`
+        // empty, which the telemetry task handles (nothing to throttle).
+        let chains_to_start: Vec<SelectedHashboard> = if self.psu_present {
+            self.selected_hashboards.clone()
+        } else {
+            warn!(
+                board = %device_id(&self.config),
+                hashboards = self.selected_hashboards.len(),
+                "No PSU on i2c — skipping chain creation; running fans/telemetry only. \
+                 Restore PSU power and restart mujina to mine."
+            );
+            Vec::new()
+        };
+
+        for selected in chains_to_start {
             let hb = &selected.config;
             // Per-hashboard chip-family spec from the DETECTED model (the
             // config's per-slot `model` is only a fallback). This drives the
@@ -1090,6 +1198,7 @@ impl Board for S19xAmlogic {
             })
             .collect();
         let psu = Arc::clone(&self.psu);
+        let psu_present = self.psu_present;
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
@@ -1098,6 +1207,7 @@ impl Board for S19xAmlogic {
                 cfg_clone,
                 hbs_clone,
                 psu,
+                psu_present,
                 state_tx,
                 thread_states,
                 thermal_caps,
@@ -2041,6 +2151,9 @@ async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
     hashboards: Vec<AmlogicHashboardConfig>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
+    // False when the APW12 never answered at bring-up. The chips then have no
+    // rail, so there is nothing to measure and nothing generating heat.
+    psu_present: bool,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     // Per-chain frequency caps as `(cap, per-chain max)`. Each is stepped off
@@ -2333,11 +2446,18 @@ async fn native_telemetry_task(
             }
         }
 
-        let target_fan_percent: u8 = if temp_stale {
+        let target_fan_percent: u8 = if temp_stale && psu_present {
             warn!(
                 "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
             );
             100
+        } else if temp_stale {
+            // Same missing-sensor case, but with no rail the chips are
+            // unpowered and generating nothing to cool — the sensors are simply
+            // dead along with the PSU. Screaming at 100 % here is pure noise
+            // (it is exactly what a powered-off miner used to do), so sit at the
+            // idle floor instead.
+            idle_floor_percent
         } else if let Some(t) = board_hottest {
             if t <= fan_ramp_start_c {
                 fan_floor_percent
@@ -2376,12 +2496,41 @@ async fn native_telemetry_task(
         }
 
         let fans = read_fan_states(&config, target_fan_percent).await;
-        let voltage_v = match psu.lock().await.measure_voltage().await {
-            Ok(voltage_v) => Some(voltage_v),
-            Err(error) => {
-                debug!(error = %error, "Native telemetry PSU voltage read failed");
-                None
+        // Read the rail voltage — but NEVER hold the `psu` mutex across an
+        // unbounded i2c op.
+        //
+        // `measure_voltage` is a raw, timeout-less ioctl: on a dead or wedged
+        // APW12 it blocks forever. Holding the lock across it wedged this task
+        // *inside* the mutex, which deadlocked everything else that needs the
+        // rail — `set_paused` (pause hung forever on `psu.lock()`), resume, and
+        // most seriously the over-temp cutoff above, which simply stopped
+        // running because this loop never came back around. Bounding it means a
+        // dead PSU costs one skipped reading instead of a stuck miner. Skipped
+        // entirely when the PSU never answered at bring-up — there's nothing to
+        // measure and no reason to burn the timeout every tick.
+        let voltage_v = if psu_present {
+            match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, async {
+                psu.lock().await.measure_voltage().await
+            })
+            .await
+            {
+                Ok(Ok(voltage_v)) => Some(voltage_v),
+                Ok(Err(error)) => {
+                    debug!(error = %error, "Native telemetry PSU voltage read failed");
+                    None
+                }
+                Err(_elapsed) => {
+                    warn!(
+                        timeout = ?PSU_BRINGUP_OP_TIMEOUT,
+                        "APW12 voltage read timed out (i2c-1 unresponsive); skipping this sample. \
+                         The PSU rail may be wedged — pause/resume and the over-temp cutoff stay \
+                         responsive regardless."
+                    );
+                    None
+                }
             }
+        } else {
+            None
         };
         let powers = vec![PowerMeasurement {
             name: "apw12".into(),
@@ -2637,11 +2786,11 @@ async fn create_amlogic_board()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let (selected_hashboards, psu) = S19xAmlogic::initialize(&config, &state_tx)
+    let (selected_hashboards, psu, psu_present) = S19xAmlogic::initialize(&config, &state_tx)
         .await
         .map_err(|e| Error::Hardware(format!("Failed to initialize native Amlogic board: {e}")))?;
 
-    let board = S19xAmlogic::new(config, selected_hashboards, psu, state_tx);
+    let board = S19xAmlogic::new(config, selected_hashboards, psu, psu_present, state_tx);
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
 }

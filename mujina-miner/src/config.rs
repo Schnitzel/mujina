@@ -250,6 +250,20 @@ pub struct AmlogicStartupConfig {
     /// Delay after enabling the PSU before dependent operations begin.
     pub psu_settle_ms: u64,
 
+    /// How long to hold the PSU rail OFF at the start of cold-init, before
+    /// asserting reset and bringing it back up.
+    ///
+    /// mujina is SIGKILLed on stop, which leaves the PSU enable line asserted —
+    /// so on a restart the rail is still up and the chips are still clocked from
+    /// the previous run. Asserting RST_N alone does not recover that; the chips
+    /// have to come up *into* reset from an unpowered rail. Dropping the rail
+    /// here makes cold-init idempotent whatever state was inherited.
+    ///
+    /// Must be long enough for the rail to discharge below the chips'
+    /// power-on-reset threshold. Defaults to 2000 ms.
+    #[serde(default = "default_psu_off_settle_ms")]
+    pub psu_off_settle_ms: u64,
+
     /// Time to hold hashboard reset active during initialization.
     pub reset_assert_ms: u64,
 
@@ -266,6 +280,10 @@ fn default_fan_floor_percent() -> u8 {
 
 fn default_fan_floor_mining_percent() -> u8 {
     30
+}
+
+fn default_psu_off_settle_ms() -> u64 {
+    2000
 }
 
 fn default_fan_ramp_start_c() -> f32 {
