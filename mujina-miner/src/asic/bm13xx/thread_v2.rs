@@ -489,12 +489,25 @@ enum ThreadCommand {
 }
 
 /// Chip power/initialization state.
+#[derive(PartialEq)]
 enum ChipState {
     /// Chips disabled (low power). Initial state and after go_idle.
     Disabled,
     /// Chips enabled and fully configured, ready to hash.
     Initialized,
+    /// Cold-init failed (or hung and was timed out). The chain is dropped:
+    /// future work assignments return immediately without re-initializing, so
+    /// one bad hashboard can't wedge this actor's run loop (and thereby the
+    /// scheduler, which awaits this thread's next command ACK). The other
+    /// chains keep mining.
+    Unstartable,
 }
+
+/// Upper bound on a single cold-init attempt. Legit init (enumeration +
+/// multi-pass verify + full frequency ramp) is well under a minute; past this
+/// the chain is treated as unstartable rather than blocking the run loop
+/// forever (e.g. a jammed chip UART TX with no lower-level timeout).
+const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Ring buffer mapping chip job IDs to tasks.
 ///
@@ -924,9 +937,36 @@ impl BM13xxActor {
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
-        // Initialize chips if not already running
+        // A chain that already failed cold-init is dropped — never re-init it
+        // (that re-hang would wedge the run loop again). Stay responsive so the
+        // scheduler's next command ACK returns and the healthy chains keep
+        // getting work.
+        if self.chip_state == ChipState::Unstartable {
+            return Ok(None);
+        }
+
+        // Initialize chips if not already running. Bound the attempt: a hung
+        // init (e.g. a jammed chip UART TX with no lower-level timeout) must not
+        // block this actor's run loop forever, or the scheduler deadlocks
+        // waiting to ACK the next UpdateTask.
         if matches!(self.chip_state, ChipState::Disabled) {
-            self.initialize_chips().await?;
+            match tokio::time::timeout(INIT_TIMEOUT, self.initialize_chips()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.chip_state = ChipState::Unstartable;
+                    error!(error = %e, "Cold-init failed — marking chain unstartable");
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.chip_state = ChipState::Unstartable;
+                    let msg = format!(
+                        "cold-init exceeded {}s — marking chain unstartable",
+                        INIT_TIMEOUT.as_secs()
+                    );
+                    error!("{msg}");
+                    return Err(HashThreadError::InitializationFailed(msg));
+                }
+            }
         }
 
         // Send job to chips
@@ -1506,6 +1546,14 @@ impl BM13xxActor {
     /// safe runtime range, record it as the *requested* frequency, and apply
     /// the effective frequency (which the thermal cap may hold lower).
     async fn handle_set_frequency(&mut self, target_mhz: f32) -> Result<(), HashThreadError> {
+        // A permanently-unstartable chain silently ignores dial commands — it
+        // will never hash, so a frequency change is a no-op. Erroring here would
+        // fail the whole cluster's `PATCH /api/v0/miner` (a controller like Nova
+        // dials every chain at once), so one dead hashboard would block dialing
+        // the healthy ones.
+        if self.chip_state == ChipState::Unstartable {
+            return Ok(());
+        }
         if !matches!(self.chip_state, ChipState::Initialized) {
             return Err(HashThreadError::InitializationFailed(
                 "set_frequency: chips not initialized".into(),
@@ -2001,30 +2049,47 @@ impl BM13xxActor {
                     self.estimated_hashrate = self.hashrate_estimator.hashrate();
                     let hashrate_1min = self.hashrate_estimator_1min.hashrate();
 
-                    // Send via task's dedicated channel
-                    if task.share_tx.send(share).await.is_err() {
-                        // Channel closed = task replaced, share is stale
-                        debug!("Share channel closed (task replaced)");
-                    } else {
-                        let status = self.update_status(|status| {
-                            status.chip_shares_found += 1;
-                            status.is_active = true;
-                            status.hashrate = self.estimated_hashrate;
-                            status.hashrate_1min = hashrate_1min;
-                        });
-                        let _ = self
-                            .evt_tx
-                            .clone()
-                            .send(HashThreadEvent::StatusUpdate(status))
-                            .await;
+                    // Send via task's dedicated channel with try_send — NEVER a
+                    // blocking `.send().await`. The scheduler awaits this
+                    // thread's `update_task` on every pool job; if we blocked
+                    // here on a full share channel while the scheduler is
+                    // mid-assign, the two deadlock (scheduler waits on us, we
+                    // wait on the scheduler to drain shares). A post-ramp share
+                    // burst on a slow UART fills the 32-deep channel in well
+                    // under one job interval, so this is reachable in practice
+                    // (observed on the BCB100: mining froze at exactly
+                    // 32 shares/chain). Shares are best-effort proof-of-work to
+                    // the pool; dropping one while the consumer is momentarily
+                    // behind is correct and keeps the hash thread live.
+                    match task.share_tx.try_send(share) {
+                        Ok(()) => {
+                            let status = self.update_status(|status| {
+                                status.chip_shares_found += 1;
+                                status.is_active = true;
+                                status.hashrate = self.estimated_hashrate;
+                                status.hashrate_1min = hashrate_1min;
+                            });
+                            let _ = self
+                                .evt_tx
+                                .clone()
+                                .send(HashThreadEvent::StatusUpdate(status))
+                                .await;
 
-                        debug!(
-                            job_id,
-                            nonce = format!("{:#x}", nonce),
-                            hash = %hash,
-                            hash_diff = %Difficulty::from_hash(&hash),
-                            "Share found and sent"
-                        );
+                            debug!(
+                                job_id,
+                                nonce = format!("{:#x}", nonce),
+                                hash = %hash,
+                                hash_diff = %Difficulty::from_hash(&hash),
+                                "Share found and sent"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            debug!("Share channel full — dropping share (scheduler behind)");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // Channel closed = task replaced, share is stale
+                            debug!("Share channel closed (task replaced)");
+                        }
                     }
                 } else {
                     // Debug: Show ALL header values for mismatch investigation
