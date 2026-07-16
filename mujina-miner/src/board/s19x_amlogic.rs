@@ -2204,7 +2204,13 @@ async fn native_telemetry_task(
         // Configurable floor (toml `startup.fan_floor_percent`, default 30),
         // clamped above the fan's stall point. Governs noise at low power/paused;
         // the curve still ramps to 100 % as the board heats.
-        let fan_floor_percent: u8 = config.startup.fan_floor_percent.clamp(20, 100);
+        //
+        // The lower bound is 10: the S19j/S19k chassis fans were measured still
+        // spinning (~3100 RPM) at 20 % on a cool board, so the previous bound of
+        // 20 was well above the actual stall point. 10 is kept as a floor because
+        // a duty low enough to stall the fans reads as "fans configured" while
+        // moving no air, which the tach-less code path cannot detect.
+        let fan_floor_percent: u8 = config.startup.fan_floor_percent.clamp(10, 100);
         const FAN_RAMP_START_C: f32 = 40.0;
         const FAN_RAMP_FULL_C: f32 = 60.0;
         const TEMP_STALE_AFTER: Duration = Duration::from_secs(30);

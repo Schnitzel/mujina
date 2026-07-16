@@ -197,8 +197,10 @@ pub struct AmlogicStartupConfig {
     /// Minimum fan duty (%) the temperature curve floors at when the board is
     /// cool (below the ramp-start temperature) — i.e. when mining at low power
     /// or paused. Lower is quieter; the board layer clamps it to a safe range
-    /// above the fan's stall point. Defaults to 30 (the curve still ramps to
-    /// 100 % as the board heats, with a hard over-temp cutoff, regardless).
+    /// above the fan's stall point (currently >= 10). Defaults to 30 (the curve
+    /// still ramps to 100 % as the board heats, with a hard over-temp cutoff,
+    /// regardless). Verify your chassis fans still turn at the duty you pick —
+    /// below their stall point they stop entirely while still reading as "set".
     #[serde(default = "default_fan_floor_percent")]
     pub fan_floor_percent: u8,
 
