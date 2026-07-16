@@ -204,6 +204,42 @@ pub struct AmlogicStartupConfig {
     #[serde(default = "default_fan_floor_percent")]
     pub fan_floor_percent: u8,
 
+    /// Minimum fan duty (%) used in place of [`Self::fan_floor_percent`] while
+    /// any chain is actively mining.
+    ///
+    /// The fan curve keys off BOARD temperature, which lags the die by tens of
+    /// seconds during a frequency ramp — so a floor chosen to keep an idle
+    /// board quiet leaves the chips underserved exactly while they heat
+    /// fastest. This floor applies from the moment the first job is dispatched
+    /// (so it covers the whole ramp) until mining stops, letting you run a
+    /// quiet idle floor without starving the ramp of airflow.
+    ///
+    /// Never drops below `fan_floor_percent`. Defaults to 30, matching the idle
+    /// default — i.e. no behaviour change unless you lower one of them.
+    #[serde(default = "default_fan_floor_mining_percent")]
+    pub fan_floor_mining_percent: u8,
+
+    /// Board temperature (°C) at which the fan curve starts rising above the
+    /// floor. Below this the fans sit at the floor; from here they ramp
+    /// linearly to 100 % at [`Self::fan_ramp_full_c`].
+    ///
+    /// Note this is the BOARD sensor (TMP75/PIC), which lags the chip die by
+    /// tens of seconds — so the die is already meaningfully hotter than this
+    /// number. Lower it to start cooling earlier. Defaults to 40.
+    #[serde(default = "default_fan_ramp_start_c")]
+    pub fan_ramp_start_c: f32,
+
+    /// Board temperature (°C) at which the fan curve reaches 100 %. Defaults to
+    /// 60.
+    ///
+    /// Held to at least `fan_ramp_start_c + 1` so the ramp always has a span,
+    /// and capped at the hard over-temp cutoff (65) — the fans must be at 100 %
+    /// *before* the gate cuts the PSU, otherwise the board shuts itself down
+    /// with cooling still in reserve. Raise this to stay quieter at cruise: it
+    /// stretches the ramp, so any given temperature maps to a lower duty.
+    #[serde(default = "default_fan_ramp_full_c")]
+    pub fan_ramp_full_c: f32,
+
     /// Initial PSU output voltage used for first BM1362 enumeration.
     ///
     /// This should be a low bring-up voltage. The BM13xx thread ramps the PSU
@@ -226,6 +262,18 @@ pub struct AmlogicStartupConfig {
 
 fn default_fan_floor_percent() -> u8 {
     30
+}
+
+fn default_fan_floor_mining_percent() -> u8 {
+    30
+}
+
+fn default_fan_ramp_start_c() -> f32 {
+    40.0
+}
+
+fn default_fan_ramp_full_c() -> f32 {
+    60.0
 }
 
 /// Pre-mining validation policy.

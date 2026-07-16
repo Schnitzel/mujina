@@ -2210,9 +2210,48 @@ async fn native_telemetry_task(
         // 20 was well above the actual stall point. 10 is kept as a floor because
         // a duty low enough to stall the fans reads as "fans configured" while
         // moving no air, which the tach-less code path cannot detect.
-        let fan_floor_percent: u8 = config.startup.fan_floor_percent.clamp(10, 100);
-        const FAN_RAMP_START_C: f32 = 40.0;
-        const FAN_RAMP_FULL_C: f32 = 60.0;
+        let idle_floor_percent: u8 = config.startup.fan_floor_percent.clamp(10, 100);
+        // While mining, floor at `fan_floor_mining_percent` instead. The curve
+        // below keys off BOARD temperature, which lags the die by tens of
+        // seconds during a frequency ramp: a floor picked to keep an idle board
+        // quiet leaves the chips underserved exactly while they heat fastest
+        // (observed on .187 — chips ran hot through the ramp at a 10 % floor).
+        // The chains publish `is_active` as soon as the first job is dispatched,
+        // which is *before* the ramp completes, so this covers the whole ramp.
+        // Clamped to >= the idle floor so a lower mining value can never reduce
+        // airflow while hashing.
+        let mining = {
+            let states = thread_states
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            states.iter().any(|t| t.is_active)
+        };
+        let fan_floor_percent: u8 = if mining {
+            config
+                .startup
+                .fan_floor_mining_percent
+                .clamp(10, 100)
+                .max(idle_floor_percent)
+        } else {
+            idle_floor_percent
+        };
+        // Ramp window (toml `startup.fan_ramp_start_c` / `fan_ramp_full_c`,
+        // default 40 → 60). Below start the fans sit at the floor; from start
+        // they rise linearly to 100 % at full.
+        //
+        // Two invariants, both enforced here rather than trusted to the toml:
+        //   - `full` never exceeds TMP75_OVERTEMP_C. The fans MUST be at 100 %
+        //     before the over-temp gate cuts the PSU, or the board shuts itself
+        //     down with cooling headroom still unspent.
+        //   - `full` stays at least 1 °C above `start`, so the span can never be
+        //     zero (which would divide to a NaN duty).
+        // `start` is capped first so the two can't cross and invert the ramp.
+        let fan_ramp_start_c: f32 = config.startup.fan_ramp_start_c.min(TMP75_OVERTEMP_C - 1.0);
+        let fan_ramp_full_c: f32 = config
+            .startup
+            .fan_ramp_full_c
+            .max(fan_ramp_start_c + 1.0)
+            .min(TMP75_OVERTEMP_C);
         const TEMP_STALE_AFTER: Duration = Duration::from_secs(30);
 
         let board_hottest = temperatures
@@ -2300,13 +2339,13 @@ async fn native_telemetry_task(
             );
             100
         } else if let Some(t) = board_hottest {
-            if t <= FAN_RAMP_START_C {
+            if t <= fan_ramp_start_c {
                 fan_floor_percent
-            } else if t >= FAN_RAMP_FULL_C {
+            } else if t >= fan_ramp_full_c {
                 100
             } else {
-                let span = FAN_RAMP_FULL_C - FAN_RAMP_START_C;
-                let into_ramp = t - FAN_RAMP_START_C;
+                let span = fan_ramp_full_c - fan_ramp_start_c;
+                let into_ramp = t - fan_ramp_start_c;
                 let pct = fan_floor_percent as f32
                     + ((100.0 - fan_floor_percent as f32) * (into_ramp / span));
                 pct.round().clamp(fan_floor_percent as f32, 100.0) as u8
@@ -2328,6 +2367,8 @@ async fn native_telemetry_task(
                 info!(
                     target_percent = target_fan_percent,
                     board_temp_c = board_hottest.unwrap_or(0.0),
+                    mining,
+                    floor_percent = fan_floor_percent,
                     "Adjusted fan PWM"
                 );
                 applied_fan_percent = Some(target_fan_percent);
