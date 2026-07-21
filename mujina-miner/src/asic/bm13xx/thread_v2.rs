@@ -120,6 +120,10 @@ pub struct BM13xxThread {
     name: String,
     /// Channel for sending commands to the actor
     command_tx: mpsc::Sender<ThreadCommand>,
+    /// Interrupt flag shared with the actor. Set by `set_paused(true)` before
+    /// the SetPaused command is queued, so an in-flight cold-init aborts
+    /// instead of blocking the actor's command loop for the full INIT_TIMEOUT.
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
     capabilities: HashThreadCapabilities,
     status: Arc<RwLock<HashThreadStatus>>,
     event_rx: Option<mpsc::Receiver<HashThreadEvent>>,
@@ -170,6 +174,14 @@ impl BM13xxThread {
 
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, evt_rx) = mpsc::channel(100);
+        // Interrupt flag, shared with the facade and set OUTSIDE the command
+        // channel. A cold-init runs INLINE in the actor's command handler, so
+        // while it's in flight (up to INIT_TIMEOUT — 45 s, e.g. against a dead
+        // rail) the actor can't dequeue the next command. Pause is a safety
+        // operation and must not wait that long: `set_paused(true)` flips this
+        // flag, the in-flight init races against it and aborts, and the actor
+        // then processes the queued SetPaused immediately.
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
         let status_clone = Arc::clone(&status);
         let name = config.name.clone();
@@ -191,9 +203,11 @@ impl BM13xxThread {
             tokio::spawn(serial_reader_task(chip_rx, response_tx.clone()));
 
         // Spawn actor - it will initialize chips lazily on first work assignment
+        let interrupt_actor = Arc::clone(&interrupt);
         tokio::spawn(async move {
             let mut actor = BM13xxActor {
                 cmd_rx,
+                interrupt: interrupt_actor,
                 evt_tx,
                 status: status_clone,
                 active_census_last_seen: [None; 256],
@@ -223,6 +237,7 @@ impl BM13xxThread {
         Ok(Self {
             name,
             command_tx: cmd_tx,
+            interrupt,
             capabilities: HashThreadCapabilities {
                 hashrate_estimate: initial_hashrate,
             },
@@ -266,7 +281,14 @@ impl HashThread for BM13xxThread {
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
-        let (tx, rx) = oneshot::channel();
+        // Fire-and-forget: queue the task but do NOT await the actor's reply.
+        // The actor runs cold-init INLINE and can't reply while it's in flight
+        // (up to INIT_TIMEOUT); awaiting here would block the SCHEDULER's
+        // command loop behind that init — which is what stalled a pause (a
+        // safety op) for ~45 s when a new job landed mid-init. The reply only
+        // carried the discarded "previous task", so nothing downstream needs
+        // it. The actor still processes the task (or aborts on a pending pause).
+        let (tx, _rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::UpdateTask {
                 new_task,
@@ -274,14 +296,17 @@ impl HashThread for BM13xxThread {
             })
             .await
             .map_err(|_| HashThreadError::ThreadOffline)?;
-        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+        Ok(None)
     }
 
     async fn replace_task(
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
-        let (tx, rx) = oneshot::channel();
+        // Fire-and-forget — see `update_task` for why the scheduler must not
+        // await the actor's reply here (it would block the command loop, and a
+        // safety pause behind it, on an in-flight cold-init).
+        let (tx, _rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::ReplaceTask {
                 new_task,
@@ -289,7 +314,7 @@ impl HashThread for BM13xxThread {
             })
             .await
             .map_err(|_| HashThreadError::ThreadOffline)?;
-        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+        Ok(None)
     }
 
     async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
@@ -302,6 +327,16 @@ impl HashThread for BM13xxThread {
     }
 
     async fn set_paused(&mut self, paused: bool) -> Result<(), HashThreadError> {
+        // Pausing is a safety operation and must take effect promptly. Raise
+        // the interrupt BEFORE queuing the command so an in-flight cold-init
+        // (which runs inline in the actor's command loop, up to INIT_TIMEOUT)
+        // aborts and lets the actor dequeue this SetPaused, instead of the
+        // pause waiting the full timeout. The actor clears the flag once it
+        // handles the pause. (Not raised on resume — nothing to interrupt.)
+        if paused {
+            self.interrupt
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::SetPaused {
@@ -374,6 +409,10 @@ impl std::fmt::Debug for BM13xxThread {
 /// serial port, which is required for USB CDC-ACM flow control.
 struct BM13xxActor {
     cmd_rx: mpsc::Receiver<ThreadCommand>,
+    /// Shared with the facade. When set, an in-flight cold-init aborts so the
+    /// queued SetPaused can be handled without waiting out INIT_TIMEOUT. The
+    /// actor clears it when it processes that pause.
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     status: Arc<RwLock<HashThreadStatus>>,
     /// Live per-thread hashrate, computed from shares the chips
@@ -841,6 +880,10 @@ impl BM13xxActor {
                 paused,
                 response_tx,
             } => {
+                // Clear the interrupt now that we're processing the pause it may
+                // have raised — so the NEXT cold-init (on resume) isn't aborted.
+                self.interrupt
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 self.paused = paused;
                 if paused {
                     // Hard pause. The board layer is about to drop the
@@ -945,19 +988,41 @@ impl BM13xxActor {
             return Ok(None);
         }
 
-        // Initialize chips if not already running. Bound the attempt: a hung
-        // init (e.g. a jammed chip UART TX with no lower-level timeout) must not
-        // block this actor's run loop forever, or the scheduler deadlocks
-        // waiting to ACK the next UpdateTask.
+        // Initialize chips if not already running. Bound the attempt two ways:
+        //   - INIT_TIMEOUT caps a hung init (e.g. a jammed chip UART TX with no
+        //     lower-level timeout) so it can't block this actor's run loop
+        //     forever and deadlock the scheduler.
+        //   - the interrupt flag lets a PAUSE abort the init in-flight: pause is
+        //     a safety op, and a cold-init against a dead rail otherwise pins
+        //     the actor here for the full 45 s before the queued SetPaused is
+        //     seen. `interrupt` is a cloned Arc so it doesn't borrow self while
+        //     `initialize_chips` does.
         if matches!(self.chip_state, ChipState::Disabled) {
-            match tokio::time::timeout(INIT_TIMEOUT, self.initialize_chips()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+            let interrupt = Arc::clone(&self.interrupt);
+            let init = tokio::select! {
+                _ = async {
+                    while !interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                        time::sleep(Duration::from_millis(50)).await;
+                    }
+                } => None,
+                r = tokio::time::timeout(INIT_TIMEOUT, self.initialize_chips()) => Some(r),
+            };
+            match init {
+                // Aborted by a pending pause. Stay Disabled (NOT Unstartable —
+                // it wasn't a hardware failure): the SetPaused the actor is
+                // about to dequeue keeps the chain cold, and a later resume
+                // retries. The pause handler clears the interrupt flag.
+                None => {
+                    info!("cold-init interrupted by a pending pause — aborting; will retry on resume");
+                    return Ok(None);
+                }
+                Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => {
                     self.chip_state = ChipState::Unstartable;
                     error!(error = %e, "Cold-init failed — marking chain unstartable");
                     return Err(e);
                 }
-                Err(_) => {
+                Some(Err(_)) => {
                     self.chip_state = ChipState::Unstartable;
                     let msg = format!(
                         "cold-init exceeded {}s — marking chain unstartable",
@@ -1084,6 +1149,18 @@ impl BM13xxActor {
         for attempt in 1..=MAX_VERIFY_RETRIES {
             responding = self.verify_chain().await;
             if responding == expected_count {
+                break;
+            }
+            // ZERO chips responding isn't "a few missing" — it's an unpowered
+            // rail or a dead board, and every verify_chain call burns seconds
+            // waiting for replies that never come. Retrying just runs out the
+            // whole INIT_TIMEOUT and pins the actor (and any pause queued behind
+            // it) for that long. Fail fast on the first empty pass.
+            if responding == 0 {
+                warn!(
+                    attempt,
+                    "chain verification found 0 chips — no rail or dead board; failing init fast"
+                );
                 break;
             }
             if attempt < MAX_VERIFY_RETRIES {
