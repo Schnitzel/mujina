@@ -191,7 +191,11 @@ pub struct AmlogicPsuConfig {
 /// Startup behavior and safety defaults for native Amlogic bring-up.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AmlogicStartupConfig {
-    /// Default fan duty cycle applied before ASIC bring-up.
+    /// Default fan duty cycle applied before ASIC bring-up. Defaults to 100 —
+    /// full airflow for the pre-mining window where there's no temperature
+    /// signal yet to drive the curve (a lower open-loop default here was the
+    /// original mechanism behind boards running hot through early bring-up).
+    #[serde(default = "default_default_fan_percent")]
     pub default_fan_percent: u8,
 
     /// Minimum fan duty (%) the temperature curve floors at when the board is
@@ -225,7 +229,7 @@ pub struct AmlogicStartupConfig {
     ///
     /// Note this is the BOARD sensor (TMP75/PIC), which lags the chip die by
     /// tens of seconds — so the die is already meaningfully hotter than this
-    /// number. Lower it to start cooling earlier. Defaults to 40.
+    /// number. Lower it to start cooling earlier. Defaults to 30.
     #[serde(default = "default_fan_ramp_start_c")]
     pub fan_ramp_start_c: f32,
 
@@ -286,8 +290,12 @@ fn default_psu_off_settle_ms() -> u64 {
     2000
 }
 
+fn default_default_fan_percent() -> u8 {
+    100
+}
+
 fn default_fan_ramp_start_c() -> f32 {
-    40.0
+    30.0
 }
 
 fn default_fan_ramp_full_c() -> f32 {
