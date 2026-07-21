@@ -900,10 +900,25 @@ impl Scheduler {
                     // factory voltage — re-seed the tracker so the next
                     // SetOperatingPoint picks the right V/f ordering.
                     self.current_voltage_v = COLD_INIT_VOLTAGE_V;
+
+                    // ACK the resume NOW, then converge. A resume cycles the PSU
+                    // rail and re-inits the chains — ~10 s of hardware work.
+                    // Returning the PATCH here (the desired state is already
+                    // set and published) keeps the HTTP request from blocking
+                    // that long or tripping client/proxy timeouts (e.g. the
+                    // UI's). It's a declarative "start mining" command: clients
+                    // observe the chains actually come up via GET /miner
+                    // (`active_chips` climbs). Pause is deliberately NOT treated
+                    // this way — it's the fast safety path and stays synchronous
+                    // so its caller gets confirmation the rail dropped.
                     info!(
                         thread_count = self.threads.len(),
-                        "Mining resumed — re-dispatching cached jobs"
+                        "Mining resume accepted — cycling the rail and re-dispatching below"
                     );
+                    let _ = miner_state_tx.send(self.compute_miner_state());
+                    let _ = reply.send(Ok(()));
+
+                    // --- convergence (after the ack) ---
                     // Tell every thread to start feeding its own status
                     // hashrate again. assign_job_to_threads below will
                     // also re-dispatch cached work so shares start
@@ -934,9 +949,9 @@ impl Scheduler {
                     }
                 } else {
                     debug!("ResumeMining received but scheduler is not paused");
+                    let _ = miner_state_tx.send(self.compute_miner_state());
+                    let _ = reply.send(Ok(()));
                 }
-                let _ = miner_state_tx.send(self.compute_miner_state());
-                let _ = reply.send(Ok(()));
             }
             SchedulerCommand::SetFrequency { mhz, reply } => {
                 info!(
