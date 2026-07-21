@@ -1282,6 +1282,7 @@ impl Board for S19xAmlogic {
                 self.config.startup.reset_assert_ms,
                 hb.eeprom_i2c_device.clone(),
                 hb.index,
+                selected.has_pic,
                 self.config.clone(),
                 Arc::clone(&rail),
             );
@@ -1494,6 +1495,13 @@ struct BoardStateHashThread {
     /// power up on their own respond on UART.
     pic_i2c_device: PathBuf,
     pic_slot_index: u8,
+    /// Whether THIS hashboard actually has a PIC (detected from the EEPROM
+    /// board name, not assumed from the chip family). Gates the resume-time
+    /// PIC handshake: a noPIC board (BHB56902 / BHB42603 / …) has nothing at
+    /// the PIC i2c address, so handshaking it just NAKs (ENXIO) and logs a
+    /// spurious "chain may not respond on UART" warning. Mirrors the cold-init
+    /// path's `if !sel.has_pic { continue }`.
+    has_pic: bool,
     /// Full board config — needed so pause/resume can assert EVERY chain's
     /// reset, not just this one's (the rail they share is board-wide).
     config: AmlogicControlBoardConfig,
@@ -1511,6 +1519,7 @@ impl BoardStateHashThread {
         reset_assert_ms: u64,
         pic_i2c_device: PathBuf,
         pic_slot_index: u8,
+        has_pic: bool,
         config: AmlogicControlBoardConfig,
         rail: Arc<Mutex<SharedRail>>,
     ) -> Self {
@@ -1523,6 +1532,7 @@ impl BoardStateHashThread {
             reset_assert_ms,
             pic_i2c_device,
             pic_slot_index,
+            has_pic,
             config,
             rail,
         }
@@ -1719,29 +1729,42 @@ impl HashThread for BoardStateHashThread {
             // re-running handshake -> enable_dc_dc only the domains that happen
             // to come up power-on survive. Best-effort: exhausting the retries
             // only WARNs and lets initialize_chips() surface the real failure.
-            let pic_addr = pic_address_for_slot(self.pic_slot_index);
-            match pic_handshake_and_enable_dc_dc(&self.pic_i2c_device, pic_addr).await {
-                Ok(Some(version)) => {
-                    info!(
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        version = format_args!("0x{:02x}", version),
-                        "PIC handshake ok on resume"
-                    );
+            //
+            // ONLY for boards that actually have a PIC. A noPIC board
+            // (BHB56902 / BHB42603 / …) has nothing at the PIC i2c address, so
+            // handshaking it always NAKs (ENXIO) and logs a misleading "chain
+            // may not respond on UART" warning that has nothing to do with why
+            // the chain is or isn't up. Mirror the cold-init guard.
+            if self.has_pic {
+                let pic_addr = pic_address_for_slot(self.pic_slot_index);
+                match pic_handshake_and_enable_dc_dc(&self.pic_i2c_device, pic_addr).await {
+                    Ok(Some(version)) => {
+                        info!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            version = format_args!("0x{:02x}", version),
+                            "PIC handshake ok on resume"
+                        );
+                    }
+                    Ok(None) => {
+                        debug!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            "PIC absent on resume (noPIC variant?)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            addr = format_args!("0x{:02x}", pic_addr),
+                            attempts = PIC_RESUME_HANDSHAKE_ATTEMPTS,
+                            error = %e,
+                            "PIC handshake failed on resume after retries; chain may not respond on UART"
+                        );
+                    }
                 }
-                Ok(None) => {
-                    debug!(
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        "PIC absent on resume (noPIC variant?)"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        addr = format_args!("0x{:02x}", pic_addr),
-                        attempts = PIC_RESUME_HANDSHAKE_ATTEMPTS,
-                        error = %e,
-                        "PIC handshake failed on resume after retries; chain may not respond on UART"
-                    );
-                }
+            } else {
+                debug!(
+                    slot = self.pic_slot_index,
+                    "noPIC hashboard; skipping resume PIC handshake (chip power is ungated on this variant)"
+                );
             }
 
             info!(
