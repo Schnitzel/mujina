@@ -548,6 +548,13 @@ enum ChipState {
 /// forever (e.g. a jammed chip UART TX with no lower-level timeout).
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Per-command upper bound on a chip-UART write during init sequences. A
+/// healthy chain writes a command frame in sub-millisecond time; seconds
+/// means the port isn't accepting writes. Bounds each `chip_tx.send` in
+/// `execute_sequence` so a wedged write fails fast (with the step it stalled
+/// on) instead of parking the actor for the whole `INIT_TIMEOUT`.
+const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Ring buffer mapping chip job IDs to tasks.
 ///
 /// BM13xx chips include a job_id in nonce responses so we can correlate
@@ -1128,10 +1135,8 @@ impl BM13xxActor {
         time::sleep(Duration::from_millis(500)).await;
 
         // Drain any stale responses that accumulated during power-on
-        let mut drained = 0;
-        while self.response_rx.try_recv().is_ok() {
-            drained += 1;
-        }
+        // (bounded — a flooding chain must not spin us here forever).
+        let drained = self.drain_stale_responses();
         if drained > 0 {
             debug!(
                 count = drained,
@@ -1141,6 +1146,35 @@ impl BM13xxActor {
 
         // 2. Execute enumeration sequence (assigns addresses)
         self.execute_enumeration().await?;
+
+        // 2b. Quick liveness probe before the expensive multi-pass verify.
+        // A dead or badly-broken chain (no chip power, dead first chip, or a
+        // daisy chain that breaks a few chips in so most of it is unreachable)
+        // would otherwise make the full verify spend the whole INIT_TIMEOUT
+        // timing out 500 ms per absent chip — pinning this actor and, on
+        // .222 HB2, taking 45 s every boot/resume to conclude the obvious.
+        // Sample a spread of chips; if an OPTIMISTIC extrapolation of the
+        // sample can't reach the minimum viable count, fail fast now.
+        let (probe_alive, probe_total) = self.quick_liveness_probe().await;
+        let min_required = min_viable_chip_count(expected_count);
+        // Scale the sampled count up to the whole chain. `* 2` is deliberate
+        // headroom so sampling noise (e.g. the BHB56902 head-shadow effect)
+        // never fast-fails a chain that could actually be viable — only a
+        // chain extrapolated below HALF the minimum trips this.
+        let est_alive = probe_alive.saturating_mul(expected_count) / probe_total.max(1);
+        if est_alive.saturating_mul(2) < min_required {
+            return Err(HashThreadError::InitializationFailed(format!(
+                "liveness probe: only {probe_alive}/{probe_total} sampled chips answered \
+                 (~{est_alive}/{expected_count} across the chain), far below the {min_required} \
+                 minimum — the chain is dead or broken partway (a partial daisy chain). Failing \
+                 fast instead of grinding the full verify into the {}s init timeout.",
+                INIT_TIMEOUT.as_secs()
+            )));
+        }
+        debug!(
+            probe_alive,
+            probe_total, est_alive, "Chain liveness probe: enough chips answering; running full verify"
+        );
 
         // 3. Verify chip count with retries
         const MAX_VERIFY_RETRIES: usize = 3;
@@ -1240,20 +1274,44 @@ impl BM13xxActor {
     }
 
     /// Execute a sequence of steps, sending commands with optional delays.
+    ///
+    /// Each `chip_tx.send` is bounded by [`SEND_STALL_TIMEOUT`]. A healthy
+    /// chain writes each small command frame in well under a millisecond; a
+    /// send that blocks for seconds means the chip UART is not accepting
+    /// writes (the kernel TX buffer filled and never drains from tokio's
+    /// point of view — a wedged port, a rail that dropped mid-op, or chips
+    /// holding the line). Without this bound such a stall parks the actor for
+    /// the full INIT_TIMEOUT with no clue where — this converts it into a
+    /// fast, located failure (and names the step so the chain that stalled is
+    /// obvious in the logs).
     async fn execute_sequence(
         &mut self,
         steps: Vec<super::sequencer::Step>,
         description: &str,
     ) -> Result<(), HashThreadError> {
-        debug!(step_count = steps.len(), "Executing {}", description);
+        let total = steps.len();
+        debug!(step_count = total, "Executing {}", description);
 
-        for step in steps {
-            self.chip_tx.send(step.command.clone()).await.map_err(|e| {
-                HashThreadError::InitializationFailed(format!(
-                    "Failed to send {} command: {:?}",
-                    description, e
-                ))
-            })?;
+        for (idx, step) in steps.into_iter().enumerate() {
+            match time::timeout(SEND_STALL_TIMEOUT, self.chip_tx.send(step.command.clone())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(HashThreadError::InitializationFailed(format!(
+                        "Failed to send {} command: {:?}",
+                        description, e
+                    )));
+                }
+                Err(_elapsed) => {
+                    return Err(HashThreadError::InitializationFailed(format!(
+                        "{description} stalled — chip UART write blocked >{}s at step {}/{}. \
+                         The chain is not accepting writes (wedged port, rail dropped mid-op, \
+                         or chips holding the line); failing fast instead of pinning the actor.",
+                        SEND_STALL_TIMEOUT.as_secs(),
+                        idx + 1,
+                        total
+                    )));
+                }
+            }
 
             if let Some(delay) = step.wait_after {
                 time::sleep(delay).await;
@@ -1772,6 +1830,109 @@ impl BM13xxActor {
         }
     }
 
+    /// Drain currently-buffered chip responses, BOUNDED. A plain
+    /// `while try_recv().is_ok()` spins forever if the chain is flooding the
+    /// RX faster than we drain (chips free-running an old job on a board whose
+    /// reset didn't take) — which is exactly the pathology that hung cold-init
+    /// on .222 HB2. Cap the work so "clear the stale backlog" can never become
+    /// an infinite loop; the per-chip poll deadline handles the rest.
+    fn drain_stale_responses(&mut self) -> usize {
+        const DRAIN_CAP: usize = 4096;
+        let mut drained = 0;
+        for _ in 0..DRAIN_CAP {
+            if self.response_rx.try_recv().is_err() {
+                break;
+            }
+            drained += 1;
+        }
+        drained
+    }
+
+    /// Cheap "is anyone home?" check before the full multi-pass verify.
+    ///
+    /// Polls a spread of ~8 addresses ACROSS the chain (deliberately not just
+    /// the head — on BHB56902 the first ~10 chips shadow-miss the first sweep
+    /// even when live, so a head-only probe would false-negative a working
+    /// board) with a short timeout and two passes. Returns
+    /// `(responding, sampled)`. A working chain answers on several samples in
+    /// well under a second; a dead/unpowered chain answers on none in ~3 s,
+    /// which lets the caller fail fast instead of burning the full
+    /// INIT_TIMEOUT in 500 ms-per-chip verify waits.
+    async fn quick_liveness_probe(&mut self) -> (usize, usize) {
+        const SAMPLE_COUNT: usize = 8;
+        const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+        const PROBE_PASSES: usize = 2;
+
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
+        if addresses.is_empty() {
+            return (0, 0);
+        }
+        // Even spread across the whole chain, plus the very last chip.
+        let step = (addresses.len() / SAMPLE_COUNT).max(1);
+        let mut samples: Vec<u8> = addresses.iter().copied().step_by(step).collect();
+        if let Some(&last) = addresses.last() {
+            if !samples.contains(&last) {
+                samples.push(last);
+            }
+        }
+        let sampled = samples.len();
+
+        let mut alive = 0usize;
+        let mut to_poll = samples;
+        for _ in 0..PROBE_PASSES {
+            let mut missing = Vec::new();
+            for &addr in &to_poll {
+                self.drain_stale_responses();
+                if self
+                    .chip_tx
+                    .send(Command::ReadRegister {
+                        broadcast: false,
+                        chip_address: addr,
+                        register_address: RegisterAddress::ChipId,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (alive, sampled);
+                }
+                // Single deadline for the WHOLE poll of this chip — created
+                // once, NOT re-armed per iteration. A chain that floods the RX
+                // with unsolicited frames (e.g. chips free-running an old job)
+                // would otherwise reset a per-iteration timeout on every frame
+                // and spin here forever. Bias the deadline first so it wins
+                // even when a response is always ready.
+                let deadline = time::sleep(PROBE_TIMEOUT);
+                tokio::pin!(deadline);
+                let got_response = loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut deadline => break false,
+                        response = self.response_rx.recv() => {
+                            match response {
+                                Some(Ok(protocol::Response::ReadRegister {
+                                    register: Register::ChipId { .. },
+                                    ..
+                                })) => break true,
+                                Some(Ok(_)) | Some(Err(_)) => continue,
+                                None => break false,
+                            }
+                        }
+                    }
+                };
+                if got_response {
+                    alive += 1;
+                } else {
+                    missing.push(addr);
+                }
+            }
+            if missing.is_empty() {
+                break;
+            }
+            to_poll = missing;
+        }
+        (alive, sampled)
+    }
+
     /// Verify all chips respond by polling each one individually.
     ///
     /// Sends an addressed ReadRegister(ChipId) to each chip in sequence and
@@ -1798,8 +1959,8 @@ impl BM13xxActor {
             let mut missing_this_pass: Vec<u8> = Vec::new();
 
             for &addr in &to_poll {
-                // Drain any stale responses before each query
-                while self.response_rx.try_recv().is_ok() {}
+                // Drain any stale responses before each query (bounded).
+                self.drain_stale_responses();
 
                 if let Err(e) = self
                     .chip_tx
@@ -1814,8 +1975,19 @@ impl BM13xxActor {
                     return alive.len();
                 }
 
+                // ONE deadline for this chip's whole poll — armed once, never
+                // reset on a non-matching frame. A chain flooding the RX with
+                // unsolicited responses (chips free-running an old job on a
+                // board whose reset didn't take) would otherwise re-arm a
+                // per-iteration timeout on every frame and spin forever here,
+                // hanging the entire cold-init into INIT_TIMEOUT. Bias the
+                // deadline first so it fires even when a frame is always ready.
+                let deadline = time::sleep(PER_CHIP_TIMEOUT);
+                tokio::pin!(deadline);
                 let got_response = loop {
                     tokio::select! {
+                        biased;
+                        _ = &mut deadline => break false,
                         response = self.response_rx.recv() => {
                             match response {
                                 Some(Ok(protocol::Response::ReadRegister {
@@ -1826,7 +1998,6 @@ impl BM13xxActor {
                                 None => break false,
                             }
                         }
-                        _ = time::sleep(PER_CHIP_TIMEOUT) => break false,
                     }
                 };
 
