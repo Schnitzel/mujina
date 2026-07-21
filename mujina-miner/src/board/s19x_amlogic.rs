@@ -313,26 +313,57 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
     }
 }
 
-/// Auto-detect a hashboard's chip family from its decoded EEPROM so the
-/// board self-identifies rather than trusting the configured `model`.
+/// A hashboard identified from its EEPROM: chip family AND whether its DC-DC is
+/// PIC-gated. These are ORTHOGONAL — chip family (BM1362 vs BM1366) is one axis,
+/// PIC presence is another — and real hardware occupies three of the four
+/// corners: BM1362+PIC (BHB42601/BHB42611), BM1362+noPIC (BHB42603/BHB42631),
+/// BM1366+noPIC (BHB56902). Collapsing them into a single `model` enum is what
+/// stranded the noPIC S19j revisions: the S19j path assumed a PIC, the S19k path
+/// assumed BM1366, and neither fit.
+#[derive(Clone, Copy)]
+struct DetectedHashboard {
+    /// Chip family — drives the whole chip/topology/voltage spec.
+    model: HashboardModel,
+    /// True if the per-domain DC-DC is gated by an on-hashboard PIC16F1704 that
+    /// must be handshaked before the chips get core voltage; false if the
+    /// DC-DC comes up directly when the rail is energized.
+    has_pic: bool,
+}
+
+/// Auto-detect a hashboard's chip family AND PIC presence from its decoded
+/// EEPROM, so the board self-identifies rather than trusting the configured
+/// `model` (which can't express BM1362+noPIC at all).
 ///
-/// Matching is case-insensitive `contains`:
-///   - `board_name` "BHB42601" / "BHB42611" OR `chip_marking` "BM1362"
-///     → [`HashboardModel::S19jPro`]
-///   - `board_name` "BHB56902"             OR `chip_marking` "BM1366"
-///     → [`HashboardModel::S19kPro`]
+///   - `board_name` starts with "BHB426" OR `chip_marking` has "BM1362"
+///     → S19j Pro / BM1362. `has_pic` is true ONLY for the original
+///       BHB42601 / BHB42611; every other BHB426xx revision (BHB42603,
+///       BHB42631, confirmed BM1362/126-chip/noPIC by chain check on
+///       192.168.1.241 / .103) brings DC-DC up directly.
+///   - `board_name` starts with "BHB569" OR `chip_marking` has "BM1366"
+///     → S19k Pro / BM1366, noPIC.
 ///   - neither → `None` (caller falls back to the configured model).
-fn detect_hashboard_model(decoded: &DecodedAntminerEeprom) -> Option<HashboardModel> {
+///
+/// Defaulting an unknown BHB426xx revision to noPIC is a deliberate bet: the
+/// newer revisions we've seen are all noPIC (Bitmain is dropping the PIC, as it
+/// already did on the S19k). A wrong guess either way fails loudly and
+/// recoverably — a PIC board brought up noPIC simply enumerates 0 chips, and a
+/// noPIC board treated as PIC fails the handshake — so the operator sees it and
+/// adds the board to the PIC list rather than getting silent misbehaviour.
+fn detect_hashboard(decoded: &DecodedAntminerEeprom) -> Option<DetectedHashboard> {
     let board_name = decoded.board_name.to_ascii_uppercase();
     let chip_marking = decoded.chip_marking.to_ascii_uppercase();
 
-    if board_name.contains("BHB42601")
-        || board_name.contains("BHB42611")
-        || chip_marking.contains("BM1362")
-    {
-        Some(HashboardModel::S19jPro)
-    } else if board_name.contains("BHB56902") || chip_marking.contains("BM1366") {
-        Some(HashboardModel::S19kPro)
+    if board_name.starts_with("BHB426") || chip_marking.contains("BM1362") {
+        let has_pic = board_name.contains("BHB42601") || board_name.contains("BHB42611");
+        Some(DetectedHashboard {
+            model: HashboardModel::S19jPro,
+            has_pic,
+        })
+    } else if board_name.starts_with("BHB569") || chip_marking.contains("BM1366") {
+        Some(DetectedHashboard {
+            model: HashboardModel::S19kPro,
+            has_pic: false,
+        })
     } else {
         None
     }
@@ -562,6 +593,12 @@ struct SelectedHashboard {
     /// label, and this board's contribution to the shared-rail voltage
     /// envelope and its per-chain thermal cap.
     model: HashboardModel,
+    /// Whether this board's DC-DC is PIC-gated, DETECTED from the EEPROM
+    /// independently of `model` (BM1362 boards exist both with and without a
+    /// PIC). Drives the init DC-DC handshake and the telemetry heartbeat.
+    /// Falls back to `config.model.expects_pic()` when detection is
+    /// unavailable, preserving the pre-detection behaviour.
+    has_pic: bool,
 }
 
 /// Native Amlogic S19x Pro board.
@@ -644,17 +681,20 @@ impl S19xAmlogic {
         let mut selected: Vec<SelectedHashboard> = Vec::with_capacity(present.len());
         let mut all_temps: Vec<TemperatureSensor> = Vec::new();
         for hb in &present {
-            let (board_serial, detected_model, initial_temperatures) =
+            let (board_serial, detected, initial_temperatures) =
                 perform_health_gate(config, hb)?;
             all_temps.extend(initial_temperatures);
-            // Fall back to the configured model only when detection was
-            // unavailable (EEPROM read disabled or unrecognized board —
-            // `perform_health_gate` has already warned in the latter case).
-            let model = detected_model.unwrap_or(hb.model);
+            // Fall back to the configured model / its PIC assumption only when
+            // detection was unavailable (EEPROM read disabled or unrecognized
+            // board — `perform_health_gate` has already warned in the latter
+            // case). Preserves the pre-detection behaviour for that path.
+            let model = detected.map(|d| d.model).unwrap_or(hb.model);
+            let has_pic = detected.map(|d| d.has_pic).unwrap_or(hb.model.expects_pic());
             selected.push(SelectedHashboard {
                 config: hb.clone(),
                 board_serial,
                 model,
+                has_pic,
             });
         }
 
@@ -822,21 +862,24 @@ impl S19xAmlogic {
         // the decompiled S21 single_board_test in
         //   https://github.com/HashSource/bitmain_antminer_binaries
         // and confirmed against LuxOS ftrace captures on BHB42601.
-        // Bring up each PIC-variant board's DC-DC (retried), and note any that
-        // can't be started. On PIC variants (S19j Pro) the DC-DC is gated by
-        // the on-hashboard PIC: if it won't handshake / enable (after retries)
-        // the chips can never power, so the board cannot start. noPIC variants
-        // (S19k Pro) bring their DC-DC up directly — no PIC gate.
+        // Bring up each PIC-gated board's DC-DC (retried), and note any that
+        // can't be started. Whether a board is PIC-gated is DETECTED per board
+        // (`sel.has_pic`), not assumed from the chip family: BM1362 boards exist
+        // both with a PIC (BHB42601/BHB42611) and without (BHB42603/BHB42631),
+        // so keying on the model alone stranded the noPIC S19j revisions. On a
+        // PIC-gated board that won't handshake / enable (after retries) the
+        // chips can never power, so the board cannot start; noPIC boards bring
+        // their DC-DC up directly and skip this entirely.
         // Skipped entirely without a rail: the PIC's LDO is fed from the same
         // 12 V the APW12 supplies, so with the PSU down every handshake would
-        // fail and mark every PIC-variant board "unstartable" — turning a
+        // fail and mark every PIC-gated board "unstartable" — turning a
         // simply-unpowered chassis into a hard init failure.
         let mut unstartable: Vec<u8> = Vec::new();
         for sel in &selected {
             if !psu_present {
                 break;
             }
-            if !sel.model.expects_pic() {
+            if !sel.has_pic {
                 continue; // noPIC board — DC-DC comes up directly.
             }
             let pic_addr = pic_address_for_slot(sel.config.index);
@@ -1182,16 +1225,10 @@ impl Board for S19xAmlogic {
         // would have them race on `state_tx.send_modify` and clobber
         // each other's temperatures.
         let cfg_clone = self.config.clone();
-        // Carry the EEPROM-DETECTED chip family into the telemetry task, not
-        // the configured one. The task decides whether to run the PIC
-        // heartbeat from `hb.model.expects_pic()`; on a mixed chassis a slot
-        // configured `s19j_pro` may actually hold a noPIC S19k board
-        // (`SelectedHashboard.model` already reflects the detected family and
-        // drives the chain, voltage, and thermal everywhere else). Without
-        // this override the heartbeat path keeps poking an absent PIC on every
-        // detected-S19k slot and spams "PIC heartbeat failed / os error 6"
-        // each tick. Overriding `model` with the detected family makes the
-        // heartbeat decision consistent with the rest of the board.
+        // Per-board config for the telemetry task. `model` carries the
+        // EEPROM-detected chip family so any per-model telemetry stays
+        // consistent with the rest of the board; the DETECTED PIC presence is
+        // passed alongside as `has_pic_by_board`, below.
         let hbs_clone: Vec<AmlogicHashboardConfig> = self
             .selected_hashboards
             .iter()
@@ -1201,6 +1238,12 @@ impl Board for S19xAmlogic {
                 cfg
             })
             .collect();
+        // The heartbeat path pokes a PIC only on slots that actually have one.
+        // Keyed on DETECTED PIC presence, not the chip family — otherwise every
+        // noPIC slot (all S19k, plus the noPIC S19j revisions, which are BM1362
+        // yet have no PIC) spams "PIC heartbeat failed / os error 6" each tick.
+        let has_pic_by_board: Vec<bool> =
+            self.selected_hashboards.iter().map(|s| s.has_pic).collect();
         let psu = Arc::clone(&self.psu);
         let psu_present = self.psu_present;
         let state_tx = self.state_tx.clone();
@@ -1210,6 +1253,7 @@ impl Board for S19xAmlogic {
             native_telemetry_task(
                 cfg_clone,
                 hbs_clone,
+                has_pic_by_board,
                 psu,
                 psu_present,
                 state_tx,
@@ -2009,12 +2053,12 @@ fn is_hashboard_present(hashboard: &AmlogicHashboardConfig) -> Result<bool, Boar
 fn perform_health_gate(
     config: &AmlogicControlBoardConfig,
     hashboard: &AmlogicHashboardConfig,
-) -> Result<(Option<String>, Option<HashboardModel>, Vec<TemperatureSensor>), BoardError> {
+) -> Result<(Option<String>, Option<DetectedHashboard>, Vec<TemperatureSensor>), BoardError> {
     let mut board_serial = None;
-    // Chip family detected from the EEPROM. `None` when EEPROM reading is
-    // disabled or the board is unrecognized; the caller falls back to the
-    // configured model.
-    let mut detected_model = None;
+    // Chip family + PIC presence detected from the EEPROM. `None` when EEPROM
+    // reading is disabled or the board is unrecognized; the caller falls back
+    // to the configured model.
+    let mut detected = None;
 
     if config.startup.health_gate.read_eeprom_before_mining {
         let eeprom = read_eeprom(hashboard)?;
@@ -2024,16 +2068,17 @@ fn perform_health_gate(
                 hashboard.index
             ))
         })?;
-        match detect_hashboard_model(&decoded) {
-            Some(model) => {
+        match detect_hashboard(&decoded) {
+            Some(d) => {
                 info!(
                     hashboard = hashboard.index,
-                    detected = %model.board_model_label(),
+                    detected = %d.model.board_model_label(),
+                    has_pic = d.has_pic,
                     board_name = %decoded.board_name,
                     chip_marking = %decoded.chip_marking,
                     "hashboard family detected from EEPROM"
                 );
-                detected_model = Some(model);
+                detected = Some(d);
             }
             None => {
                 warn!(
@@ -2066,7 +2111,7 @@ fn perform_health_gate(
         }
     }
 
-    Ok((board_serial, detected_model, temperatures))
+    Ok((board_serial, detected, temperatures))
 }
 
 fn assert_all_resets(config: &AmlogicControlBoardConfig) -> Result<(), BoardError> {
@@ -2215,6 +2260,9 @@ fn probe_pic_for_heartbeat_blocking(
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
     hashboards: Vec<AmlogicHashboardConfig>,
+    // DETECTED PIC presence, one per entry in `hashboards` (same order). The
+    // heartbeat probe pokes a PIC only where this is true.
+    has_pic: Vec<bool>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
     // False when the APW12 never answered at bring-up. The chips then have no
     // rail, so there is nothing to measure and nothing generating heat.
@@ -2236,18 +2284,28 @@ async fn native_telemetry_task(
     // retries so a single noisy i2c frame can't misclassify a PIC-variant
     // board as "noPIC", and only genuine noPIC variants (BHB56902) end up with
     // the heartbeat disabled.
-    let probe_hbs = hashboards.clone();
+    let probe_hbs: Vec<(AmlogicHashboardConfig, bool)> = hashboards
+        .iter()
+        .cloned()
+        .zip(
+            has_pic
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(false))
+                .take(hashboards.len()),
+        )
+        .collect();
     let mut pics: Vec<(u16, AmlogicHashboardConfig, Option<PicChain>)> =
         tokio::task::spawn_blocking(move || {
             probe_hbs
                 .iter()
-                .map(|hb| {
+                .map(|(hb, has_pic)| {
                     let pic_addr = pic_address_for_slot(hb.index);
                     let pic = probe_pic_for_heartbeat_blocking(
                         &hb.eeprom_i2c_device,
                         pic_addr,
                         hb.index,
-                        hb.model.expects_pic(),
+                        *has_pic,
                     );
                     (pic_addr, hb.clone(), pic)
                 })
