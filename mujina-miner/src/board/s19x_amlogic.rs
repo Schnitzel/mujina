@@ -161,6 +161,14 @@ const PIC_HEARTBEAT_PROBE_ATTEMPTS: usize = 3;
 /// a clear error. The blocked `spawn_blocking` thread leaks, but the caller
 /// (and the daemon) recover.
 const PSU_BRINGUP_OP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bring-up rail-voltage confirmation: read the APW12 output ADC this many
+/// times before concluding the rail is dead, so a single transient i2c glitch
+/// on a genuinely-live rail can't force a false telemetry-only/paused.
+const PSU_RAIL_CONFIRM_ATTEMPTS: usize = 3;
+/// Minimum output voltage (V) that counts as a live rail at bring-up. Well
+/// below any real operating point (initial bring-up is ~12 V) and well above
+/// the ~0 V a dead/AC-cut APW12 reads while its i2c MCU still answers on caps.
+const PSU_RAIL_MIN_V: f32 = 8.0;
 const EEPROM_LEN: usize = 256;
 const TMP75_TEMP_REG: u8 = 0x00;
 
@@ -853,16 +861,65 @@ impl S19xAmlogic {
 
             if psu_present {
                 tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
-                match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.measure_voltage()).await
-                {
-                    Err(_elapsed) => {
+
+                // GATE on the actual OUTPUT voltage, not just an i2c ACK. The
+                // APW12's low-power control MCU can keep answering i2c for a
+                // window after its AC is cut (a Shelly relay) — running on
+                // residual capacitance — while the DC output has already
+                // collapsed. So config_watchdog/set_voltage "succeeding" does
+                // NOT prove the rail can power the chips. `measure_voltage`
+                // reads the real output ADC (not the setpoint): a live rail
+                // sits near the setpoint after settling; a dead one reads ~0 V,
+                // or the read fails as the caps finish draining. If we can't
+                // confirm a live rail, treat it as no PSU → telemetry-only /
+                // paused (recoverable via resume) rather than mining into a
+                // dead rail — which would just time every chain out into
+                // Unstartable while the miner sits "running" with 0 chips.
+                let mut measured: Option<f32> = None;
+                for attempt in 0..PSU_RAIL_CONFIRM_ATTEMPTS {
+                    match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.measure_voltage())
+                        .await
+                    {
+                        Ok(Ok(v)) => {
+                            measured = Some(v);
+                            if v >= PSU_RAIL_MIN_V {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => debug!(attempt, error = %e, "APW12 measure_voltage errored"),
+                        Err(_elapsed) => debug!(attempt, "APW12 measure_voltage timed out"),
+                    }
+                    if attempt + 1 < PSU_RAIL_CONFIRM_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(PIC_RESUME_RETRY_DELAY_MS)).await;
+                    }
+                }
+                match measured {
+                    Some(v) if v >= PSU_RAIL_MIN_V => {
+                        info!(board = %board_name, measured_v = v, "APW12 rail confirmed live");
+                        Some(v)
+                    }
+                    Some(v) => {
                         warn!(
-                            "APW12 measure_voltage timed out after {PSU_BRINGUP_OP_TIMEOUT:?} \
-                             (i2c-1 unresponsive); continuing without a measured voltage"
+                            board = %board_name,
+                            measured_v = v,
+                            min_v = PSU_RAIL_MIN_V,
+                            "APW12 answered i2c but the rail is NOT up (output below the live \
+                             threshold) — AC likely cut, i2c alive on residual caps. Coming up \
+                             WITHOUT the chains (paused); power the rail and resume — no restart."
                         );
+                        psu_present = false;
                         None
                     }
-                    Ok(result) => result.ok(),
+                    None => {
+                        warn!(
+                            board = %board_name,
+                            "APW12 rail voltage could not be read — cannot confirm a live rail. \
+                             Coming up WITHOUT the chains (paused); power the rail and resume — \
+                             no restart."
+                        );
+                        psu_present = false;
+                        None
+                    }
                 }
             } else {
                 // Leave the enable line asserted but the rail is dead anyway;
