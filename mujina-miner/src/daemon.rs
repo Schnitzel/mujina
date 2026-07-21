@@ -162,12 +162,19 @@ impl Daemon {
             // Created early so backplane can pass receiver to boards for display.
             let (miner_state_tx, miner_state_rx) = watch::channel(MinerState::default());
 
+            // Command channel: API sends commands, scheduler processes them.
+            // Created before the backplane so the backplane can also send a
+            // command — it starts the scheduler PAUSED for a board that came up
+            // not-yet-minable (no PSU on the i2c bus).
+            let (scheduler_cmd_tx, scheduler_cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+
             // Create and start backplane
             let mut backplane = Backplane::new(
                 transport_rx,
                 thread_tx,
                 board_reg_tx,
                 miner_state_rx.clone(),
+                scheduler_cmd_tx.clone(),
             );
             self.tracker.spawn({
                 let shutdown = self.shutdown.clone();
@@ -309,10 +316,8 @@ impl Daemon {
                 });
             }
 
-            // Command channel: API sends commands, scheduler processes them.
-            let (scheduler_cmd_tx, scheduler_cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
-
-            // Start the scheduler
+            // Start the scheduler (its command channel was created above, before
+            // the backplane, so the backplane can pause it for a no-PSU board).
             self.tracker.spawn(scheduler::task(
                 self.shutdown.clone(),
                 thread_rx,

@@ -16,8 +16,9 @@ use crate::{
         cpu::TransportEvent as CpuTransportEvent, usb::TransportEvent as UsbTransportEvent,
     },
 };
+use crate::api::commands::SchedulerCommand;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Board registry that uses inventory to find registered boards.
 pub struct BoardRegistry;
@@ -54,6 +55,9 @@ pub struct Backplane {
     board_reg_tx: mpsc::Sender<BoardRegistration>,
     /// Receiver for miner state (passed to boards for display)
     miner_state_rx: watch::Receiver<MinerState>,
+    /// Command channel to the scheduler. Used to start the scheduler PAUSED for
+    /// a board that came up not-yet-minable (see `Board::needs_initial_pause`).
+    scheduler_cmd_tx: mpsc::Sender<crate::api::commands::SchedulerCommand>,
 }
 
 impl Backplane {
@@ -63,6 +67,7 @@ impl Backplane {
         scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
         board_reg_tx: mpsc::Sender<BoardRegistration>,
         miner_state_rx: watch::Receiver<MinerState>,
+        scheduler_cmd_tx: mpsc::Sender<crate::api::commands::SchedulerCommand>,
     ) -> Self {
         Self {
             registry: BoardRegistry,
@@ -72,6 +77,7 @@ impl Backplane {
             scheduler_tx,
             board_reg_tx,
             miner_state_rx,
+            scheduler_cmd_tx,
         }
     }
 
@@ -174,6 +180,40 @@ impl Backplane {
                 match board.create_hash_threads().await {
                     Ok(threads) => {
                         let thread_count = threads.len();
+
+                        // If the board came up not-yet-minable (no PSU on the
+                        // i2c bus), start the scheduler PAUSED *before* its
+                        // threads register — `handle_new_thread` leaves threads
+                        // added while paused idle, so no work is dispatched into
+                        // unpowered chains. Await the ack so the pause is in
+                        // effect before the threads arrive (select! across the
+                        // scheduler's channels is not ordered, so send-order
+                        // alone wouldn't guarantee it). A later resume energizes
+                        // the rail and cold-inits them — no process restart.
+                        if board.needs_initial_pause() {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            if self
+                                .scheduler_cmd_tx
+                                .send(SchedulerCommand::PauseMining { reply: reply_tx })
+                                .await
+                                .is_ok()
+                            {
+                                let _ = reply_rx.await;
+                                info!(
+                                    board = %board_info.model,
+                                    id = %board_id,
+                                    "Board came up without a PSU — scheduler started PAUSED; \
+                                     power the rail and resume to mine (no restart needed)."
+                                );
+                            } else {
+                                error!(
+                                    board = %board_info.model,
+                                    "Failed to pause scheduler for a no-PSU board; chains may \
+                                     be driven while unpowered"
+                                );
+                            }
+                        }
+
                         self.boards.insert(board_id.clone(), board);
 
                         for thread in threads {

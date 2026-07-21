@@ -48,6 +48,20 @@ pub trait Board: Send {
     fn set_miner_state_rx(&mut self, _rx: watch::Receiver<MinerState>) {
         // Default: boards that don't need miner state ignore this
     }
+
+    /// Whether the scheduler should start PAUSED rather than mining once this
+    /// board's threads are registered.
+    ///
+    /// Returns true when the board came up with its chains created but not yet
+    /// minable — e.g. the Amlogic board booted with no PSU on the i2c bus (the
+    /// rail is unpowered). The chains exist but must not be driven until an
+    /// operator (or a controller like Nova) powers the rail and sends a resume,
+    /// which energizes the PSU and cold-inits the chains through the normal
+    /// resume path. Without this the scheduler would dispatch work into
+    /// unpowered chains at boot. Default: mine immediately.
+    fn needs_initial_pause(&self) -> bool {
+        false
+    }
 }
 
 /// Information about a board

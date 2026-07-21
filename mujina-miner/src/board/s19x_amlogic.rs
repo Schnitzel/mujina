@@ -990,6 +990,13 @@ impl S19xAmlogic {
 
 #[async_trait]
 impl Board for S19xAmlogic {
+    /// Start paused when the board came up with no PSU on the i2c bus: the
+    /// chains are created but the rail is unpowered, so the scheduler must not
+    /// dispatch work until a resume energizes it (see `create_hash_threads`).
+    fn needs_initial_pause(&self) -> bool {
+        !self.psu_present
+    }
+
     fn board_info(&self) -> BoardInfo {
         let present_models: Vec<HashboardModel> =
             self.selected_hashboards.iter().map(|s| s.model).collect();
@@ -1046,7 +1053,10 @@ impl Board for S19xAmlogic {
         // own regulator independently.
         // Board-wide rail arbitration, shared by every chain on this APW12 so
         // pause/resume touch the rail exactly once per cycle (see `SharedRail`).
-        let rail = Arc::new(Mutex::new(SharedRail::new(n_chains)));
+        // Seed it with the rail state cold-init left behind: energized on a
+        // normal boot, NOT energized when the board came up with no PSU (so the
+        // first resume runs the full power-on-reset before enumerating).
+        let rail = Arc::new(Mutex::new(SharedRail::new(n_chains, self.psu_present)));
 
         let ramp_coordinator = if n_chains > 1 {
             Some(Arc::new(bm13xx::chain_config::ChainCoordinator::new(
@@ -1070,25 +1080,27 @@ impl Board for S19xAmlogic {
         let mut thread_state_seed: Vec<crate::api_client::types::ThreadState> =
             Vec::with_capacity(n_chains);
 
-        // With no rail the chips are unpowered, so opening their UARTs and
-        // running enumerate/ramp would only fail or hang. Skip chain creation
-        // and come up telemetry-only: the task spawned at the end of this
-        // function still drives the fans and reads temperatures, which is the
-        // entire point of staying up without a PSU. Leaves `thermal_caps`
-        // empty, which the telemetry task handles (nothing to throttle).
-        let chains_to_start: Vec<SelectedHashboard> = if self.psu_present {
-            self.selected_hashboards.clone()
-        } else {
+        // ALWAYS create the chains, even with no PSU at boot. Opening the chip
+        // UARTs and spawning the actors needs no chip power (the UARTs are on
+        // the control board); the actors just won't cold-init until they get
+        // work. When there's no rail, the board asks the scheduler to start
+        // PAUSED (see `needs_initial_pause`) so no work is dispatched into
+        // unpowered chains — and a later resume (once the PSU is powered)
+        // energizes the rail and cold-inits the chains through the normal
+        // resume path, WITHOUT a process restart. Creating them now is what
+        // makes that recovery possible: a telemetry-only board with zero
+        // threads had nothing for a resume to act on.
+        if !self.psu_present {
             warn!(
                 board = %device_id(&self.config),
                 hashboards = self.selected_hashboards.len(),
-                "No PSU on i2c — skipping chain creation; running fans/telemetry only. \
-                 Restore PSU power and restart mujina to mine."
+                "No PSU on i2c at boot — chains created but the miner will start PAUSED; \
+                 power the PSU and send a resume (PATCH /api/v0/miner {{\"paused\":false}}) to mine. \
+                 No restart needed."
             );
-            Vec::new()
-        };
+        }
 
-        for selected in chains_to_start {
+        for selected in self.selected_hashboards.clone() {
             let hb = &selected.config;
             // Per-hashboard chip-family spec from the DETECTED model (the
             // config's per-slot `model` is only a fallback). This drives the
@@ -1245,7 +1257,7 @@ impl Board for S19xAmlogic {
         let has_pic_by_board: Vec<bool> =
             self.selected_hashboards.iter().map(|s| s.has_pic).collect();
         let psu = Arc::clone(&self.psu);
-        let psu_present = self.psu_present;
+        let telemetry_rail = Arc::clone(&rail);
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
@@ -1255,7 +1267,7 @@ impl Board for S19xAmlogic {
                 hbs_clone,
                 has_pic_by_board,
                 psu,
-                psu_present,
+                telemetry_rail,
                 state_tx,
                 thread_states,
                 thermal_caps,
@@ -1286,17 +1298,25 @@ struct SharedRail {
     n_chains: usize,
     /// Chains currently paused. The rail drops only when all of them are.
     paused_chains: std::collections::HashSet<u8>,
-    /// Whether the board-level power-on-reset has already run for the current
-    /// resume cycle. Cleared when the rail drops.
+    /// Whether the board-level power-on-reset has run and the rail is energized
+    /// — i.e. the chips have power. Set by the first chain to resume, cleared
+    /// when the last chain pauses (rail dropped). Doubles as the "rail
+    /// energized" signal the telemetry task reads to decide whether to poll the
+    /// PSU voltage and whether a stale-temp condition warrants pinning fans to
+    /// 100 % (nothing to cool when the rail is down).
     bringup_done: bool,
 }
 
 impl SharedRail {
-    fn new(n_chains: usize) -> Self {
+    /// `rail_energized` is the state cold-init left the rail in: true on a
+    /// normal boot (`initialize()` energized it), false when the board came up
+    /// with no PSU. When false the first resume runs the full power-on-reset;
+    /// when true it's skipped (already up).
+    fn new(n_chains: usize, rail_energized: bool) -> Self {
         Self {
             n_chains,
             paused_chains: std::collections::HashSet::new(),
-            bringup_done: true,
+            bringup_done: rail_energized,
         }
     }
 }
@@ -2264,9 +2284,14 @@ async fn native_telemetry_task(
     // heartbeat probe pokes a PIC only where this is true.
     has_pic: Vec<bool>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
-    // False when the APW12 never answered at bring-up. The chips then have no
-    // rail, so there is nothing to measure and nothing generating heat.
-    psu_present: bool,
+    // Shared rail state. Its `bringup_done` is the live "rail energized" signal
+    // — read each tick — replacing a static boot-time flag: it's true when the
+    // rail is up (normal boot, or after a resume) and false when it's down (no
+    // PSU at boot, or after a pause). When the rail is down there's nothing to
+    // measure (skip the PSU voltage read) and nothing generating heat (a
+    // stale-temp reading is the dead sensors going with the dead rail, not an
+    // overheat, so don't pin fans to 100 %).
+    rail: Arc<Mutex<SharedRail>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     // Per-chain frequency caps as `(cap, per-chain max)`. Each is stepped off
@@ -2331,6 +2356,11 @@ async fn native_telemetry_task(
         if shutdown.is_cancelled() {
             break;
         }
+
+        // Live rail state for this tick — is the APW12 energized right now?
+        // Drives the PSU voltage read and the stale-temp fan safety below. Read
+        // once and drop the lock immediately (never held across the PSU lock).
+        let rail_energized = rail.lock().await.bringup_done;
 
         // Walk every present hashboard each tick: PIC heartbeat,
         // PIC-mediated temps, TMP75 fallback. Accumulate into one
@@ -2569,7 +2599,7 @@ async fn native_telemetry_task(
             }
         }
 
-        let target_fan_percent: u8 = if temp_stale && psu_present {
+        let target_fan_percent: u8 = if temp_stale && rail_energized {
             warn!(
                 "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
             );
@@ -2629,9 +2659,9 @@ async fn native_telemetry_task(
         // most seriously the over-temp cutoff above, which simply stopped
         // running because this loop never came back around. Bounding it means a
         // dead PSU costs one skipped reading instead of a stuck miner. Skipped
-        // entirely when the PSU never answered at bring-up — there's nothing to
-        // measure and no reason to burn the timeout every tick.
-        let voltage_v = if psu_present {
+        // entirely while the rail is down (no PSU at boot, or paused) — there's
+        // nothing to measure and no reason to burn the timeout every tick.
+        let voltage_v = if rail_energized {
             match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, async {
                 psu.lock().await.measure_voltage().await
             })
