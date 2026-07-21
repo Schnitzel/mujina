@@ -770,18 +770,21 @@ impl S19xAmlogic {
             // board used to stall here SILENTLY (no log line, never inits).
             // Bound each op so a dead PSU surfaces a clear message instead.
             //
-            // A TIMEOUT means the APW12 isn't answering at all — usually its AC
-            // feed is simply cut (a Shelly relay), not a fault. That must NOT
-            // fail the whole board: the APW12 only powers the ASICs, while the
-            // EEPROMs, temperature sensors and fans all run off the
-            // control-board rail and are already up (enumeration happened
-            // above). So carry on in telemetry-only mode — fans and temps keep
-            // working and only the chains are skipped. Mining then requires a
-            // restart once the PSU is back, which is deliberate: nothing here
-            // polls for its return.
-            //
-            // `config_watchdog` is best-effort (some APW12 firmware NAKs it),
-            // so a returned error is only a warning.
+            // "No PSU on the bus" (its AC cut by a Shelly relay) shows up two
+            // ways and BOTH must degrade to telemetry-only/paused, never fail
+            // the board: the APW12 only powers the ASICs, while the EEPROMs,
+            // temperature sensors and fans run off the control-board rail and
+            // are already up (enumeration happened above). So the chains are
+            // created but the board comes up PAUSED, and a later resume (once
+            // the PSU is powered) energizes the rail and cold-inits them — no
+            // process restart.
+            //   - a TIMEOUT (the ioctl hangs on a wedged bus), and
+            //   - an ENXIO error (os error 6 — the address doesn't ACK), which
+            //     is the COMMON case and returns immediately.
+            // Only a DIFFERENT error means the PSU is answering but misbehaving
+            // (a real fault). `config_watchdog` is additionally best-effort
+            // (some APW12 firmware NAKs it), so a non-absent error there is just
+            // a warning.
             match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, psu_guard.config_watchdog(0x00)).await
             {
                 Err(_elapsed) => {
@@ -790,8 +793,17 @@ impl S19xAmlogic {
                         timeout = ?PSU_BRINGUP_OP_TIMEOUT,
                         "APW12 did not respond on i2c-1 during bring-up (config_watchdog) — the \
                          PSU is unpowered or its i2c bus is disconnected. Coming up WITHOUT the \
-                         chains: fans, temperatures and EEPROM still work. Restore PSU power and \
-                         restart mujina to mine."
+                         chains (paused); power the rail and resume to mine — no restart."
+                    );
+                    psu_present = false;
+                }
+                Ok(Err(e)) if is_psu_absent_error(&e) => {
+                    warn!(
+                        board = %board_name,
+                        error = %e,
+                        "APW12 not on i2c-1 (ENXIO) during bring-up (config_watchdog) — the PSU is \
+                         unpowered. Coming up WITHOUT the chains (paused); power the rail and \
+                         resume to mine — no restart."
                     );
                     psu_present = false;
                 }
@@ -813,7 +825,18 @@ impl S19xAmlogic {
                             board = %board_name,
                             timeout = ?PSU_BRINGUP_OP_TIMEOUT,
                             "APW12 did not respond on i2c-1 during bring-up (set_voltage) — \
-                             coming up WITHOUT the chains; restore PSU power and restart to mine."
+                             coming up WITHOUT the chains (paused); power the rail and resume \
+                             to mine — no restart."
+                        );
+                        psu_present = false;
+                    }
+                    Ok(Err(e)) if is_psu_absent_error(&e) => {
+                        warn!(
+                            board = %board_name,
+                            error = %e,
+                            "APW12 not on i2c-1 (ENXIO) during bring-up (set_voltage) — the PSU \
+                             is unpowered. Coming up WITHOUT the chains (paused); power the rail \
+                             and resume to mine — no restart."
                         );
                         psu_present = false;
                     }
@@ -1319,6 +1342,24 @@ impl SharedRail {
             bringup_done: rail_energized,
         }
     }
+}
+
+/// True when an APW12 i2c error means the PSU simply isn't on the bus — its AC
+/// is cut (a Shelly relay) so its i2c address doesn't ACK, which the kernel
+/// surfaces as ENXIO ("No such device or address", os error 6). This is the
+/// COMMON "no PSU" signal and it returns immediately; a hung bus times out
+/// instead (handled separately). Either way it means "no rail", NOT a PSU
+/// fault, so bring-up must degrade to telemetry-only/paused rather than fail
+/// the whole board. Walks the anyhow cause chain for a typed `io::Error`, with
+/// a formatted-string fallback for layers that stringify the error first.
+fn is_psu_absent_error(e: &anyhow::Error) -> bool {
+    const ENXIO: i32 = 6;
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(ENXIO)
+    }) || format!("{e:#}").contains("os error 6")
 }
 
 /// THE board-level power-on-reset. Cold-init and resume both call this, so the
@@ -2623,10 +2664,17 @@ async fn native_telemetry_task(
                     + ((100.0 - fan_floor_percent as f32) * (into_ramp / span));
                 pct.round().clamp(fan_floor_percent as f32, 100.0) as u8
             }
-        } else {
-            // Pre-mining / first tick — sit at the boot value but
-            // never below the floor.
+        } else if rail_energized {
+            // Pre-mining / first tick WITH a rail — sit at the boot value
+            // (full airflow) until the first temperature arrives. Never below
+            // the floor.
             config.startup.default_fan_percent.max(fan_floor_percent)
+        } else {
+            // No rail (no PSU at boot, or paused) and no temps to read — the
+            // chips are unpowered, nothing to cool. Sit at the idle floor
+            // instead of blasting the boot default for the ~30 s until the
+            // stale-temp path takes over.
+            idle_floor_percent
         };
 
         if Some(target_fan_percent) != applied_fan_percent {
