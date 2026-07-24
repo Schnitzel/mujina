@@ -227,8 +227,17 @@ const COLD_INIT_VOLTAGE_V: f32 = 13.9;
 /// cold-init + ramp resolve, then — if nothing came up — parks the miner
 /// paused so a single resume recovers it once the rail is genuinely powered
 /// (instead of leaving it "running" with 0 chips, which a bare resume can't
-/// fix). Must comfortably exceed a normal cold-init + frequency ramp.
-const BOOT_RAIL_CHECK_DELAY: Duration = Duration::from_secs(20);
+/// fix).
+///
+/// Must comfortably exceed a normal cold-init + frequency ramp: `is_active` /
+/// `frequency_mhz` only settle at the END of cold-init, and can't distinguish
+/// "still ramping" from "failed", so a check that fires mid-ramp would
+/// false-demote a perfectly live rail. Measured worst case ~25 s from thread
+/// registration to ramp-complete on a 3×S19j chassis (cold-init's enumerate /
+/// liveness / config phases run ~9 s BEFORE the ramp even starts); 45 s leaves
+/// generous margin. A genuinely dead rail fast-fails its chains in ~3 s, so it
+/// simply waits out the remainder before parking paused — harmless.
+const BOOT_RAIL_CHECK_DELAY: Duration = Duration::from_secs(45);
 
 /// Upper bound on how long a single thread's `set_frequency`/`set_voltage` may
 /// take before the scheduler gives up on it. A full-range PLL re-ramp is ~8 s
