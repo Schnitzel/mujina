@@ -899,23 +899,40 @@ impl S19xAmlogic {
                         Some(v)
                     }
                     Some(v) => {
-                        warn!(
+                        // The PSU answered i2c but its output reads BELOW the live
+                        // threshold. This is genuinely ambiguous and CANNOT be
+                        // resolved from the number alone — it is EITHER a rail
+                        // that's actually down (AC cut, the MCU still answering on
+                        // residual caps) OR a PSU firmware variant that simply
+                        // never reports its output voltage (some APW12s read ~0 V
+                        // even with the rail fully up; observed FW 0x15 / HW 0x74).
+                        // Treating "low" as "no rail" here is exactly the
+                        // false-positive that parks a non-reporting-PSU miner in
+                        // telemetry-only despite a live rail. So DON'T decide from
+                        // voltage: come up and let the chains cold-init be the
+                        // arbiter. If the rail really is dead every chain fast-fails
+                        // its liveness probe (and the board can park paused); if the
+                        // PSU is just quiet, the chips enumerate and it mines.
+                        info!(
                             board = %board_name,
                             measured_v = v,
                             min_v = PSU_RAIL_MIN_V,
-                            "APW12 answered i2c but the rail is NOT up (output below the live \
-                             threshold) — AC likely cut, i2c alive on residual caps. Coming up \
-                             WITHOUT the chains (paused); power the rail and resume — no restart."
+                            "APW12 answered i2c but its output reads below the live threshold — \
+                             ambiguous (dead rail vs a PSU that does not report voltage). Bringing \
+                             up the chains and letting enumeration confirm the rail."
                         );
-                        psu_present = false;
-                        None
+                        Some(v)
                     }
                     None => {
+                        // Every read errored or timed out. Unlike a low-but-present
+                        // reading, a total lack of response means the PSU MCU is
+                        // gone (not answering) — the rail is genuinely down. Come
+                        // up paused (recoverable via resume once the rail returns).
                         warn!(
                             board = %board_name,
-                            "APW12 rail voltage could not be read — cannot confirm a live rail. \
-                             Coming up WITHOUT the chains (paused); power the rail and resume — \
-                             no restart."
+                            "APW12 did not answer the voltage read (i2c error/timeout) — the PSU \
+                             is not responding, so the rail is down. Coming up WITHOUT the chains \
+                             (paused); power the rail and resume — no restart."
                         );
                         psu_present = false;
                         None

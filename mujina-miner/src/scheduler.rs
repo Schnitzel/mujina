@@ -208,10 +208,27 @@ struct Scheduler {
     /// pick the safe V/f ordering. Seeded to the factory cold-init setpoint and
     /// reset there on resume (a cold-init returns the rail to factory voltage).
     current_voltage_v: f32,
+
+    /// One-shot "did the rail actually come up?" deadline, armed when the first
+    /// chain registers at boot. Fired (once) from the periodic state tick; see
+    /// [`BOOT_RAIL_CHECK_DELAY`].
+    boot_rail_check_at: Option<tokio::time::Instant>,
 }
 
 /// Factory cold-init chain voltage (V) — the rail's value after any cold init.
 const COLD_INIT_VOLTAGE_V: f32 = 13.9;
+
+/// How long after the first chain registers (i.e. boot) to check whether ANY
+/// chain actually enumerated. The board layer can't always tell a live rail
+/// from a dead one at bring-up: some PSUs answer i2c but never report their
+/// real output voltage, so the residual-cap voltage gate can't catch a dead
+/// rail on them. In that case the board optimistically comes up mining and
+/// every chain fast-fails its liveness probe (0 chips). This window lets
+/// cold-init + ramp resolve, then — if nothing came up — parks the miner
+/// paused so a single resume recovers it once the rail is genuinely powered
+/// (instead of leaving it "running" with 0 chips, which a bare resume can't
+/// fix). Must comfortably exceed a normal cold-init + frequency ramp.
+const BOOT_RAIL_CHECK_DELAY: Duration = Duration::from_secs(20);
 
 /// Upper bound on how long a single thread's `set_frequency`/`set_voltage` may
 /// take before the scheduler gives up on it. A full-range PLL re-ramp is ~8 s
@@ -285,6 +302,7 @@ impl Scheduler {
             last_thread_count: 0,
             paused: false,
             current_voltage_v: COLD_INIT_VOLTAGE_V,
+            boot_rail_check_at: None,
         }
     }
 
@@ -351,6 +369,58 @@ impl Scheduler {
                 })
                 .collect(),
         }
+    }
+
+    /// One-shot boot rail check: once `boot_rail_check_at` elapses, if no chain
+    /// enumerated any chips, the rail was dead despite the PSU answering i2c
+    /// (residual caps, or a PSU that can't report its output voltage so the
+    /// board's voltage gate couldn't catch it). Park paused so a single resume
+    /// recovers it, rather than sitting "running" with 0 chips.
+    async fn maybe_run_boot_rail_check(
+        &mut self,
+        miner_state_tx: &watch::Sender<MinerState>,
+        share_channels: &mut ShareStream,
+    ) {
+        let deadline = match self.boot_rail_check_at {
+            Some(d) => d,
+            None => return,
+        };
+        if tokio::time::Instant::now() < deadline {
+            return;
+        }
+        self.boot_rail_check_at = None;
+
+        // Already paused (came up no-PSU, or an operator paused it), or no
+        // chains at all — nothing to demote.
+        if self.paused || self.threads.is_empty() {
+            return;
+        }
+
+        // A chain that came up reports is_active / active chips / a non-zero
+        // applied frequency once cold-init + ramp finish. If EVERY chain came
+        // back empty, the rail never powered the chips.
+        let any_chain_up = self.threads.values().any(|e| {
+            let s = e.thread.status();
+            s.is_active || s.active_chips > 0 || s.frequency_mhz > 0.0
+        });
+        if any_chain_up {
+            debug!("Boot rail check: a chain enumerated — rail confirmed live.");
+            return;
+        }
+
+        warn!(
+            thread_count = self.threads.len(),
+            "Boot rail check: no chain enumerated any chips within the boot window — the rail is \
+             dead despite the PSU answering i2c (residual caps, or a PSU that can't report its \
+             output voltage). Parking paused; power the rail and send a resume — no restart."
+        );
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        self.handle_api_command(
+            SchedulerCommand::PauseMining { reply: reply_tx },
+            miner_state_tx,
+            share_channels,
+        )
+        .await;
     }
 
     /// Compute the per-thread scheduler target for HashTask.
@@ -703,6 +773,8 @@ impl Scheduler {
             .expect("Thread missing event receiver");
 
         let thread_name = thread.name().to_string();
+        // The first chain to register marks boot — used to arm the rail check.
+        let is_first_thread = self.threads.is_empty();
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
@@ -722,6 +794,14 @@ impl Scheduler {
         }
 
         self.last_thread_count = thread_events.len();
+
+        // Boot: arm a one-shot check that at least one chain actually
+        // enumerates. If none do (a dead rail the board's voltage gate
+        // couldn't catch — a PSU that answers i2c but never reports its output
+        // voltage), park paused instead of sitting "running" with 0 chips.
+        if is_first_thread {
+            self.boot_rail_check_at = Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY);
+        }
 
         // Hashrate is constant for a brand-new thread (estimator has no
         // samples yet, so this always falls back to the static estimate).
@@ -1153,6 +1233,7 @@ impl Scheduler {
 
                 // Frequent API/UI state snapshot publish (~2 s).
                 _ = state_publish_interval.tick() => {
+                    self.maybe_run_boot_rail_check(&miner_state_tx, &mut share_channels).await;
                     let _ = miner_state_tx.send(self.compute_miner_state());
                 }
 
