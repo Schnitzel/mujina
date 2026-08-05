@@ -291,7 +291,11 @@ pub fn bm1362() -> ChipConfig {
     ChipConfig {
         chip_id: 0x1362,
         min_freq: Frequency::from_mhz(50.0),
-        max_freq: Frequency::from_mhz(525.0),
+        // 560 MHz ceiling gives headroom above the 550 MHz stock operating
+        // point (target_frequency_mhz below). The board-level thermal_cap
+        // (s19x_amlogic.rs, 560) matches; both must clear 550 or the dial
+        // clamps below the target.
+        max_freq: Frequency::from_mhz(560.0),
         io_driver: IoDriverStrength::normal(),
         nonce_range: 0x8118_0000, // From emberone-miner (12 chips)
         pll_params: PllParams::BM1362_BM1370,
@@ -337,7 +341,13 @@ pub fn bm1362() -> ChipConfig {
         // volume) validated incrementally against real chip-count/hashrate
         // held steady, not reused wholesale from a smaller chain.
         post_perchip_ticket_zero_bits: None,
-        target_frequency_mhz: None,
+        // S19j Pro stock operating frequency. LuxOS/Braiins run BHB42601 at
+        // ~550 MHz / ~13.5 V for the spec ~104 TH/s / ~3068 W. The previous
+        // `None` defaulted to 500 MHz (unwrap_or(500) in thread_v2), which
+        // measured ~90 TH/s / ~2.76 kW on real hardware (.241, 3×BHB42601) —
+        // correct efficiency but ~14% short on power/hashrate. Paired with the
+        // 13.5 V floor in s19x_amlogic.rs.
+        target_frequency_mhz: Some(550.0),
     }
 }
 

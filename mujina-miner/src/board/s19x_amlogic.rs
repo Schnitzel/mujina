@@ -278,25 +278,27 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
             chain_label: "S19jProAmlogic",
             chip_config: chip_config::bm1362(),
             topology: TopologySpec::uniform_domains(42, 3, false),
-            // BHB42601 EEPROM specifies 13.20 V at 525 MHz (factory test
-            // setpoint, decoded from EEPROM `voltage_v` field). The generic
+            // S19j Pro stock operating point is ~550 MHz / ~13.5 V (matches
+            // LuxOS/Braiins on BHB42601). The EEPROM ATE setpoint of 13.20 V @
+            // 525 MHz is a conservative factory-test point, not the production
+            // operating voltage. The generic
             // `bm13xx::thread_v2::voltage_for_frequency_stacked()` formula is
             // calibrated for emberone-style stacked regulators (per-chip
             // 0.3 V at 500 MHz, multiplied by 12 chips = 3.6 V total) and
-            // returns ~12.6 V when applied to the 42-domain series chain on
-            // S19j Pro (0.3 V × 42). That's 0.6 V under spec and causes chips
-            // to fall off the chain mid-ramp under load.
+            // returns ~12.8 V when applied to the 42-domain series chain on
+            // S19j Pro (~0.305 V × 42). That's ~0.7 V under spec and causes
+            // chips to fall off the chain mid-ramp under load.
             //
             // Clamping the min here (`applied.clamp(min_v, max_v)` in
-            // thread_v2) forces the ramp to program at least 13.2 V from the
+            // thread_v2) forces the ramp to program at least 13.5 V from the
             // first step. Above-spec at low frequencies is harmless; the chips
             // just have headroom they don't use.
             //
             // Long-term fix is per-chip-family voltage-frequency tables in
             // chip_config.rs but that's a wider refactor.
-            voltage_range: (13.2, 15.0),
-            // Match EEPROM-specified operating voltage for BHB42601.
-            target_voltage: 13.2,
+            voltage_range: (13.5, 15.0),
+            // Stock S19j Pro operating voltage for BHB42601 at 550 MHz.
+            target_voltage: 13.5,
             voltage_step: 0.1,
             // 12.0 V runtime floor — the original S19j Pro driver's
             // `set_voltage` clamp. Cold-init clamps higher via voltage_range.
@@ -304,13 +306,13 @@ fn hashboard_spec(model: HashboardModel) -> HashboardSpec {
             // BM1362 operating max (MHz). The S19j Pro driver had no thermal
             // cap before this unification; routing it through the shared
             // multi-board path adds the protective throttle. The BM1362
-            // factory/operating point is 525 MHz (chip_config::bm1362
-            // max_freq), so a 525 MHz ceiling never bites under normal
-            // temps — it only sheds frequency as the board heats.
-            thermal_cap_max_mhz: 525,
-            // Dial floor for the BM1362/S19j. Ceiling is 500 MHz
-            // (target_frequency_mhz = None → the unwrap_or(500) default in
-            // thread_v2, which is also the runtime clamp). 150 MHz floor.
+            // operating point is 550 MHz (chip_config::bm1362
+            // target_frequency_mhz), so a 560 MHz ceiling never bites under
+            // normal temps — it only sheds frequency as the board heats.
+            thermal_cap_max_mhz: 560,
+            // Dial floor for the BM1362/S19j. Ceiling is 550 MHz
+            // (target_frequency_mhz = Some(550) → the runtime clamp in
+            // thread_v2). 150 MHz floor.
             min_operating_mhz: 150,
             // BM1362 keeps the fixed SERIAL_BAUD — the original single-board
             // S19j driver left the 3.125 Mbaud switch OFF (`None`), and that's
