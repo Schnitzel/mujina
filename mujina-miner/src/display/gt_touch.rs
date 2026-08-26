@@ -614,6 +614,7 @@ mod tests {
                 voltage_v: Some(12.3),
                 current_a: Some(10.0),
                 power_w: Some(123.0),
+                temperature_c: Some(42),
             }],
             threads: vec![],
         }];

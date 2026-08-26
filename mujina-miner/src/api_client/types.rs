@@ -85,6 +85,13 @@ pub struct PowerMeasurement {
     pub voltage_v: Option<f32>,
     pub current_a: Option<f32>,
     pub power_w: Option<f32>,
+    /// PSU's own temperature sensor, in degrees Celsius.
+    ///
+    /// A real measurement read from the supply (APW12 command 0x09), unlike
+    /// `power_w`, which no APW12 reports and which stock firmwares only ever
+    /// model. `None` when the supply is unreachable or reports no sensor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_c: Option<i16>,
 }
 
 /// Per-thread runtime status.

@@ -27,8 +27,9 @@ use amlogic_cb_tools::{
     linux_i2c::LinuxI2cDevice,
     pic::{PicChain, pic_address_for_slot},
     protocol::{
-        CMD_GET_VOLTAGE, CMD_MEASURE_VOLTAGE, CMD_SET_VOLTAGE, CMD_WATCHDOG, NAK_BYTE, build_frame,
-        decode_dac_to_voltage, decode_measured_voltage, encode_voltage_to_dac, parse_frame,
+        CMD_GET_VOLTAGE, CMD_MEASURE_VOLTAGE, CMD_READ_TEMPERATURE, CMD_SET_VOLTAGE, CMD_WATCHDOG,
+        NAK_BYTE, build_frame, decode_dac_to_voltage, decode_measured_voltage,
+        decode_temperature_c, encode_voltage_to_dac, parse_frame,
     },
     pwm::SysfsPwm,
     tach::SysfsTachometer,
@@ -1055,6 +1056,9 @@ impl S19xAmlogic {
             voltage_v: measured_voltage,
             current_a: None,
             power_w: None,
+            // Filled in by the telemetry loop; bring-up has enough i2c-1 work
+            // to do already.
+            temperature_c: None,
         }];
 
         let (freq_floor, freq_ceiling) = effective_freq_band(&present_models);
@@ -1873,6 +1877,26 @@ impl NativeAmlogicPsu {
             return Err(anyhow::anyhow!("missing ADC payload from PSU"));
         }
         Ok(decode_measured_voltage(frame.payload[0], frame.payload[1]))
+    }
+
+    /// Read the APW12's own temperature sensor.
+    ///
+    /// Command 0x09 returns a 2-byte little-endian raw NTC/ADC code — not
+    /// degrees — decoded through the breakpoint table in
+    /// [`decode_temperature_c`]. This is a REAL measurement out of the PSU,
+    /// unlike the "input power" some stock firmwares display, which is a
+    /// model estimate.
+    ///
+    /// Answers even with the PSU output disabled (its control MCU runs off
+    /// standby), so this is not gated on the rail being energized at the
+    /// protocol level — the caller decides.
+    async fn read_temperature_c(&self) -> anyhow::Result<i16> {
+        let frame = self.exchange(CMD_READ_TEMPERATURE, Vec::new()).await?;
+        if frame.payload.len() < 2 {
+            return Err(anyhow::anyhow!("missing temperature payload from PSU"));
+        }
+        let raw = u16::from(frame.payload[0]) | (u16::from(frame.payload[1]) << 8);
+        Ok(decode_temperature_c(raw))
     }
 
     async fn read_target_voltage(&self) -> anyhow::Result<f32> {
@@ -2861,35 +2885,63 @@ async fn native_telemetry_task(
         // dead PSU costs one skipped reading instead of a stuck miner. Skipped
         // entirely while the rail is down (no PSU at boot, or paused) — there's
         // nothing to measure and no reason to burn the timeout every tick.
-        let voltage_v = if rail_energized {
+        // Voltage AND the PSU's own temperature sensor, under ONE lock
+        // acquisition inside ONE timeout. Two separately-bounded ops would
+        // double this tick's worst case on a wedged bus, and the over-temp
+        // cutoff above depends on this loop coming back around promptly.
+        //
+        // Gated on `rail_energized` like the voltage read. The APW12 does in
+        // fact answer 0x09 with its output disabled (verified: idle supply
+        // reads ~21 C at ~22 C ambient), so this could be extended to report an
+        // idle PSU's temperature — but only behind a consecutive-failure
+        // backoff, or an AC-cut supply would burn the full timeout every tick.
+        let (voltage_v, psu_temperature_c) = if rail_energized {
             match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, async {
-                psu.lock().await.measure_voltage().await
+                let psu_guard = psu.lock().await;
+                let voltage = psu_guard.measure_voltage().await;
+                let temperature = psu_guard.read_temperature_c().await;
+                (voltage, temperature)
             })
             .await
             {
-                Ok(Ok(voltage_v)) => Some(voltage_v),
-                Ok(Err(error)) => {
-                    debug!(error = %error, "Native telemetry PSU voltage read failed");
-                    None
+                Ok((voltage, temperature)) => {
+                    let voltage_v = match voltage {
+                        Ok(voltage_v) => Some(voltage_v),
+                        Err(error) => {
+                            debug!(error = %error, "Native telemetry PSU voltage read failed");
+                            None
+                        }
+                    };
+                    let temperature_c = match temperature {
+                        Ok(temperature_c) => Some(temperature_c),
+                        Err(error) => {
+                            debug!(error = %error, "Native telemetry PSU temperature read failed");
+                            None
+                        }
+                    };
+                    (voltage_v, temperature_c)
                 }
                 Err(_elapsed) => {
                     warn!(
                         timeout = ?PSU_BRINGUP_OP_TIMEOUT,
-                        "APW12 voltage read timed out (i2c-1 unresponsive); skipping this sample. \
-                         The PSU rail may be wedged — pause/resume and the over-temp cutoff stay \
-                         responsive regardless."
+                        "APW12 voltage/temperature read timed out (i2c-1 unresponsive); skipping \
+                         this sample. The PSU rail may be wedged — pause/resume and the over-temp \
+                         cutoff stay responsive regardless."
                     );
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let powers = vec![PowerMeasurement {
             name: "apw12".into(),
             voltage_v,
+            // The APW12 reports neither current nor power on i2c — any such
+            // figure in stock firmware is a model estimate, not a measurement.
             current_a: None,
             power_w: None,
+            temperature_c: psu_temperature_c,
         }];
         let threads = {
             thread_states
