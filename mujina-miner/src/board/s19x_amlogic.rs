@@ -14,7 +14,7 @@
 //! coordinated through a [`bm13xx::chain_config::ChainCoordinator`].
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     sync::atomic::{AtomicU32, Ordering},
@@ -1969,6 +1969,36 @@ fn exchange_blocking(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no valid PSU response received")))
 }
 
+/// Serialises **all** access to one hashboard i2c bus (`/dev/i2c-0`).
+///
+/// `PicChain::exchange()` is not atomic: it writes the request frame, sleeps
+/// `POST_WRITE_DELAY`, then issues N *separate* single-byte reads with a gap
+/// between each. One logical PIC exchange therefore spans N+1 independent i2c
+/// transactions with sleeps in the gaps. The kernel serialises each individual
+/// transaction but nothing serialises the sequence, and every caller opens its
+/// own `LinuxI2cDevice` fd — so two threads sharing the bus interleave and
+/// consume each other's response bytes.
+///
+/// Observed on `.140` with ftrace: the resume handshake wrote its frame, the
+/// telemetry loop wrote its own frame into the 300 ms gap and read all six
+/// response bytes, and the handshake's read then failed outright (`n=0`,
+/// surfacing as `os error 6`). That is the "PIC handshake failed on resume →
+/// chain marked unstartable" field failure. Hold this lock across a WHOLE
+/// logical exchange, never per transaction.
+///
+/// NOTE: `std::sync::Mutex` is not reentrant — only ever take this at the
+/// outermost logical operation, and never hold it across an `.await`. Every
+/// caller here runs on `spawn_blocking`.
+fn i2c_bus_lock(device: &Path) -> &'static std::sync::Mutex<()> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, &'static std::sync::Mutex<()>>>> =
+        OnceLock::new();
+    let map = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(device.to_path_buf())
+        .or_insert_with(|| &*Box::leak(Box::new(std::sync::Mutex::new(()))))
+}
+
 /// Open the on-hashboard PIC, handshake, and enable its DC-DCs — one
 /// atomic blocking unit, retried as a whole by
 /// [`pic_handshake_and_enable_dc_dc`]. Distinct outcomes so the retry loop
@@ -1983,6 +2013,12 @@ fn pic_handshake_and_enable_dc_dc_blocking(
     pic_i2c_device: &Path,
     pic_addr: u16,
 ) -> Result<u8, PicHandshakeError> {
+    // Whole open->handshake->enable sequence under the bus lock: each of those
+    // is several non-atomic exchanges, and interleaving any of them with the
+    // telemetry loop is exactly the resume race. See [`i2c_bus_lock`].
+    let _bus = i2c_bus_lock(pic_i2c_device)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut pic =
         PicChain::open(pic_i2c_device, pic_addr).map_err(PicHandshakeError::Absent)?;
     let version = pic.handshake().map_err(PicHandshakeError::Handshake)?;
@@ -2371,9 +2407,14 @@ fn probe_pic_for_heartbeat_blocking(
         }
     };
 
+    let bus = i2c_bus_lock(pic_i2c_device);
     let mut last_err: Option<amlogic_cb_tools::pic::PicError> = None;
     for attempt in 0..PIC_HEARTBEAT_PROBE_ATTEMPTS {
-        match pic.heartbeat() {
+        let hb_result = {
+            let _g = bus.lock().unwrap_or_else(|e| e.into_inner());
+            pic.heartbeat()
+        };
+        match hb_result {
             Ok(()) => {
                 if attempt > 0 {
                     info!(
@@ -2529,7 +2570,15 @@ async fn native_telemetry_task(
                 let pic_addr = *pic_addr;
                 let mut got_pic_temps = false;
                 if let Some(pic) = pic_opt.as_mut() {
-                    if let Err(e) = pic.heartbeat() {
+                    // Each of these is a multi-transaction exchange — take the
+                    // bus lock for the whole of one, and drop it before
+                    // `read_temperatures` below (which locks internally; the
+                    // lock is NOT reentrant). See [`i2c_bus_lock`].
+                    let bus = i2c_bus_lock(&hb.eeprom_i2c_device);
+                    if let Err(e) = {
+                        let _g = bus.lock().unwrap_or_else(|e| e.into_inner());
+                        pic.heartbeat()
+                    } {
                         warn!(
                             hashboard = hb.index,
                             addr = format_args!("0x{:02x}", pic_addr),
@@ -2537,7 +2586,11 @@ async fn native_telemetry_task(
                             "PIC heartbeat failed"
                         );
                     }
-                    match pic.read_temperatures_celsius() {
+                    let temps_result = {
+                        let _g = bus.lock().unwrap_or_else(|e| e.into_inner());
+                        pic.read_temperatures_celsius()
+                    };
+                    match temps_result {
                         Ok(temps) => {
                             for (i, t) in temps.iter().enumerate() {
                                 temperatures.push(TemperatureSensor {
@@ -2907,6 +2960,11 @@ fn read_temperatures(
     // ASIC-bus TMP75.
     let mut sensors = Vec::new();
     let pic_addr = pic_address_for_slot(hashboard.index);
+    // Bus lock: this shares /dev/i2c-0 with the PIC handshake and the telemetry
+    // loop, and the TMP75 fallback below is on the same bus. See [`i2c_bus_lock`].
+    let _bus = i2c_bus_lock(&hashboard.eeprom_i2c_device)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Ok(mut pic) = PicChain::open(&hashboard.eeprom_i2c_device, pic_addr) {
         if let Ok(temps) = pic.read_temperatures_celsius() {
             for (i, t) in temps.iter().enumerate() {
