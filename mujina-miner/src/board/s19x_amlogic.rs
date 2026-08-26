@@ -166,6 +166,12 @@ const PSU_BRINGUP_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// times before concluding the rail is dead, so a single transient i2c glitch
 /// on a genuinely-live rail can't force a false telemetry-only/paused.
 const PSU_RAIL_CONFIRM_ATTEMPTS: usize = 3;
+/// Consecutive failed PSU temperature reads before backing off. The read is
+/// attempted even with the rail down (the APW12's control MCU answers off
+/// standby), so an unpowered supply must not cost a timeout every tick.
+const PSU_TEMP_FAILURES_BEFORE_BACKOFF: u32 = 3;
+/// Telemetry ticks to skip the PSU temperature read once backed off.
+const PSU_TEMP_BACKOFF_TICKS: u32 = 10;
 /// Minimum output voltage (V) that counts as a live rail at bring-up. Well
 /// below any real operating point (initial bring-up is ~12 V) and well above
 /// the ~0 V a dead/AC-cut APW12 reads while its i2c MCU still answers on caps.
@@ -2556,6 +2562,15 @@ async fn native_telemetry_task(
     // so we tolerate the first read taking a little while before
     // declaring the sensor dead.
     let mut last_temp_at = std::time::Instant::now();
+    // PSU temperature backoff. The APW12 answers command 0x09 whether or not
+    // its output is enabled, so we read it even while paused — a supply
+    // cooling down from load is worth showing. But if the PSU has no AC at
+    // all the read costs a full PSU_BRINGUP_OP_TIMEOUT, and paying that every
+    // tick would stall this loop (which also runs the over-temp cutoff). So:
+    // after PSU_TEMP_FAILURES_BEFORE_BACKOFF consecutive failures, only retry
+    // once every PSU_TEMP_BACKOFF_TICKS ticks. Any success re-arms it.
+    let mut psu_temp_failures: u32 = 0;
+    let mut psu_temp_skip_ticks: u32 = 0;
 
     loop {
         if shutdown.is_cancelled() {
@@ -2895,29 +2910,51 @@ async fn native_telemetry_task(
         // reads ~21 C at ~22 C ambient), so this could be extended to report an
         // idle PSU's temperature — but only behind a consecutive-failure
         // backoff, or an AC-cut supply would burn the full timeout every tick.
-        let (voltage_v, psu_temperature_c) = if rail_energized {
+        let want_temperature = if psu_temp_skip_ticks > 0 {
+            psu_temp_skip_ticks -= 1;
+            false
+        } else {
+            true
+        };
+        let (voltage_v, psu_temperature_c) = if rail_energized || want_temperature {
             match tokio::time::timeout(PSU_BRINGUP_OP_TIMEOUT, async {
                 let psu_guard = psu.lock().await;
-                let voltage = psu_guard.measure_voltage().await;
-                let temperature = psu_guard.read_temperature_c().await;
+                // Voltage only matters with the rail up; temperature is
+                // readable either way.
+                let voltage = if rail_energized {
+                    Some(psu_guard.measure_voltage().await)
+                } else {
+                    None
+                };
+                let temperature = if want_temperature {
+                    Some(psu_guard.read_temperature_c().await)
+                } else {
+                    None
+                };
                 (voltage, temperature)
             })
             .await
             {
                 Ok((voltage, temperature)) => {
                     let voltage_v = match voltage {
-                        Ok(voltage_v) => Some(voltage_v),
-                        Err(error) => {
+                        Some(Ok(voltage_v)) => Some(voltage_v),
+                        Some(Err(error)) => {
                             debug!(error = %error, "Native telemetry PSU voltage read failed");
                             None
                         }
+                        None => None,
                     };
                     let temperature_c = match temperature {
-                        Ok(temperature_c) => Some(temperature_c),
-                        Err(error) => {
+                        Some(Ok(temperature_c)) => {
+                            psu_temp_failures = 0;
+                            Some(temperature_c)
+                        }
+                        Some(Err(error)) => {
                             debug!(error = %error, "Native telemetry PSU temperature read failed");
+                            psu_temp_failures += 1;
                             None
                         }
+                        None => None,
                     };
                     (voltage_v, temperature_c)
                 }
@@ -2928,12 +2965,23 @@ async fn native_telemetry_task(
                          this sample. The PSU rail may be wedged — pause/resume and the over-temp \
                          cutoff stay responsive regardless."
                     );
+                    if want_temperature {
+                        psu_temp_failures += 1;
+                    }
                     (None, None)
                 }
             }
         } else {
             (None, None)
         };
+        if psu_temp_failures >= PSU_TEMP_FAILURES_BEFORE_BACKOFF {
+            psu_temp_failures = 0;
+            psu_temp_skip_ticks = PSU_TEMP_BACKOFF_TICKS;
+            debug!(
+                backoff_ticks = PSU_TEMP_BACKOFF_TICKS,
+                "APW12 temperature unreadable; backing off (the PSU is probably unpowered)"
+            );
+        }
         let powers = vec![PowerMeasurement {
             name: "apw12".into(),
             voltage_v,
