@@ -1600,16 +1600,16 @@ async fn board_power_on_reset(
 
     // The rail is up and unloaded (every chain is still held in reset) — the
     // only safe moment to find out whether it actually regulates. See issue #4.
+    //
+    // The rail is deliberately LEFT at the probe voltage. Writing the idle
+    // setpoint back afterwards is another unverified write on a link whose
+    // readback lies (the firmware NAKs responses and echoes the requested DAC),
+    // and measurements showed the supply re-sticking on exactly that write. It
+    // also cannot be verified: at 12.0 V a healthy rail reads ~12.4 V and a
+    // stuck one ~12.7 V, inside the no-load offset, while at the probe voltage
+    // the two differ by more than a volt. The probe IS the cold-init setpoint
+    // the chains raise to seconds later, so nothing downstream changes.
     verify_rail_regulates(psu, config.startup.psu_settle_ms).await;
-
-    // Leave the rail at the configured idle setpoint the caller expects.
-    {
-        let mut guard = psu.lock().await;
-        if let Err(e) = guard.set_voltage(config.startup.initial_voltage).await {
-            warn!(error = %e, "Failed to restore the idle voltage after the rail check");
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
     Ok(())
 }
 
@@ -1867,10 +1867,6 @@ impl HashThread for BoardStateHashThread {
                     // power to chains that already came up.
                     rail.rail_checked = true;
                     verify_rail_regulates(&self.psu, self.config.startup.psu_settle_ms).await;
-                    let mut guard = self.psu.lock().await;
-                    if let Err(e) = guard.set_voltage(self.config.startup.initial_voltage).await {
-                        warn!(error = %e, "Failed to restore the idle voltage after the rail check");
-                    }
                 }
                 if !rail.bringup_done {
                     if let Err(e) = board_power_on_reset(&self.config, &self.psu).await {
