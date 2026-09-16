@@ -1120,6 +1120,15 @@ impl Board for S19xAmlogic {
         !self.psu_present
     }
 
+    /// The APW12 answers `measure_voltage` (the real output ADC), and bring-up
+    /// only keeps `psu_present` when that read succeeded: every path that ends
+    /// with "no voltage reading" clears it. So a present PSU here is exactly a
+    /// PSU whose output we can measure — the bring-up gate plus the resume-time
+    /// regulation check cover what the scheduler's boot timer was written for.
+    fn rail_voltage_readback(&self) -> bool {
+        self.psu_present
+    }
+
     fn board_info(&self) -> BoardInfo {
         let present_models: Vec<HashboardModel> =
             self.selected_hashboards.iter().map(|s| s.model).collect();
@@ -1840,6 +1849,19 @@ impl HashThread for BoardStateHashThread {
             {
                 let mut rail = self.rail.lock().await;
                 rail.paused_chains.remove(&self.pic_slot_index);
+                if rail.bringup_done {
+                    // The rail was already brought up in this process, so the
+                    // power-on-reset (and with it the regulation check) is
+                    // skipped. It can still have been cycled from outside since
+                    // — a Shelly relay, a power cut — and an APW12 that came
+                    // back stuck acks set-voltage while its output sits at
+                    // ~12.7 V. Verify before releasing the chains.
+                    verify_rail_regulates(&self.psu, self.config.startup.psu_settle_ms).await;
+                    let mut guard = self.psu.lock().await;
+                    if let Err(e) = guard.set_voltage(self.config.startup.initial_voltage).await {
+                        warn!(error = %e, "Failed to restore the idle voltage after the rail check");
+                    }
+                }
                 if !rail.bringup_done {
                     if let Err(e) = board_power_on_reset(&self.config, &self.psu).await {
                         warn!(error = %e, "Board power-on-reset failed on resume; chain may not enumerate");

@@ -214,6 +214,15 @@ impl Backplane {
                             }
                         }
 
+                        // Tell the scheduler whether this board can measure its
+                        // own rail; if it can, its boot rail check is redundant.
+                        let _ = self
+                            .scheduler_cmd_tx
+                            .send(SchedulerCommand::SetRailReadback(
+                                board.rail_voltage_readback(),
+                            ))
+                            .await;
+
                         self.boards.insert(board_id.clone(), board);
 
                         for thread in threads {

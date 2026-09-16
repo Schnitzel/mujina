@@ -21,6 +21,12 @@ pub enum SchedulerCommand {
         reply: oneshot::Sender<Result<()>>,
     },
 
+    /// Tell the scheduler whether this board can read its rail voltage back.
+    /// When it can, the boot rail check is pointless (the board gates on the
+    /// measured output at bring-up) and is left disarmed — it could otherwise
+    /// only demote a healthy start that is merely slow.
+    SetRailReadback(bool),
+
     /// Set the operating point (frequency + chain voltage) — M1.5. The
     /// scheduler sequences frequency and the shared voltage in the order that
     /// keeps the chips safe (lower frequency before lowering voltage; raise

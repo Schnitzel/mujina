@@ -213,6 +213,10 @@ struct Scheduler {
     /// chain registers at boot. Fired (once) from the periodic state tick; see
     /// [`BOOT_RAIL_CHECK_DELAY`].
     boot_rail_check_at: Option<tokio::time::Instant>,
+
+    /// Set by the board layer: true when the rail voltage can be read back, in
+    /// which case the boot rail check stays disarmed (see `SetRailReadback`).
+    rail_voltage_readback: bool,
 }
 
 /// Factory cold-init chain voltage (V) — the rail's value after any cold init.
@@ -313,6 +317,7 @@ impl Scheduler {
             paused: false,
             current_voltage_v: COLD_INIT_VOLTAGE_V,
             boot_rail_check_at: None,
+            rail_voltage_readback: false,
         }
     }
 
@@ -809,7 +814,7 @@ impl Scheduler {
         // enumerates. If none do (a dead rail the board's voltage gate
         // couldn't catch — a PSU that answers i2c but never reports its output
         // voltage), park paused instead of sitting "running" with 0 chips.
-        if is_first_thread {
+        if is_first_thread && !self.rail_voltage_readback {
             self.boot_rail_check_at = Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY);
         }
 
@@ -1001,8 +1006,11 @@ impl Scheduler {
                     // resume, so the window would otherwise be mostly spent
                     // before cold-init even begins and a healthy rail gets
                     // demoted mid-start. See issue #3.
-                    self.boot_rail_check_at =
-                        Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY);
+                    self.boot_rail_check_at = if self.rail_voltage_readback {
+                        None
+                    } else {
+                        Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY)
+                    };
 
                     // ACK the resume NOW, then converge. A resume cycles the PSU
                     // rail and re-inits the chains — ~10 s of hardware work.
@@ -1055,6 +1063,13 @@ impl Scheduler {
                     let _ = miner_state_tx.send(self.compute_miner_state());
                     let _ = reply.send(Ok(()));
                 }
+            }
+            SchedulerCommand::SetRailReadback(available) => {
+                self.rail_voltage_readback = available;
+                if available {
+                    self.boot_rail_check_at = None;
+                }
+                debug!(available, "rail voltage readback reported by the board");
             }
             SchedulerCommand::SetFrequency { mhz, reply } => {
                 info!(
