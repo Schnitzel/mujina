@@ -2696,6 +2696,9 @@ async fn native_telemetry_task(
     // so we tolerate the first read taking a little while before
     // declaring the sensor dead.
     let mut last_temp_at = std::time::Instant::now();
+    // Tracks the rail's previous state so the thermal cap can be seeded from
+    // the first real reading after it comes back up (see the throttle below).
+    let mut prev_rail_energized = false;
     // PSU temperature backoff. The APW12 answers command 0x09 whether or not
     // its output is enabled, so we read it even while paused — a supply
     // cooling down from load is worth showing. But if the PSU has no AC at
@@ -2923,16 +2926,41 @@ async fn native_telemetry_task(
         // min(requested, cap) on its 1 s tick, so the board sheds heat by
         // slowing down — staying alive at lower power instead of tripping the
         // full DC-DC/PSU cutoff. Runs with no dependency on Nova.
+        // A rail that just came back gets its cap seeded from the first real
+        // reading instead of creeping up from wherever it was left. Without
+        // this a miner resumed after a pause spends ~12 min at 6 MHz/tick
+        // climbing back to its ceiling with chips sitting at 40 C.
+        let seed_cap = rail_energized && !prev_rail_energized;
+        prev_rail_energized = rail_energized;
+
         for (chain_idx, (thermal_cap_mhz, thermal_cap_max_mhz)) in
             thermal_caps.iter().enumerate()
         {
             let thermal_cap_max_mhz = *thermal_cap_max_mhz;
             let cap = thermal_cap_mhz.load(Ordering::Relaxed);
-            let new_cap = if temp_stale {
-                // No temperature signal — be conservative (fans already 100 %).
+            let new_cap = if temp_stale && !rail_energized {
+                // Rail down: the chips are unpowered, so there is nothing to
+                // protect and nothing to read — the PIC sensors are fed from
+                // the same 12 V. Parking the cap at the floor here is what made
+                // every resume start throttled; hold it instead and let the
+                // first real sample below decide.
+                cap
+            } else if temp_stale {
+                // No temperature signal with a LIVE rail — be conservative
+                // (fans already 100 %).
                 THERMAL_CAP_MIN_MHZ
             } else if let Some(t) = board_hottest {
-                if t >= THERMAL_THROTTLE_HARD_C {
+                if seed_cap {
+                    // First reading after the rail came up: jump straight to
+                    // what this temperature justifies. Only here — the small
+                    // step-up elsewhere is what keeps the cap from oscillating
+                    // around the throttle point.
+                    if t >= THERMAL_THROTTLE_START_C {
+                        THERMAL_CAP_MIN_MHZ
+                    } else {
+                        thermal_cap_max_mhz
+                    }
+                } else if t >= THERMAL_THROTTLE_HARD_C {
                     THERMAL_CAP_MIN_MHZ
                 } else if t >= THERMAL_THROTTLE_START_C {
                     cap.saturating_sub(THERMAL_STEP_DOWN_MHZ)
