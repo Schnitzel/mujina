@@ -1438,6 +1438,11 @@ struct SharedRail {
     /// PSU voltage and whether a stale-temp condition warrants pinning fans to
     /// 100 % (nothing to cool when the rail is down).
     bringup_done: bool,
+    /// Whether the rail was verified to actually follow a voltage command in
+    /// THIS resume cycle. The check (and its enable-line toggle) must run once
+    /// per cycle, not once per chain: toggling the line again would cut power
+    /// to chains that already came up. Cleared with `bringup_done`.
+    rail_checked: bool,
 }
 
 impl SharedRail {
@@ -1450,6 +1455,7 @@ impl SharedRail {
             n_chains,
             paused_chains: std::collections::HashSet::new(),
             bringup_done: rail_energized,
+            rail_checked: false,
         }
     }
 }
@@ -1824,6 +1830,7 @@ impl HashThread for BoardStateHashThread {
                 }
                 // Next resume must redo the board-level power-on-reset.
                 rail.bringup_done = false;
+                rail.rail_checked = false;
             } else {
                 info!(
                     thread = %self.inner.name(),
@@ -1849,13 +1856,16 @@ impl HashThread for BoardStateHashThread {
             {
                 let mut rail = self.rail.lock().await;
                 rail.paused_chains.remove(&self.pic_slot_index);
-                if rail.bringup_done {
+                if rail.bringup_done && !rail.rail_checked {
                     // The rail was already brought up in this process, so the
                     // power-on-reset (and with it the regulation check) is
                     // skipped. It can still have been cycled from outside since
                     // — a Shelly relay, a power cut — and an APW12 that came
                     // back stuck acks set-voltage while its output sits at
-                    // ~12.7 V. Verify before releasing the chains.
+                    // ~12.7 V. Verify before releasing the chains. Once per
+                    // resume cycle: the enable-line toggle inside would cut
+                    // power to chains that already came up.
+                    rail.rail_checked = true;
                     verify_rail_regulates(&self.psu, self.config.startup.psu_settle_ms).await;
                     let mut guard = self.psu.lock().await;
                     if let Err(e) = guard.set_voltage(self.config.startup.initial_voltage).await {
@@ -1870,6 +1880,8 @@ impl HashThread for BoardStateHashThread {
                         )));
                     }
                     rail.bringup_done = true;
+                    // board_power_on_reset() verified the rail itself.
+                    rail.rail_checked = true;
                     info!(
                         thread = %self.inner.name(),
                         chains = rail.n_chains,
