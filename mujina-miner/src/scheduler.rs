@@ -213,31 +213,36 @@ struct Scheduler {
     /// chain registers at boot. Fired (once) from the periodic state tick; see
     /// [`BOOT_RAIL_CHECK_DELAY`].
     boot_rail_check_at: Option<tokio::time::Instant>,
+
+    /// Set by the board layer: true when the rail voltage can be read back, in
+    /// which case the boot rail check stays disarmed (see `SetRailReadback`).
+    rail_voltage_readback: bool,
 }
 
 /// Factory cold-init chain voltage (V) — the rail's value after any cold init.
 const COLD_INIT_VOLTAGE_V: f32 = 13.9;
 
-/// How long after the first chain registers (i.e. boot) to check whether ANY
-/// chain actually enumerated. The board layer can't always tell a live rail
-/// from a dead one at bring-up: some PSUs answer i2c but never report their
-/// real output voltage, so the residual-cap voltage gate can't catch a dead
-/// rail on them. In that case the board optimistically comes up mining and
-/// every chain fast-fails its liveness probe (0 chips). This window lets
-/// cold-init + ramp resolve, then — if nothing came up — parks the miner
+/// How long after the chains are released (boot with a live rail, or a resume)
+/// to check whether ANY chain actually enumerated. The board layer can't always
+/// tell a live rail from a dead one at bring-up: some PSUs answer i2c but never
+/// report their real output voltage, so the residual-cap voltage gate can't
+/// catch a dead rail on them. In that case the board optimistically comes up
+/// mining and every chain fast-fails its liveness probe (0 chips). This window
+/// lets the bring-up resolve, then — if nothing came up — parks the miner
 /// paused so a single resume recovers it once the rail is genuinely powered
 /// (instead of leaving it "running" with 0 chips, which a bare resume can't
 /// fix).
 ///
-/// Must comfortably exceed a normal cold-init + frequency ramp: `is_active` /
-/// `frequency_mhz` only settle at the END of cold-init, and can't distinguish
-/// "still ramping" from "failed", so a check that fires mid-ramp would
-/// false-demote a perfectly live rail. Measured worst case ~25 s from thread
-/// registration to ramp-complete on a 3×S19j chassis (cold-init's enumerate /
-/// liveness / config phases run ~9 s BEFORE the ramp even starts); 45 s leaves
-/// generous margin. A genuinely dead rail fast-fails its chains in ~3 s, so it
-/// simply waits out the remainder before parking paused — harmless.
-const BOOT_RAIL_CHECK_DELAY: Duration = Duration::from_secs(45);
+/// Must comfortably exceed the WHOLE resume sequence, not just cold-init:
+/// `set_paused(false)` cycles the rail and re-handshakes every PIC before the
+/// first chain even starts enumerating. Measured on a 3×S19j Pro (Amlogic,
+/// APW12): resume -> board power-on-reset done ~14 s, last PIC handshake ~30 s,
+/// frequency ramp starts ~39 s, first chips ~50-60 s. At 45 s the check fired
+/// mid-ramp and aborted a perfectly healthy start (`cold-init interrupted by a
+/// pending pause`), which is exactly the false demotion this window exists to
+/// avoid. A genuinely dead rail fast-fails its chains in ~3 s and simply waits
+/// out the remainder before parking paused — harmless.
+const BOOT_RAIL_CHECK_DELAY: Duration = Duration::from_secs(120);
 
 /// Upper bound on how long a single thread's `set_frequency`/`set_voltage` may
 /// take before the scheduler gives up on it. A full-range PLL re-ramp is ~8 s
@@ -312,6 +317,7 @@ impl Scheduler {
             paused: false,
             current_voltage_v: COLD_INIT_VOLTAGE_V,
             boot_rail_check_at: None,
+            rail_voltage_readback: false,
         }
     }
 
@@ -808,7 +814,7 @@ impl Scheduler {
         // enumerates. If none do (a dead rail the board's voltage gate
         // couldn't catch — a PSU that answers i2c but never reports its output
         // voltage), park paused instead of sitting "running" with 0 chips.
-        if is_first_thread {
+        if is_first_thread && !self.rail_voltage_readback {
             self.boot_rail_check_at = Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY);
         }
 
@@ -933,6 +939,10 @@ impl Scheduler {
             SchedulerCommand::PauseMining { reply } => {
                 if !self.paused {
                     self.paused = true;
+                    // Chains are going down: a boot-rail verdict armed for the
+                    // previous start would judge a window that no longer means
+                    // anything. See issue #3.
+                    self.boot_rail_check_at = None;
                     info!(
                         thread_count = self.threads.len(),
                         "Mining paused — share submissions and new job dispatch stopped"
@@ -990,6 +1000,18 @@ impl Scheduler {
                     // SetOperatingPoint picks the right V/f ordering.
                     self.current_voltage_v = COLD_INIT_VOLTAGE_V;
 
+                    // (Re-)arm the boot rail check HERE, not at thread
+                    // registration: on a board that came up without a PSU the
+                    // threads register at boot while no chain starts until this
+                    // resume, so the window would otherwise be mostly spent
+                    // before cold-init even begins and a healthy rail gets
+                    // demoted mid-start. See issue #3.
+                    self.boot_rail_check_at = if self.rail_voltage_readback {
+                        None
+                    } else {
+                        Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY)
+                    };
+
                     // ACK the resume NOW, then converge. A resume cycles the PSU
                     // rail and re-inits the chains — ~10 s of hardware work.
                     // Returning the PATCH here (the desired state is already
@@ -1041,6 +1063,13 @@ impl Scheduler {
                     let _ = miner_state_tx.send(self.compute_miner_state());
                     let _ = reply.send(Ok(()));
                 }
+            }
+            SchedulerCommand::SetRailReadback(available) => {
+                self.rail_voltage_readback = available;
+                if available {
+                    self.boot_rail_check_at = None;
+                }
+                debug!(available, "rail voltage readback reported by the board");
             }
             SchedulerCommand::SetFrequency { mhz, reply } => {
                 info!(

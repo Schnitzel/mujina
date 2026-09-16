@@ -62,6 +62,19 @@ pub trait Board: Send {
     fn needs_initial_pause(&self) -> bool {
         false
     }
+
+    /// Whether this board can read its rail voltage back from the PSU.
+    ///
+    /// The scheduler's boot rail check exists for supplies that answer i2c but
+    /// never report their real output voltage, so nothing can tell a live rail
+    /// from a dead one until the chips either enumerate or don't. A board that
+    /// CAN measure its output already gates on that at bring-up (and verifies
+    /// the output follows the commanded voltage on resume), so the timer adds
+    /// no information there — it can only demote a healthy but slow start.
+    /// Default: false, i.e. keep the check.
+    fn rail_voltage_readback(&self) -> bool {
+        false
+    }
 }
 
 /// Information about a board

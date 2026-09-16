@@ -162,6 +162,20 @@ const PIC_HEARTBEAT_PROBE_ATTEMPTS: usize = 3;
 /// a clear error. The blocked `spawn_blocking` thread leaks, but the caller
 /// (and the daemon) recover.
 const PSU_BRINGUP_OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Probe voltage for the post-power-on rail check. Deliberately the cold-init
+/// setpoint and NOT the idle setpoint: a stuck APW12 pins its output near
+/// ~12.7 V, which is indistinguishable from a healthy 12.0 V request (the
+/// no-load offset alone is +0.2..0.4 V), while at 13.9 V the two differ by
+/// more than a volt. See issue #4.
+const PSU_RAIL_VERIFY_PROBE_V: f32 = 13.9;
+/// How far the measured output may sit from the probe before the rail counts
+/// as not regulating. Covers the no-load offset with margin.
+const PSU_RAIL_VERIFY_TOLERANCE_V: f32 = 0.8;
+/// How many enable-GPIO toggles to spend trying to un-stick the rail.
+const PSU_RAIL_VERIFY_ATTEMPTS: u32 = 2;
+/// How long to hold the PSU output disabled while un-sticking it.
+const PSU_RAIL_UNSTICK_OFF_MS: u64 = 5000;
 /// Bring-up rail-voltage confirmation: read the APW12 output ADC this many
 /// times before concluding the rail is dead, so a single transient i2c glitch
 /// on a genuinely-live rail can't force a false telemetry-only/paused.
@@ -1106,6 +1120,15 @@ impl Board for S19xAmlogic {
         !self.psu_present
     }
 
+    /// The APW12 answers `measure_voltage` (the real output ADC), and bring-up
+    /// only keeps `psu_present` when that read succeeded: every path that ends
+    /// with "no voltage reading" clears it. So a present PSU here is exactly a
+    /// PSU whose output we can measure — the bring-up gate plus the resume-time
+    /// regulation check cover what the scheduler's boot timer was written for.
+    fn rail_voltage_readback(&self) -> bool {
+        self.psu_present
+    }
+
     fn board_info(&self) -> BoardInfo {
         let present_models: Vec<HashboardModel> =
             self.selected_hashboards.iter().map(|s| s.model).collect();
@@ -1415,6 +1438,11 @@ struct SharedRail {
     /// PSU voltage and whether a stale-temp condition warrants pinning fans to
     /// 100 % (nothing to cool when the rail is down).
     bringup_done: bool,
+    /// Whether the rail was verified to actually follow a voltage command in
+    /// THIS resume cycle. The check (and its enable-line toggle) must run once
+    /// per cycle, not once per chain: toggling the line again would cut power
+    /// to chains that already came up. Cleared with `bringup_done`.
+    rail_checked: bool,
 }
 
 impl SharedRail {
@@ -1427,6 +1455,7 @@ impl SharedRail {
             n_chains,
             paused_chains: std::collections::HashSet::new(),
             bringup_done: rail_energized,
+            rail_checked: false,
         }
     }
 }
@@ -1466,6 +1495,83 @@ fn is_psu_absent_error(e: &anyhow::Error) -> bool {
 ///      voltage on a cold start.
 ///   4. Enable, then let the APW12 stabilize.
 /// Reset is released later, per chain, by `initialize_chips()`.
+/// Check that the rail follows a voltage command, and un-stick it if it does
+/// not.
+///
+/// Some APW12 revisions (seen on hw 0x0075) acknowledge `set-voltage` — the
+/// DAC even reads back correctly — while the output stays pinned at ~12.7 V
+/// after a trip. Cold-init then runs against an under-volted rail: the chips
+/// never enumerate, and the ramp's current draw trips the supply again. A
+/// toggle of the output-enable line clears it.
+///
+/// Runs with every chain held in reset, so the rail is unloaded. Best effort:
+/// if the PSU cannot be measured at all we leave the verdict to the existing
+/// no-PSU handling instead of toggling blindly.
+async fn verify_rail_regulates(psu: &Arc<Mutex<NativeAmlogicPsu>>, settle_ms: u64) {
+    for attempt in 0..=PSU_RAIL_VERIFY_ATTEMPTS {
+        {
+            let mut guard = psu.lock().await;
+            if let Err(e) = guard.set_voltage(PSU_RAIL_VERIFY_PROBE_V).await {
+                debug!(error = %e, "rail check: set_voltage failed; skipping verification");
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(settle_ms.max(2000))).await;
+        let measured = {
+            let guard = psu.lock().await;
+            guard.measure_voltage().await
+        };
+        let measured = match measured {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "rail check: measure_voltage failed; skipping verification");
+                return;
+            }
+        };
+        if (measured - PSU_RAIL_VERIFY_PROBE_V).abs() <= PSU_RAIL_VERIFY_TOLERANCE_V {
+            if attempt > 0 {
+                info!(
+                    requested = PSU_RAIL_VERIFY_PROBE_V,
+                    measured, attempt, "Rail regulates again after an enable-GPIO toggle"
+                );
+            } else {
+                debug!(requested = PSU_RAIL_VERIFY_PROBE_V, measured, "rail check: regulating");
+            }
+            return;
+        }
+        if attempt == PSU_RAIL_VERIFY_ATTEMPTS {
+            error!(
+                requested = PSU_RAIL_VERIFY_PROBE_V,
+                measured,
+                attempts = PSU_RAIL_VERIFY_ATTEMPTS,
+                "PSU output does not follow set-voltage (stuck rail); chips will not enumerate. \
+                 Power-cycle the supply at the wall if this persists."
+            );
+            return;
+        }
+        warn!(
+            requested = PSU_RAIL_VERIFY_PROBE_V,
+            measured, attempt, "PSU acked set-voltage but the output did not follow; toggling the enable line"
+        );
+        {
+            let mut guard = psu.lock().await;
+            if let Err(e) = guard.set_enabled(false) {
+                warn!(error = %e, "rail check: could not disable PSU output");
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(PSU_RAIL_UNSTICK_OFF_MS)).await;
+        {
+            let mut guard = psu.lock().await;
+            if let Err(e) = guard.set_enabled(true) {
+                warn!(error = %e, "rail check: could not re-enable PSU output");
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    }
+}
+
 async fn board_power_on_reset(
     config: &AmlogicControlBoardConfig,
     psu: &Arc<Mutex<NativeAmlogicPsu>>,
@@ -1491,6 +1597,19 @@ async fn board_power_on_reset(
         })?;
     }
     tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
+
+    // The rail is up and unloaded (every chain is still held in reset) — the
+    // only safe moment to find out whether it actually regulates. See issue #4.
+    //
+    // The rail is deliberately LEFT at the probe voltage. Writing the idle
+    // setpoint back afterwards is another unverified write on a link whose
+    // readback lies (the firmware NAKs responses and echoes the requested DAC),
+    // and measurements showed the supply re-sticking on exactly that write. It
+    // also cannot be verified: at 12.0 V a healthy rail reads ~12.4 V and a
+    // stuck one ~12.7 V, inside the no-load offset, while at the probe voltage
+    // the two differ by more than a volt. The probe IS the cold-init setpoint
+    // the chains raise to seconds later, so nothing downstream changes.
+    verify_rail_regulates(psu, config.startup.psu_settle_ms).await;
     Ok(())
 }
 
@@ -1711,6 +1830,7 @@ impl HashThread for BoardStateHashThread {
                 }
                 // Next resume must redo the board-level power-on-reset.
                 rail.bringup_done = false;
+                rail.rail_checked = false;
             } else {
                 info!(
                     thread = %self.inner.name(),
@@ -1736,6 +1856,18 @@ impl HashThread for BoardStateHashThread {
             {
                 let mut rail = self.rail.lock().await;
                 rail.paused_chains.remove(&self.pic_slot_index);
+                if rail.bringup_done && !rail.rail_checked {
+                    // The rail was already brought up in this process, so the
+                    // power-on-reset (and with it the regulation check) is
+                    // skipped. It can still have been cycled from outside since
+                    // — a Shelly relay, a power cut — and an APW12 that came
+                    // back stuck acks set-voltage while its output sits at
+                    // ~12.7 V. Verify before releasing the chains. Once per
+                    // resume cycle: the enable-line toggle inside would cut
+                    // power to chains that already came up.
+                    rail.rail_checked = true;
+                    verify_rail_regulates(&self.psu, self.config.startup.psu_settle_ms).await;
+                }
                 if !rail.bringup_done {
                     if let Err(e) = board_power_on_reset(&self.config, &self.psu).await {
                         warn!(error = %e, "Board power-on-reset failed on resume; chain may not enumerate");
@@ -1744,6 +1876,8 @@ impl HashThread for BoardStateHashThread {
                         )));
                     }
                     rail.bringup_done = true;
+                    // board_power_on_reset() verified the rail itself.
+                    rail.rail_checked = true;
                     info!(
                         thread = %self.inner.name(),
                         chains = rail.n_chains,
