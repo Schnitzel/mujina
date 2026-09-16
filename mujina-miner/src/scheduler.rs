@@ -933,6 +933,10 @@ impl Scheduler {
             SchedulerCommand::PauseMining { reply } => {
                 if !self.paused {
                     self.paused = true;
+                    // Chains are going down: a boot-rail verdict armed for the
+                    // previous start would judge a window that no longer means
+                    // anything. See issue #3.
+                    self.boot_rail_check_at = None;
                     info!(
                         thread_count = self.threads.len(),
                         "Mining paused — share submissions and new job dispatch stopped"
@@ -989,6 +993,15 @@ impl Scheduler {
                     // factory voltage — re-seed the tracker so the next
                     // SetOperatingPoint picks the right V/f ordering.
                     self.current_voltage_v = COLD_INIT_VOLTAGE_V;
+
+                    // (Re-)arm the boot rail check HERE, not at thread
+                    // registration: on a board that came up without a PSU the
+                    // threads register at boot while no chain starts until this
+                    // resume, so the window would otherwise be mostly spent
+                    // before cold-init even begins and a healthy rail gets
+                    // demoted mid-start. See issue #3.
+                    self.boot_rail_check_at =
+                        Some(tokio::time::Instant::now() + BOOT_RAIL_CHECK_DELAY);
 
                     // ACK the resume NOW, then converge. A resume cycles the PSU
                     // rail and re-inits the chains — ~10 s of hardware work.
