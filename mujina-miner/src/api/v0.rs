@@ -26,6 +26,43 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
+        .routes(routes!(post_identify))
+        .routes(routes!(post_psu_probe))
+}
+
+/// How long a commissioning window should stay open.
+#[derive(Debug, Default, serde::Deserialize, utoipa::ToSchema)]
+pub struct WindowRequest {
+    /// Seconds, clamped to 1..=120. Defaults to 20.
+    #[serde(default)]
+    pub seconds: Option<u64>,
+}
+
+/// Make this miner findable: fans to 100 % and blinking status LEDs.
+#[utoipa::path(
+    post,
+    path = "/identify",
+    tag = "commissioning",
+    request_body = WindowRequest,
+    responses((status = NO_CONTENT, description = "Identify started")),
+)]
+async fn post_identify(Json(req): Json<WindowRequest>) -> StatusCode {
+    crate::commissioning::start_identify(req.seconds.unwrap_or(20));
+    StatusCode::NO_CONTENT
+}
+
+/// Read the PSU on every telemetry tick for a while, so that a controller can
+/// see which miner's supply wakes up when it closes a relay.
+#[utoipa::path(
+    post,
+    path = "/psu-probe",
+    tag = "commissioning",
+    request_body = WindowRequest,
+    responses((status = NO_CONTENT, description = "Probe window opened")),
+)]
+async fn post_psu_probe(Json(req): Json<WindowRequest>) -> StatusCode {
+    crate::commissioning::start_psu_probe(req.seconds.unwrap_or(20));
+    StatusCode::NO_CONTENT
 }
 
 /// Health check endpoint.

@@ -2644,6 +2644,10 @@ async fn native_telemetry_task(
     thermal_caps: Vec<(Arc<AtomicU32>, u32)>,
     shutdown: CancellationToken,
 ) {
+    if let Some(leds) = &config.leds {
+        crate::commissioning::register_leds(vec![leds.green_gpio, leds.red_gpio]);
+    }
+
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
 
     // One PIC handle per present hashboard for the heartbeat path.
@@ -2993,7 +2997,11 @@ async fn native_telemetry_task(
             }
         }
 
-        let target_fan_percent: u8 = if temp_stale && rail_energized {
+        let target_fan_percent: u8 = if crate::commissioning::identify_active() {
+            // Someone asked this miner to make itself known. Full airflow is
+            // always safe and is audible across a room.
+            100
+        } else if temp_stale && rail_energized {
             warn!(
                 "No temperature sample in 30 s — pinning fans to 100 % as a safety fallback"
             );
@@ -3072,7 +3080,12 @@ async fn native_telemetry_task(
         // reads ~21 C at ~22 C ambient), so this could be extended to report an
         // idle PSU's temperature — but only behind a consecutive-failure
         // backoff, or an AC-cut supply would burn the full timeout every tick.
-        let want_temperature = if psu_temp_skip_ticks > 0 {
+        let want_temperature = if crate::commissioning::psu_probe_active() {
+            // A commissioning tool is watching for this PSU to wake up, so a
+            // relay closing has to show within a tick, not after the backoff.
+            psu_temp_skip_ticks = 0;
+            true
+        } else if psu_temp_skip_ticks > 0 {
             psu_temp_skip_ticks -= 1;
             false
         } else {
